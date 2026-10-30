@@ -39,6 +39,7 @@
 #include <ceres/version.h>
 #pragma GCC diagnostic pop
 
+#include <okvis/PlaneMap.hpp>
 #include <okvis/kinematics/Transformation.hpp>
 
 #include <okvis/assert_macros.hpp>
@@ -588,7 +589,8 @@ class ViGraph
   bool addSubmapAlignmentConstraints(const SupereightMapType* submap_ptr,
                                      const uint64_t& frame_A_id, const uint64_t frame_B_id,
                                      std::vector<Eigen::Vector3f, Eigen::aligned_allocator<Eigen::Vector3f>>& pointCloud,
-                                     std::vector<float> sensorError, bool isLidar = false, const std::string robustFunction = "Tukey");
+                                     std::vector<float> sensorError, bool isLidar = false, const std::string robustFunction = "Tukey",
+                                     PlaneMapPtr planeMap = nullptr, bool usePointToPlane = true);
 
   // get/set states
   /**
@@ -779,7 +781,7 @@ protected:
   using GpsFactor = GraphEdge<ceres::GpsErrorAsynchronous>;
 
   /// \brief
-  using SubmapAlignmentFactor = GraphEdge<ceres::SubmapIcpError>;
+  using SubmapAlignmentFactor = GraphEdge<::ceres::CostFunction>;
 
 
 

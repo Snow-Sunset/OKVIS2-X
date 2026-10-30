@@ -21,6 +21,7 @@
 
 #include <atomic>
 
+#include <okvis/PlaneMap.hpp>
 #include <okvis/ViGraphEstimator.hpp>
 #include "se/map/map.hpp"
 
@@ -659,7 +660,8 @@ class ViSlamBackend //: public VioBackendInterface
   bool addSubmapAlignmentConstraints(const SupereightMapType* submap_ptr,
                                      const uint64_t& frame_A_id, const uint64_t frame_B_id,
                                      std::vector<Eigen::Vector3f, Eigen::aligned_allocator<Eigen::Vector3f>>& pointCloud,
-                                     std::vector<float> sensorError, bool isLidar=false, const std::string robustFunction = "Tukey");
+                                     std::vector<float> sensorError, bool isLidar=false, const std::string robustFunction = "Tukey",
+                                     PlaneMapPtr planeMap = nullptr, bool usePointToPlane = true);
 
   /// \brief Clears the underlying graphs and resets everything (so you can re-start).
   void clear();
@@ -782,6 +784,8 @@ private:
       std::vector<float> sensorError; ///< Uncertainty value for the LiDAR / Depth Sensor [in meters]
       bool isLidar;
       std::string robustFunction;
+      PlaneMapPtr planeMap;
+      bool usePointToPlane;
   };
   AlignedVector<AddSubmapAlignmentBacklog> addSubmapAlignmentBacklog_;
 

@@ -1741,7 +1741,8 @@ bool ViSlamBackend::synchroniseRealtimeAndFullGraph(std::vector<StateId> &update
       fullGraph_.addSubmapAlignmentConstraints(alignmentTerm.submap_ptr, alignmentTerm.frame_A_id,
                                                alignmentTerm.frame_B_id, alignmentTerm.pointCloud,
                                                alignmentTerm.sensorError, alignmentTerm.isLidar,
-                                               alignmentTerm.robustFunction);
+                                               alignmentTerm.robustFunction, alignmentTerm.planeMap,
+                                               alignmentTerm.usePointToPlane);
     }
   }
   addSubmapAlignmentBacklog_.clear();
@@ -2759,16 +2760,17 @@ bool ViSlamBackend::attemptPosGpsAlignment(StateId pose_i , StateId pose_j, cons
 bool ViSlamBackend::addSubmapAlignmentConstraints(const SupereightMapType* submap_ptr,
                                                   const uint64_t &frame_A_id, const uint64_t frame_B_id,
                                                   std::vector<Eigen::Vector3f, Eigen::aligned_allocator<Eigen::Vector3f>>& pointCloud,
-                                                  std::vector<float> sensorError, bool isLidar, const std::string robustFunction) {
+                                                  std::vector<float> sensorError, bool isLidar, const std::string robustFunction,
+                                                  PlaneMapPtr planeMap, bool usePointToPlane) {
   if(!isLoopClosing_ && !isLoopClosureAvailable_){
-    fullGraph_.addSubmapAlignmentConstraints(submap_ptr, frame_A_id, frame_B_id, pointCloud, sensorError, isLidar, robustFunction);
+    fullGraph_.addSubmapAlignmentConstraints(submap_ptr, frame_A_id, frame_B_id, pointCloud, sensorError, isLidar, robustFunction, planeMap, usePointToPlane);
   }
   else
   {
-    addSubmapAlignmentBacklog_.push_back(AddSubmapAlignmentBacklog{submap_ptr, frame_A_id, frame_B_id, pointCloud, sensorError, isLidar, robustFunction});
+    addSubmapAlignmentBacklog_.push_back(AddSubmapAlignmentBacklog{submap_ptr, frame_A_id, frame_B_id, pointCloud, sensorError, isLidar, robustFunction, planeMap, usePointToPlane});
     LOG(INFO) << "full Graph is being optimized. don't add alignment constraints.";
   }
-  return realtimeGraph_.addSubmapAlignmentConstraints(submap_ptr, frame_A_id, frame_B_id, pointCloud, sensorError, isLidar, robustFunction);
+  return realtimeGraph_.addSubmapAlignmentConstraints(submap_ptr, frame_A_id, frame_B_id, pointCloud, sensorError, isLidar, robustFunction, planeMap, usePointToPlane);
 }
 
 StateId ViSlamBackend::currentKeyframeStateId(bool considerLoopClosureFrames) const

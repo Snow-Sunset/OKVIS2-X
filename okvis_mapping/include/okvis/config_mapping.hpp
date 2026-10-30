@@ -15,6 +15,8 @@
 
 
 
+#include <okvis/PlaneMap.hpp>
+#include <stdexcept>
 #include <se/map/map.hpp>
 #include <se/sensor/sensor.hpp>
 #include <se/sensor/lidar.hpp>
@@ -69,6 +71,22 @@ struct SubMapConfig{
      */
     bool useMap2LiveFactors = false;
 
+    /// LiDAR uses explicit point-to-plane factors by default. Depth is unchanged.
+    bool usePointToPlaneFactors = true;
+    /// LiDAR stores only plane submaps: no occupancy allocation/fusion or mesh.
+    bool lidarPlaneOnly = true;
+    void validateLidarMapping() const {
+      if (lidarPlaneOnly && !usePointToPlaneFactors) {
+        throw std::invalid_argument("lidar_plane_only requires use_point_to_plane_factors: true");
+      }
+    }
+    okvis::PlaneMap::Config planeMapConfig;
+    bool buildLidarPointCloudMap = true;
+    double pointCloudMapVoxelSize = 0.1;       ///< metres, independent of plane voxels
+    double pointCloudMapPublishInterval = 1.0; ///< wall-clock seconds; zero disables throttling
+    size_t pointCloudMapMaxPublishPoints = 200000; ///< display budget; PCD remains complete
+
+
     /**
      * Number of submap factors per frame / submap
      */
@@ -113,7 +131,7 @@ struct SubMapConfig{
     /** Initializes the config from a YAML file. Data not present in the YAML file will be initialized
      * as in MapConfig::MapConfig().
      */
-    SubMapConfig(const std::string& yaml_file)
+    SubMapConfig(const std::string& yaml_file) : SubMapConfig()
     {
       // Open the file for reading.
       cv::FileStorage fs;
@@ -147,6 +165,20 @@ struct SubMapConfig{
       se::yaml::subnode_as_size_t(node, "submap_min_frames", submapMinFrames);
       se::yaml::subnode_as_bool(node, "use_map_to_map_factors", useMap2MapFactors);
       se::yaml::subnode_as_bool(node, "use_map_to_live_factors", useMap2LiveFactors);
+      se::yaml::subnode_as_bool(node, "use_point_to_plane_factors", usePointToPlaneFactors);
+      se::yaml::subnode_as_bool(node, "lidar_plane_only", lidarPlaneOnly);
+      se::yaml::subnode_as_bool(node, "build_lidar_pointcloud_map", buildLidarPointCloudMap);
+      se::yaml::subnode_as_size_t(node, "pointcloud_map_max_publish_points", pointCloudMapMaxPublishPoints);
+      if (!node["pointcloud_map_voxel_size"].empty()) node["pointcloud_map_voxel_size"] >> pointCloudMapVoxelSize;
+      if (!node["pointcloud_map_publish_interval"].empty()) node["pointcloud_map_publish_interval"] >> pointCloudMapPublishInterval;
+      if (!node["plane_voxel_size"].empty()) node["plane_voxel_size"] >> planeMapConfig.voxelSize;
+      if (!node["plane_max_variance"].empty()) node["plane_max_variance"] >> planeMapConfig.maxPlaneVariance;
+      if (!node["plane_eigenvalue_ratio"].empty()) node["plane_eigenvalue_ratio"] >> planeMapConfig.maxEigenvalueRatio;
+      if (!node["plane_max_match_distance"].empty()) node["plane_max_match_distance"] >> planeMapConfig.maxMatchDistance;
+      if (!node["plane_noise_floor"].empty()) node["plane_noise_floor"] >> planeMapConfig.noiseFloor;
+      if (!node["plane_sigma_gate"].empty()) node["plane_sigma_gate"] >> planeMapConfig.sigmaGate;
+      se::yaml::subnode_as_size_t(node, "plane_min_points", planeMapConfig.minPoints);
+      se::yaml::subnode_as_size_t(node, "plane_max_points", planeMapConfig.maxPoints);
       se::yaml::subnode_as_size_t(node, "n_factors_per_state", numSubmapFactors);
       se::yaml::subnode_as_float(node, "voxel_grid_resolution", voxelGridResolution);
       se::yaml::subnode_as_float(node, "sensor_error", sensorError);
@@ -167,6 +199,20 @@ struct SubMapConfig{
       os << str_utils::value_to_pretty_str(c.submapMinFrames, "submap_min_frames") << " \n";
       os << str_utils::bool_to_pretty_str(c.useMap2MapFactors, "use_map_to_map_factors") << " \n";
       os << str_utils::bool_to_pretty_str(c.useMap2LiveFactors, "use_map_to_live_factors") << " \n";
+      os << str_utils::bool_to_pretty_str(c.usePointToPlaneFactors, "use_point_to_plane_factors") << " \n";
+      os << str_utils::bool_to_pretty_str(c.lidarPlaneOnly, "lidar_plane_only") << " \n";
+      os << str_utils::bool_to_pretty_str(c.buildLidarPointCloudMap, "build_lidar_pointcloud_map") << " \n";
+      os << str_utils::value_to_pretty_str(c.pointCloudMapMaxPublishPoints, "pointcloud_map_max_publish_points") << " \n";
+      os << str_utils::value_to_pretty_str(c.pointCloudMapVoxelSize, "pointcloud_map_voxel_size") << " \n";
+      os << str_utils::value_to_pretty_str(c.pointCloudMapPublishInterval, "pointcloud_map_publish_interval") << " \n";
+      os << str_utils::value_to_pretty_str(c.planeMapConfig.voxelSize, "plane_voxel_size") << " \n";
+      os << str_utils::value_to_pretty_str(c.planeMapConfig.maxPlaneVariance, "plane_max_variance") << " \n";
+      os << str_utils::value_to_pretty_str(c.planeMapConfig.maxEigenvalueRatio, "plane_eigenvalue_ratio") << " \n";
+      os << str_utils::value_to_pretty_str(c.planeMapConfig.maxMatchDistance, "plane_max_match_distance") << " \n";
+      os << str_utils::value_to_pretty_str(c.planeMapConfig.noiseFloor, "plane_noise_floor") << " \n";
+      os << str_utils::value_to_pretty_str(c.planeMapConfig.sigmaGate, "plane_sigma_gate") << " \n";
+      os << str_utils::value_to_pretty_str(c.planeMapConfig.minPoints, "plane_min_points") << " \n";
+      os << str_utils::value_to_pretty_str(c.planeMapConfig.maxPoints, "plane_max_points") << " \n";
       os << str_utils::value_to_pretty_str(c.numSubmapFactors, "n_factors_per_state") << " \n";
       os << str_utils::value_to_pretty_str(c.voxelGridResolution, "voxel_grid_resolution") << " \n";
       os << str_utils::value_to_pretty_str(c.sensorError, "sensor_error") << " \n";

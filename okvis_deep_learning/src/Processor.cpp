@@ -65,7 +65,8 @@ Processor::Processor(okvis::ViParameters& parameters,
   // Connect the submap alignment callback to supereight.
   se_interface_.setAlignCallback(std::bind(&okvis::ThreadedSlam::addSubmapAlignmentConstraints, &slam_,
                                              std::placeholders::_1, std::placeholders::_2, std::placeholders::_3,
-                                             std::placeholders::_4, std::placeholders::_5, std::placeholders::_6));
+                                             std::placeholders::_4, std::placeholders::_5, std::placeholders::_6,
+                                             std::placeholders::_7, std::placeholders::_8));
 
   // Launch supereight.
   se_interface_.start();

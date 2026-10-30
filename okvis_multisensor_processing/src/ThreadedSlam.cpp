@@ -100,6 +100,7 @@ void ThreadedSlam::init()
 
   // Set calibration parameters for live-to-map factor
   // TODO: generalize to n > 1 mapping camera
+  if (parameters_.lidar) submapConfig_.validateLidarMapping();
   if(parameters_.output.enable_submapping) {
     if(parameters_.lidar){
       T_SD_ = parameters_.lidar.value().T_SL;
@@ -403,10 +404,11 @@ bool ThreadedSlam::addSubmapAlignmentConstraints(const SupereightMapType* submap
                                                  const SupereightMapType* submap_B_ptr,
                                                  const uint64_t& frame_A_id, const uint64_t& frame_B_id,
                                                  std::vector<Eigen::Vector3f, Eigen::aligned_allocator<Eigen::Vector3f>>& pointCloud,
-                                                 std::vector<float> sensorError) {
+                                                 std::vector<float> sensorError,
+                                                 PlaneMapPtr planeMapA, PlaneMapPtr planeMapB) {
 
   submapAlignmentFactorsReceived_.PushNonBlocking(
-          AlignmentTerm(submap_A_ptr, submap_B_ptr,frame_A_id,frame_B_id, pointCloud, sensorError));
+          AlignmentTerm(submap_A_ptr, submap_B_ptr,frame_A_id,frame_B_id, pointCloud, sensorError, planeMapA, planeMapB));
 
   return true;
 }
@@ -756,7 +758,7 @@ bool ThreadedSlam::processFrame() {
       // Motion Compensation of LiDAR Point Cloud
       kinematics::Transformation T_WS_live = estimator_.pose(StateId(multiFrame->id()));
       if(parameters_.lidar) {
-        if(previousSubmap_){
+        if (submapConfig_.usePointToPlaneFactors ? bool(previousPlaneMap_) : previousSubmap_ != nullptr) {
 
           LidarMotionUndistortion motionUndistortion(lastOptimisedState_, T_WS_live, T_SD_,
                                                     lidarMeasurementDeque_, imuMeasurementDeque_);
@@ -765,9 +767,19 @@ bool ThreadedSlam::processFrame() {
           motionUndistortion.deskew();
           tLiveUndistortion.stop();          
 
-          //ToDo: Two-State downsampling!! (or think about it more carefully) => otherwise determining observed points quite slow
           TimerSwitchable tFilterObserved("8.2 Filter observed points");
-          size_t observed_points = motionUndistortion.filterObserved(previousSubmap_, estimator_.pose(StateId(previousSubmapId_)));
+          size_t observed_points = 0;
+          if (submapConfig_.usePointToPlaneFactors) {
+            // Bound association work spatially before the 27-cell plane search;
+            // retain all voxel candidates until validity has been checked.
+            motionUndistortion.voxelDownsample(submapConfig_.voxelGridResolution);
+            observed_points = motionUndistortion.filterPlanes(previousPlaneMap_,
+                estimator_.pose(StateId(previousSubmapId_)), submapConfig_.sensorError);
+          } else {
+            observed_points = motionUndistortion.filterObserved(previousSubmap_, estimator_.pose(StateId(previousSubmapId_)));
+          }
+          // For point-to-plane, count valid spatial candidates before the final
+          // factor limit, rather than raw duplicates or the truncated factor set.
           if(observed_points < submapConfig_.numSubmapFactors){
               noOverlapCounter_++;
           }
@@ -787,7 +799,8 @@ bool ThreadedSlam::processFrame() {
           std::vector<float> sensorErrors(motionUndistortion.deskewedDownsampledPointCloud().size(), submapConfig_.sensorError);
           estimator_.addSubmapAlignmentConstraints(
                   previousSubmap_, previousSubmapId_, multiFrame->id(),
-                  motionUndistortion.deskewedDownsampledPointCloud(), sensorErrors, true, "Tukey");
+                  motionUndistortion.deskewedDownsampledPointCloud(), sensorErrors, true, "Tukey",
+                  previousPlaneMap_, submapConfig_.usePointToPlaneFactors);
         }
       }
       else {
@@ -868,11 +881,15 @@ bool ThreadedSlam::processFrame() {
     // Prioritize the older submap
     if(parameters_.lidar) {
       // add submap alignment constraints between map keyframes A and B
-      estimator_.addSubmapAlignmentConstraints(alignmentTerm.submap_A_ptr, alignmentTerm.frame_A_id,
-                                               alignmentTerm.frame_B_id, alignmentTerm.pointCloud_B,
-                                               alignmentTerm.sensorError, true, "Tukey");
+      if (alignmentTerm.submap_A_ptr || alignmentTerm.planeMapA) {
+        estimator_.addSubmapAlignmentConstraints(alignmentTerm.submap_A_ptr, alignmentTerm.frame_A_id,
+                                                 alignmentTerm.frame_B_id, alignmentTerm.pointCloud_B,
+                                                 alignmentTerm.sensorError, true, "Tukey", alignmentTerm.planeMapA,
+                                                 submapConfig_.usePointToPlaneFactors);
+      }
       
       previousSubmap_ = alignmentTerm.submap_B_ptr;
+      previousPlaneMap_ = alignmentTerm.planeMapB;
       previousSubmapId_ = alignmentTerm.frame_B_id;
     }
     else {
@@ -886,10 +903,12 @@ bool ThreadedSlam::processFrame() {
       }
       if (alignmentTerm.frame_A_id != 0) {
         previousSubmap_ = alignmentTerm.submap_A_ptr;
+        previousPlaneMap_ = alignmentTerm.planeMapA;
         previousSubmapId_ = alignmentTerm.frame_A_id;
       }
       else {
         previousSubmap_ = alignmentTerm.submap_B_ptr;
+        previousPlaneMap_ = alignmentTerm.planeMapB;
         previousSubmapId_ = alignmentTerm.frame_B_id;
       }
     }
@@ -1210,7 +1229,7 @@ void ThreadedSlam::optimisePublishMarginalise(MultiFramePtr multiFrame,
 
 bool ThreadedSlam::needsNewLidarKeyframe()
 {
-  if(previousSubmap_){
+  if (submapConfig_.usePointToPlaneFactors ? bool(previousPlaneMap_) : previousSubmap_ != nullptr) {
     if(noOverlapCounter_ > 1){
       DLOG(INFO) << "Manually triggering new KF for lidar tracking!!! For lastOptimisedState.id = " << lastOptimisedState_.id.value();
       noOverlapCounter_ = 0;
@@ -1479,7 +1498,8 @@ void ThreadedSlam::doFinalBa()
     if (parameters_.lidar) {
       estimator_.addSubmapAlignmentConstraints(alignmentTerm.submap_A_ptr, alignmentTerm.frame_A_id,
         alignmentTerm.frame_B_id, alignmentTerm.pointCloud_B,
-        alignmentTerm.sensorError, true, "Tukey");
+        alignmentTerm.sensorError, true, "Tukey", alignmentTerm.planeMapA,
+                                               submapConfig_.usePointToPlaneFactors);
     }
     else {
       estimator_.addSubmapAlignmentConstraints(alignmentTerm.submap_A_ptr, alignmentTerm.frame_A_id,
@@ -1489,6 +1509,7 @@ void ThreadedSlam::doFinalBa()
 
     // Set reference submap for live constraints to recently finished submap
     previousSubmap_ = alignmentTerm.submap_B_ptr;
+    previousPlaneMap_ = alignmentTerm.planeMapB;
     previousSubmapId_ = alignmentTerm.frame_B_id;
   }
 

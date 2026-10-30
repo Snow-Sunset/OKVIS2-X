@@ -5,6 +5,8 @@ find_package(Glog REQUIRED)
 
 set(LIB_NAME okvis_mapping)
 add_library(${LIB_NAME}
+  src/PlaneMap.cpp
+  src/LidarPointCloudMap.cpp
   src/VoxelGridFilter.cpp
   src/SubmappingUtils.cpp
   src/LidarMotionUndistortion.cpp
@@ -45,6 +47,12 @@ install(TARGETS ${LIB_NAME} EXPORT okvisTargets
   LIBRARY COMPONENT lib
 )
 install(DIRECTORY include/okvis TYPE INCLUDE COMPONENT dev FILES_MATCHING PATTERN "*.hpp")
+
+if(BUILD_TESTS OR BUILD_POINT_TO_PLANE_TESTS)
+  add_executable(okvis_lidar_pointcloud_map_test test/TestLidarPointCloudMap.cpp)
+  target_link_libraries(okvis_lidar_pointcloud_map_test PRIVATE okvis::Mapping)
+  add_test(NAME okvis_lidar_pointcloud_map COMMAND okvis_lidar_pointcloud_map_test)
+endif()
 
 # testing
 if(BUILD_TESTS)

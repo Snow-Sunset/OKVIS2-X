@@ -166,7 +166,8 @@ class ThreadedSlam : public ViInterface {
                                        const SupereightMapType* submap_B_ptr,
                                        const uint64_t& frame_A_id, const uint64_t& frame_B_id,
                                        std::vector<Eigen::Vector3f, Eigen::aligned_allocator<Eigen::Vector3f>>& pointCloud,
-                                       std::vector<float> sensorError);
+                                       std::vector<float> sensorError,
+                                       PlaneMapPtr planeMapA = nullptr, PlaneMapPtr planeMapB = nullptr);
 
   /// \}
   /// \name Setters
@@ -293,6 +294,8 @@ private:
       std::vector<Eigen::Vector3f, Eigen::aligned_allocator<Eigen::Vector3f>> pointCloud_B; ///< Point cloud with points in keyframe B that are aligned to submap in frame A
       std::vector<float> sensorError; ///< Uncertainty value for the LiDAR / Depth Sensor [in meters]
 
+      PlaneMapPtr planeMapA, planeMapB;
+
       AlignmentTerm()
       {};
 
@@ -300,9 +303,10 @@ private:
                     const SupereightMapType* submap_B_ptr,
                     const uint64_t& frame_A_id, const uint64_t& frame_B_id,
                     std::vector<Eigen::Vector3f, Eigen::aligned_allocator<Eigen::Vector3f>>& pointCloud_B,
-                    std::vector<float> sensorError)
+                    std::vector<float> sensorError, PlaneMapPtr planeA, PlaneMapPtr planeB)
               :  submap_A_ptr(submap_A_ptr), submap_B_ptr(submap_B_ptr),
-              frame_A_id(frame_A_id), frame_B_id(frame_B_id), pointCloud_B(pointCloud_B), sensorError(sensorError)
+              frame_A_id(frame_A_id), frame_B_id(frame_B_id), pointCloud_B(pointCloud_B), sensorError(sensorError),
+              planeMapA(planeA), planeMapB(planeB)
       {
       };
   };
@@ -393,6 +397,7 @@ private:
   okvis::kinematics::Transformation T_SD_; /// < Transformation {S} IMU <-> {D} Depth source (Lidar or Camera)
   okvis::kinematics::Transformation T_rect_; ///< T_{D}{D_rectification}
   bool useAlignmentFactors_;
+  PlaneMapPtr previousPlaneMap_;
   const SupereightMapType* previousSubmap_ = nullptr; ///< Always have a reference to the most recent completed submap
   uint64_t previousSubmapId_ = -1;
   size_t previouslyObservedLidarPoints_ = 0;

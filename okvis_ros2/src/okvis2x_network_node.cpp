@@ -83,6 +83,8 @@ int main(int argc, char **argv) {
   node->declare_parameter("imu_propagated_state_publishing_rate", 0.0);
   node->declare_parameter("mesh_cutoff_z", std::numeric_limits<float>::max());
   node->declare_parameter("save_submap_meshes", false);
+  node->declare_parameter("save_lidar_pointcloud_map", true);
+  node->declare_parameter("lidar_pointcloud_map_filename", "");
   node->declare_parameter("csv_path", "/tmp/");
 
   node->get_parameter("config_filename", configFilename);
@@ -103,6 +105,8 @@ int main(int argc, char **argv) {
   if(!node->get_parameter("save_submap_meshes", save_meshes)){
     LOG(WARNING) << "save_submap_meshes not defined. Will not save submap meshes.";
   }
+  const bool saveLidarMap = node->get_parameter("save_lidar_pointcloud_map").as_bool();
+  const std::string lidarMapFilename = node->get_parameter("lidar_pointcloud_map_filename").as_string();
   std::string csv_path = "/tmp/";
   if(!node->get_parameter("csv_path", csv_path)){
     LOG(INFO) << "csv_path not defined. Will save trajectory to /tmp/.";
@@ -131,6 +135,8 @@ int main(int argc, char **argv) {
 
   // Read supereight2 config file.
   se::SubMapConfig submapConfig(seConfigFilename);
+  publisher.setMeshPublishingEnabled(submapConfig.write_mesh_output
+      && !(parameters.lidar && submapConfig.lidarPlaneOnly));
   okvis::SupereightMapType::Config  mapConfig;
   mapConfig.readYaml(seConfigFilename);
   okvis::SupereightMapType::DataConfigType dataConfig;
@@ -298,6 +304,10 @@ int main(int argc, char **argv) {
     const std::vector<Eigen::Vector3f, Eigen::aligned_allocator<Eigen::Vector3f>>& alignPointCloud, bool isMapFrame)
     {publisher.publishAlignmentPointsAsCallback(timestamp, T_WS, alignPointCloud, isMapFrame);}
   );
+  processor.se_interface_.setPointCloudMapCallback([&](const okvis::Time& timestamp,
+      const okvis::LidarPointCloudMap::Points& points) {
+    publisher.publishLidarPointCloudMap(timestamp, points);
+  });
   processor.setSubmapCallback(std::bind(
     &okvis::Publisher::publishSubmapsAsCallback, 
     &publisher, 
@@ -381,7 +391,11 @@ int main(int argc, char **argv) {
   processor.finish();
   processor.slam_.setFinalTrajectoryCsvFile(csv_path + "/okvis2-final_trajectory.csv", false);
   processor.slam_.writeFinalTrajectoryCsv();
-  if(save_meshes){
+  if (saveLidarMap && parameters.lidar && submapConfig.buildLidarPointCloudMap) {
+    const std::string filename = lidarMapFilename.empty() ? csv_path + "/lidar_map.pcd" : lidarMapFilename;
+    if (!processor.se_interface_.saveLidarPointCloudMap(filename)) LOG(WARNING) << "LiDAR map empty or could not be saved: " << filename;
+  }
+  if(save_meshes && processor.se_interface_.meshEnabled()){
     LOG(WARNING) << "Saving the submap meshes of the submapping interface";
     processor.se_interface_.saveAllSubmapMeshes();
   } else {

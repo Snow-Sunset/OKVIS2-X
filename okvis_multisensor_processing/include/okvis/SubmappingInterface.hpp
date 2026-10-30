@@ -13,6 +13,9 @@
 #ifndef INCLUDE_OKVIS_SUBMAPPINGINTERFACE_HPP
 #define INCLUDE_OKVIS_SUBMAPPINGINTERFACE_HPP
 
+#include <okvis/LidarPointCloudMap.hpp>
+#include <chrono>
+#include <condition_variable>
 #include <okvis/ThreadedSlam.hpp>
 #include <okvis/VoxelGridFilter.hpp>
 #include <okvis/SubmappingUtils.hpp>
@@ -201,6 +204,7 @@ namespace okvis {
                   depthScaleFactor_(submapConfig.depthScalingFactor){
 
           blocking_ = false;
+          if (parameters.lidar) submapConfig_.validateLidarMapping();
           
           //Quite a hacky way of doing this. Problem is that as the variable the pointers point at run afterwards 
           //in a different thread, they are getting deleted once we get out of scope. If anyone has got a better approach/proposal
@@ -266,8 +270,18 @@ namespace okvis {
           }
           trajectoryLocked_ = false;
 
+          if (parameters.lidar && submapConfig_.buildLidarPointCloudMap) {
+            if (!std::isfinite(submapConfig_.pointCloudMapPublishInterval)
+                || submapConfig_.pointCloudMapPublishInterval < 0.0) {
+              throw std::invalid_argument("pointcloud_map_publish_interval must be finite and nonnegative");
+            }
+            pointCloudMap_ = std::make_unique<LidarPointCloudMap>(submapConfig_.pointCloudMapVoxelSize);
+          }
+
           // Initialize Object Map
-          objectMap_.reset(new okvis::ObjectMap(seSubmapLookup_, seMeshLookup_));
+          if (!planeOnlyMapping()) {
+            objectMap_.reset(new okvis::ObjectMap(seSubmapLookup_, seMeshLookup_));
+          }
   
         };
 
@@ -275,6 +289,10 @@ namespace okvis {
          * @brief      Destroys the object.
          */
         ~SubmappingInterface() {
+          {
+            std::lock_guard lock(finishMutex_);
+            isFinished_ = true;
+          }
           // Shutdown all the Queues.
           depthMeasurements_.Shutdown();
           lidarMeasurements_.Shutdown();
@@ -294,6 +312,7 @@ namespace okvis {
           }
 
           LOG(INFO) << "Finished submap integration thread";
+          stopPointCloudPublisher();
 
         };
 
@@ -368,6 +387,18 @@ namespace okvis {
          * when required
          */
         void processSupereightFrames();
+
+        /// Process one prepared packet, on the mapping thread or synchronously.
+        void processSupereightFrame(SupereightFrames& frame);
+
+        bool planeOnlyMapping() const { return bool(viParameters_.lidar) && submapConfig_.lidarPlaneOnly; }
+        bool meshEnabled() const { return !planeOnlyMapping() && submapConfig_.write_mesh_output; }
+
+        using PointCloudMapCallback = std::function<void(const Time&, const LidarPointCloudMap::Points&)>;
+        void setPointCloudMapCallback(PointCloudMapCallback callback) { pointCloudMapCallback_ = std::move(callback); }
+        LidarPointCloudMap::Points lidarPointCloudMap() const;
+        void publishLidarPointCloudMap(bool force = false);
+        bool saveLidarPointCloudMap(const std::string& filename) const;
 
         /**
          * @brief       Checks if required data (LiDAR measurements + OKVIS estimates) is available and prepares for
@@ -469,11 +500,14 @@ namespace okvis {
          * @brief Function that sets the finished boolean to true
         */
         void setFinished(){
+            publishLidarPointCloudMap(true);
             std::lock_guard<std::mutex> l(finishMutex_);
             isFinished_ = true;
-            seMeshLookup_[prevKeyframeId_] = seSubmapLookup_[prevKeyframeId_].map->mesh();
-            // Finish Objects for completed submap, means coloring of mesh for text query and extracting poses
-            objectMap_->finishSubmapObjects(prevKeyframeId_);
+            const auto it = seSubmapLookup_.find(prevKeyframeId_);
+            if (meshEnabled() && it != seSubmapLookup_.end() && it->second.map) {
+              seMeshLookup_[prevKeyframeId_] = it->second.map->mesh();
+              if (objectMap_) objectMap_->finishSubmapObjects(prevKeyframeId_);
+            }
             return;
         }
 
@@ -485,7 +519,8 @@ namespace okvis {
                      const uint64_t& frame_A_id,
                      const uint64_t& frame_B_id,
                      std::vector<Eigen::Vector3f, Eigen::aligned_allocator<Eigen::Vector3f>>& pointCloud,
-                     std::vector<float> sensorError)> AlignCallback;
+                     std::vector<float> sensorError,
+                     PlaneMapPtr planeMapA, PlaneMapPtr planeMapB)> AlignCallback;
 
         void setAlignCallback(const AlignCallback& alignCallback) {
           alignCallback_ = alignCallback;
@@ -612,7 +647,7 @@ namespace okvis {
          * @param overlapThreshold Threshold for minimum overlap (if overlap < threshold new submap will be created)
          * @return Ratio of observed (considered overlapping) points to total number of measurements
          */
-        double evaluateLidarOverlap(const SupereightMapType& map, uint64_t& mapId,
+        double evaluateLidarOverlap(uint64_t& mapId,
                                     SupereightFrames& seFrame, double overlapThreshold = 0.5);
 
         /**
@@ -644,6 +679,12 @@ namespace okvis {
         bool publishSubmapTopView(cv::Mat& submapPlot);
 
     private:
+        Eigen::AlignedBox3f submapBounds(uint64_t id) const;
+        void applyPendingPointCloudPoses() const;
+        void startPointCloudPublisher();
+        void stopPointCloudPublisher();
+        void pointCloudPublisherLoop();
+        void assembleAndPublishPointCloud(bool force);
 
         /**
          * @brief Loop that performs the supereight frame data collection and integrates it
@@ -828,6 +869,34 @@ namespace okvis {
 
         // Callback for submap alignment
         AlignCallback alignCallback_;
+        std::unique_ptr<LidarPointCloudMap> pointCloudMap_;
+        mutable std::mutex pointCloudMapMutex_;
+        struct PendingPointCloudPose {
+          Eigen::Isometry3d pose;
+          uint64_t sequence = 0;
+          bool keyframe = false;
+        };
+        mutable std::mutex pointCloudPoseApplyMutex_;
+        mutable std::mutex pendingPointCloudPosesMutex_;
+        mutable std::map<uint64_t, PendingPointCloudPose> pendingPointCloudPoses_;
+        uint64_t pointCloudPoseSequence_ = 0;
+        std::mutex pointCloudPublishMutex_;
+        std::mutex pointCloudBuildMutex_;
+        std::condition_variable pointCloudPublishCv_;
+        std::thread pointCloudPublishThread_;
+        bool pointCloudPublisherStopping_ = false;
+        bool pointCloudPublishRequested_ = false;
+        bool pointCloudPublishForce_ = false;
+        uint64_t pointCloudPublishRequestId_ = 0;
+        uint64_t pointCloudPublishCompletedId_ = 0;
+        PointCloudMapCallback pointCloudMapCallback_;
+        std::chrono::steady_clock::time_point lastPointCloudPublish_;
+        uint64_t publishedPointCloudRevision_ = std::numeric_limits<uint64_t>::max();
+        std::unordered_map<uint64_t, std::shared_ptr<PlaneMap>> planeMaps_;
+        PlaneMapPtr planeMap(uint64_t id) const {
+          const auto it = planeMaps_.find(id);
+          return it == planeMaps_.end() ? nullptr : it->second;
+        }
         IntegrationPublishCallback integrationPublishCallback_;
 
         kinematics::Transformation T_BS_;

@@ -89,6 +89,13 @@ install(TARGETS ${LIB_NAME} EXPORT okvisTargets
 install(DIRECTORY include/okvis DESTINATION ${CMAKE_INSTALL_INCLUDEDIR} FILES_MATCHING PATTERN "*.hpp")
 install(DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/include/okvis DESTINATION ${CMAKE_INSTALL_INCLUDEDIR} FILES_MATCHING PATTERN "*.hpp")
 
+if(BUILD_TESTS OR BUILD_POINT_TO_PLANE_TESTS)
+  add_executable(okvis_plane_only_mapping_test test/TestPlaneOnlyMapping.cpp)
+  target_link_libraries(okvis_plane_only_mapping_test PRIVATE okvis::MultisensorProcessing)
+  add_test(NAME okvis_plane_only_mapping COMMAND okvis_plane_only_mapping_test)
+  set_tests_properties(okvis_plane_only_mapping PROPERTIES TIMEOUT 20)
+endif()
+
 if(BUILD_TESTS)
   set(TEST_NAME okvis_multisensor_processing_test)
   add_executable(${TEST_NAME}

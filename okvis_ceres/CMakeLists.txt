@@ -54,6 +54,7 @@ add_library(${LIB_NAME}
   src/SpeedAndBiasError.cpp
   src/SpeedAndBiasParameterBlock.cpp
   src/SubmapIcpError.cpp
+  src/PointToPlaneError.cpp
   src/TwoPoseGraphError.cpp
   src/TwoPoseExtrinsicsGraphError.cpp
   src/ViGraph.cpp
@@ -104,6 +105,12 @@ install(TARGETS ${LIB_NAME} EXPORT okvisTargets
   LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
 )
 install(DIRECTORY include/okvis DESTINATION ${CMAKE_INSTALL_INCLUDEDIR} FILES_MATCHING PATTERN "*.hpp")
+
+if(BUILD_TESTS OR BUILD_POINT_TO_PLANE_TESTS)
+  add_executable(okvis_point_to_plane_test test/TestPointToPlane.cpp)
+  target_link_libraries(okvis_point_to_plane_test PRIVATE okvis::Ceres)
+  add_test(NAME okvis_point_to_plane COMMAND okvis_point_to_plane_test)
+endif()
 
 if(BUILD_TESTS)
   find_package(Boost REQUIRED COMPONENTS filesystem)

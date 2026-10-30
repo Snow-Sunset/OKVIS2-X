@@ -69,6 +69,8 @@ int main(int argc, char **argv) {
   node->declare_parameter("imu_propagated_state_publishing_rate", 0.0);
   node->declare_parameter("mesh_cutoff_z", std::numeric_limits<float>::max());
   node->declare_parameter("save_submap_meshes", false);
+  node->declare_parameter("save_lidar_pointcloud_map", true);
+  node->declare_parameter("lidar_pointcloud_map_filename", "");
   node->declare_parameter("csv_path", "/tmp/");
 
   node->get_parameter("config_filename", configFilename);
@@ -98,6 +100,8 @@ int main(int argc, char **argv) {
   if(!node->get_parameter("save_submap_meshes", save_meshes)){
     LOG(WARNING) << "save_submap_meshes not defined. Will not save submap meshes.";
   }
+  const bool saveLidarMap = node->get_parameter("save_lidar_pointcloud_map").as_bool();
+  const std::string lidarMapFilename = node->get_parameter("lidar_pointcloud_map_filename").as_string();
   std::string csv_path = "/tmp/";
   if(!node->get_parameter("csv_path", csv_path)){
     LOG(INFO) << "csv_path not defined. Will save trajectory to /tmp/.";
@@ -118,6 +122,8 @@ int main(int argc, char **argv) {
   auto threadedImagePublisher    = std::make_shared<okvis::ThreadedPublisher>(node);
   auto threadedPublisher         = std::make_shared<okvis::ThreadedPublisher>(node);
   okvis::Publisher publisher(node, threadedOdometryPublisher, threadedImagePublisher, threadedPublisher);
+  publisher.setMeshPublishingEnabled(submapConfig.write_mesh_output
+      && !(parameters.lidar && submapConfig.lidarPlaneOnly));
 
   // Check for mesh cutoff
   double mesh_cutoff_z = std::numeric_limits<float>::max();
@@ -287,12 +293,18 @@ int main(int argc, char **argv) {
 
       seInterface->setAlignCallback(std::bind(&okvis::ThreadedSlam::addSubmapAlignmentConstraints, &estimator,
                                     std::placeholders::_1, std::placeholders::_2, std::placeholders::_3,
-                                    std::placeholders::_4, std::placeholders::_5, std::placeholders::_6));
+                                    std::placeholders::_4, std::placeholders::_5, std::placeholders::_6,
+                                    std::placeholders::_7, std::placeholders::_8));
 
       seInterface->setAlignmentPublishCallback([&](const okvis::Time& timestamp, const okvis::kinematics::Transformation& T_WS,
         const std::vector<Eigen::Vector3f, Eigen::aligned_allocator<Eigen::Vector3f>>& alignPointCloud, bool isMapFrame)
         {publisher.publishAlignmentPointsAsCallback(timestamp, T_WS, alignPointCloud, isMapFrame);}
       );
+
+      seInterface->setPointCloudMapCallback([&](const okvis::Time& timestamp,
+          const okvis::LidarPointCloudMap::Points& points) {
+        publisher.publishLidarPointCloudMap(timestamp, points);
+      });
 
       // Start submapping interface.
       seInterface->start();
@@ -336,7 +348,8 @@ int main(int argc, char **argv) {
     // Main loop
     while (true) {
       rclcpp::spin_some(node);
-      estimator.processFrame();
+      const bool processed = estimator.processFrame();
+      if (!processed) std::this_thread::sleep_for(std::chrono::milliseconds(1));
       std::map<std::string, cv::Mat> images;
       estimator.display(images);
       publisher.publishImages(images);
@@ -360,15 +373,22 @@ int main(int argc, char **argv) {
 
     // Finish up
     estimator.stopThreading();
-    while(!seInterface->finishedIntegrating());
-    seInterface->setFinished();
+    if (seInterface) {
+      while(!seInterface->finishedIntegrating());
+      seInterface->setFinished();
+    }
 
     // Write CSV
     estimator.setFinalTrajectoryCsvFile(csv_path + "/okvis2-final_trajectory.csv", false);
     estimator.writeFinalTrajectoryCsv();
 
+    if (saveLidarMap && seInterface && parameters.lidar && submapConfig.buildLidarPointCloudMap) {
+      const std::string filename = lidarMapFilename.empty() ? csv_path + "/lidar_map.pcd" : lidarMapFilename;
+      if (!seInterface->saveLidarPointCloudMap(filename)) LOG(WARNING) << "LiDAR map empty or could not be saved: " << filename;
+    }
+
     // Save Meshes if requested
-    if(save_meshes){
+    if(save_meshes && seInterface && seInterface->meshEnabled()){
       LOG(INFO) << "Saving the submap meshes of the submapping interface";
       seInterface->saveAllSubmapMeshes();
     } else {

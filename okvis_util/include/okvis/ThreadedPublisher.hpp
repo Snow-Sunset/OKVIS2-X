@@ -80,7 +80,7 @@ class ThreadedPublisher {
      * @param notifyCallback Function to notify when a new message is available.
      */
     PublisherTyped(std::string name, rclcpp::Node::SharedPtr node,
-                   std::function<void()> notifyCallback)
+                   std::function<void()> notifyCallback, const rclcpp::QoS& qos)
         : node_(node),
           queue_(std::make_shared<
                  okvis::threadsafe::Queue<std::shared_ptr<MessageType>>>()),
@@ -94,7 +94,7 @@ class ThreadedPublisher {
             imageTransport_->advertise(name, 1));
       } else {
         // Standard ROS2 publisher
-        publisher_ = node_->create_publisher<MessageType>(name, 1);
+        publisher_ = node_->create_publisher<MessageType>(name, qos);
       }
     }
 
@@ -193,6 +193,7 @@ public:
    * @param name The topic name to advertise on.
    * @param preprocessingFunction A preprocessing function returning the message
    * to be published.
+   * @param qos QoS for standard ROS2 publishers; image_transport retains its own settings.
    * @return A PublisherHandle with publish member that stores the latest message to be published.
    */
   template <typename MessageType, typename PreprocParamType = MessageType>
@@ -200,9 +201,10 @@ public:
   registerPublisher(const std::string name,
                     std::function<std::shared_ptr<MessageType>(
                         std::shared_ptr<PreprocParamType>)>
-                        preprocessingFunction = nullptr) {
+                        preprocessingFunction = nullptr,
+                    const rclcpp::QoS& qos = rclcpp::QoS(1)) {
     auto newPub = std::make_shared<PublisherTyped<MessageType>>(
-        name, node_, [this]() { this->notifyDataAvailable(); });
+        name, node_, [this]() { this->notifyDataAvailable(); }, qos);
     publishers_.push_back(newPub);
 
     if constexpr (!std::is_same_v<MessageType, PreprocParamType>) {

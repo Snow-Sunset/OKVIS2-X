@@ -47,6 +47,7 @@
 #include <std_srvs/srv/set_bool.hpp>
 #include <mutex>
 
+#include <okvis/LidarPointCloudMap.hpp>
 #include <okvis/ViInterface.hpp>
 #include <okvis/kinematics/Transformation.hpp>
 #include <okvis/Parameters.hpp>
@@ -90,6 +91,9 @@ class Publisher
   /// \param node The ROS2 node.
   void setupNode(std::shared_ptr<rclcpp::Node> node);
 
+  /// Configure before starting publication threads.
+  void setMeshPublishingEnabled(bool enabled) { meshPublishingEnabled_ = enabled; }
+
   /**
    * @brief Set the body.
    * @param T_BS Transform body-IMU.
@@ -131,6 +135,8 @@ class Publisher
    * @param nCameraSystem Multi-camera sensor setup.
    */
   void setupImageTopics(const okvis::cameras::NCameraSystem & nCameraSystem);
+
+  void publishLidarPointCloudMap(const Time& timestamp, const LidarPointCloudMap::Points& points);
 
   /**
    * @brief Set up the topics.
@@ -204,6 +210,8 @@ class Publisher
                                   const Eigen::Vector3d& linear_velocity, const Eigen::Vector3d& angular_velocity);
 
   private:
+  bool meshPublishingEnabled_ = true;
+  okvis::ThreadedPublisher::PublisherHandle<sensor_msgs::msg::PointCloud2> pubLidarMap_;
 
   /// @name Node and subscriber related
   /// @{

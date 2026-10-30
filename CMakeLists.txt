@@ -12,6 +12,8 @@ option (BUILD_APPS
         "Builds a demo app (which require boost and OpenCV highgui)" ON)
 option (BUILD_TESTS
         "Builds all gtests" OFF)
+option (BUILD_POINT_TO_PLANE_TESTS
+        "Build focused LiDAR plane map and factor checks" OFF)
 option (BUILD_ROS2
         "Builds ros2 wrapper" ON)
 option (HAVE_LIBREALSENSE
@@ -215,7 +217,7 @@ if(NOT DO_TIMING)
   message(STATUS "Deactivating timers")
 endif()
 
-if(BUILD_TESTS)
+if(BUILD_TESTS OR BUILD_POINT_TO_PLANE_TESTS)
   # Must be called before adding any tests for them to be registered with CMake
   enable_testing()
 endif()
@@ -600,6 +602,13 @@ if(BUILD_ROS2)
     LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
   )
   install(DIRECTORY include/okvis DESTINATION ${CMAKE_INSTALL_INCLUDEDIR} FILES_MATCHING PATTERN "*.hpp")
+
+  if(BUILD_TESTS OR BUILD_POINT_TO_PLANE_TESTS)
+    add_executable(okvis_lidar_map_publisher_test okvis_ros2/test/TestLidarMapPublisher.cpp)
+    target_link_libraries(okvis_lidar_map_publisher_test PRIVATE okvis::Ros2)
+    add_test(NAME okvis_lidar_map_publisher COMMAND okvis_lidar_map_publisher_test)
+    set_tests_properties(okvis_lidar_map_publisher PROPERTIES TIMEOUT 15 ENVIRONMENT "ROS_DOMAIN_ID=191")
+  endif()
 
   # OKVIS2X nodes - Wo/ Deep Learning
 

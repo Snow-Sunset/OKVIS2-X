@@ -13,6 +13,7 @@
 #ifndef INCLUDE_OKVIS_LIDARMOTIONUNDISTORTION_HPP
 #define INCLUDE_OKVIS_LIDARMOTIONUNDISTORTION_HPP
 
+#include <okvis/PlaneMap.hpp>
 #include <okvis/kinematics/Transformation.hpp>
 #include <okvis/ViInterface.hpp>
 #include <okvis/mapTypedefs.hpp>
@@ -44,6 +45,10 @@ namespace okvis{
         /// \brief Function doing voxel hash grid based downsampling
         bool downsample(size_t num_output_points, double voxel_grid_resolution=0.1);
 
+        /// \brief Spatially sample candidates without imposing a random point limit.
+        /// Invalid resolutions throw; nonfinite or unindexable points are removed.
+        bool voxelDownsample(double voxel_grid_resolution=0.1);
+
         /// \brief Return reference to downsampled, deskewed point cloud
         std::vector<Eigen::Vector3f, Eigen::aligned_allocator<Eigen::Vector3f>>& deskewedDownsampledPointCloud(){
           return lidarScanPostProcessed_;
@@ -52,7 +57,10 @@ namespace okvis{
         /// \brief Check which points are actually observed
         /// @param map
         /// @param T_WM
-        size_t filterObserved(const SupereightMapType* map, const okvis::kinematics::Transformation& T_WM);
+        size_t filterPlanes(PlaneMapPtr map, const kinematics::Transformation& T_WM,
+                      double sensorSigma);
+
+  size_t filterObserved(const SupereightMapType* map, const okvis::kinematics::Transformation& T_WM);
 
         void randomDownsample(size_t num_output_points);
 

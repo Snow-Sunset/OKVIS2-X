@@ -16,6 +16,7 @@
  * @author Stefan Leutenegger
  */
 
+#include <okvis/ceres/PointToPlaneError.hpp>
 #include <okvis/ViGraph.hpp>
 #include <okvis/assert_macros.hpp>
 #include <okvis/timing/Timer.hpp>
@@ -1470,15 +1471,30 @@ void ViGraph::getLandmarkHessian(LandmarkId lmId, Eigen::Matrix3d& H) {
 bool ViGraph::addSubmapAlignmentConstraints(const SupereightMapType* submap_ptr,
                                             const uint64_t &frame_A_id, const uint64_t frame_B_id,
                                             std::vector<Eigen::Vector3f, Eigen::aligned_allocator<Eigen::Vector3f>>& pointCloud,
-                                            std::vector<float> sensorError, bool isLidar, const std::string robustFunction) {
+                                            std::vector<float> sensorError, bool isLidar, const std::string robustFunction,
+                                            PlaneMapPtr planeMap, bool usePointToPlane) {
+
+  const bool pointToPlane = isLidar && usePointToPlane;
+  if ((pointToPlane && !planeMap) || (!pointToPlane && !submap_ptr)) {
+    // Map announcements have no reference map and do not create constraints.
+    return false;
+  }
 
   if((states_.count(StateId(frame_A_id)) == 0) || (states_.count(StateId(frame_B_id)) == 0)){
     LOG(ERROR) << "state outside of optimisation window";
     return false;
   }
 
+  if (frame_A_id == frame_B_id || pointCloud.size() != sensorError.size()
+      || (robustFunction != "Cauchy" && robustFunction != "Tukey")) {
+    LOG(ERROR) << "Invalid submap alignment inputs";
+    return false;
+  }
+
   State & state_A = states_.at(StateId(frame_A_id));
   State & state_B = states_.at(StateId(frame_B_id));
+  const auto T_AB = state_A.pose->estimate().inverse() * state_B.pose->estimate();
+  size_t matchedPlanes = 0;
 
   size_t non_zero_occupancy = 0;
   size_t non_zero_gradient = 0;
@@ -1499,7 +1515,17 @@ bool ViGraph::addSubmapAlignmentConstraints(const SupereightMapType* submap_ptr,
     SubmapAlignmentFactor newSubmapAlignmentFactor;
     Eigen::Vector3f pt = pointCloud.at(i);
     float sigma_i = sensorError.at(i);
-    newSubmapAlignmentFactor.errorTerm.reset(new okvis::ceres::SubmapIcpError(*submap_ptr, pt.cast<double>(), sigma_i));
+    if (pointToPlane) {
+      PlaneMap::Plane plane;
+      double residualSigma;
+      const Eigen::Vector3d pointA = T_AB.C() * pt.cast<double>() + T_AB.r();
+      if (!planeMap->match(pointA, sigma_i, plane, residualSigma)) continue;
+      newSubmapAlignmentFactor.errorTerm.reset(new okvis::ceres::PointToPlaneError(
+          pt.cast<double>(), plane.center, plane.normal, residualSigma));
+      ++matchedPlanes;
+    } else {
+      newSubmapAlignmentFactor.errorTerm.reset(new okvis::ceres::SubmapIcpError(*submap_ptr, pt.cast<double>(), sigma_i));
+    }
     ::ceres::ResidualBlockId rid;
     if(robustFunction == "Cauchy") {
       rid = problem_->AddResidualBlock(newSubmapAlignmentFactor.errorTerm.get(), cauchyLossFunctionPtr_.get(), state_A.pose->parameters(), state_B.pose->parameters());
@@ -1522,7 +1548,7 @@ bool ViGraph::addSubmapAlignmentConstraints(const SupereightMapType* submap_ptr,
     state_B.mapResIds.push_back(rid);
     state_B.submapLinks.push_back(newSubmapAlignmentFactor);
 
-    if(debugLidarResiduals_){
+    if(debugLidarResiduals_ && !pointToPlane){
       resIds.push_back(rid);
 
       // Get parameter blocks
@@ -1551,7 +1577,11 @@ bool ViGraph::addSubmapAlignmentConstraints(const SupereightMapType* submap_ptr,
       if(gradNorm > maxGradNorm) maxGradNorm = gradNorm;
     }
   }
-  if(debugLidarResiduals_) {
+  if (pointToPlane && debugLidarResiduals_) {
+    LOG(INFO) << "Point-to-plane " << frame_A_id << " -> " << frame_B_id
+              << ": " << matchedPlanes << "/" << pointCloud.size() << " matches";
+  }
+  if(debugLidarResiduals_ && !pointToPlane && !pointCloud.empty()) {
     double mean_cost = 0.0;
     if(pointCloud.size() > 0) mean_cost = total_cost / pointCloud.size();
     lidarDbgInfos_.push_back({frame_B_id, frame_A_id, pointCloud.size(), non_zero_occupancy, non_zero_gradient, mean_cost, max_residual, n_big_residuals,

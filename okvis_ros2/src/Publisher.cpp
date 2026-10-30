@@ -60,6 +60,8 @@ void Publisher::setupNode(std::shared_ptr<rclcpp::Node> node)
   pubSubmapMesh_ =          threadedPublisher_->registerPublisher<visualization_msgs::msg::MarkerArray>("okvis_submap_mesh");
   pubPointsMatched_ =       threadedPublisher_->registerPublisher<sensor_msgs::msg::PointCloud2>("okvis_points_matched");
   pubPointsAlignment_ =     threadedPublisher_->registerPublisher<sensor_msgs::msg::PointCloud2>("okvis_points_alignment");
+  pubLidarMap_ = threadedPublisher_->registerPublisher<sensor_msgs::msg::PointCloud2, sensor_msgs::msg::PointCloud2>(
+      "okvis_lidar_map", nullptr, rclcpp::QoS(1).transient_local().reliable());
       
   // get the mesh, if there is one
   // where to get the mesh from
@@ -255,7 +257,7 @@ void Publisher::publishEstimatorUpdate(
   meshMsg_->pose.orientation.w = T_WS.q().w();
 
   // publish mesh
-  if(!meshMsg_->mesh_resource.empty())
+  if(meshPublishingEnabled_ && !meshMsg_->mesh_resource.empty())
     pubMesh_.publish(meshMsg_);  //publish stamped mesh
 
   // check if empty
@@ -417,6 +419,7 @@ void Publisher::publishSubmapsAsCallback(std::unordered_map<uint64_t, okvis::kin
                                          std::unordered_map<uint64_t, std::shared_ptr<okvis::SupereightMapType>> submapLookup,
                                          std::shared_ptr<okvis::ObjectMap> objectMap) 
 {
+  if (!meshPublishingEnabled_) return;
   constexpr size_t n = okvis::SupereightMapType::SurfaceMesh::value_type::num_vertexes;
 
   std_msgs::msg::Header header;
@@ -696,6 +699,19 @@ void Publisher::publishFieldSliceAsCallback(
     }
   }
   slice_pub_.publish(msg);
+}
+
+void Publisher::publishLidarPointCloudMap(const Time& timestamp, const LidarPointCloudMap::Points& points) {
+  pcl::PointCloud<pcl::PointXYZ> cloud;
+  cloud.reserve(points.size());
+  for (const auto& point : points) {
+    cloud.push_back(pcl::PointXYZ(float(point.x()), float(point.y()), float(point.z())));
+  }
+  auto message = std::make_shared<sensor_msgs::msg::PointCloud2>();
+  pcl::toROSMsg(cloud, *message);
+  message->header.frame_id = "world";
+  message->header.stamp = rclcpp::Time(timestamp.sec, timestamp.nsec);
+  pubLidarMap_.publish(message);
 }
 
 void Publisher::publishAlignmentPointsAsCallback(const okvis::Time& timestamp, const okvis::kinematics::Transformation& T_WS,

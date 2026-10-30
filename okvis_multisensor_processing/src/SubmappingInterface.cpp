@@ -19,6 +19,7 @@
 #include <opencv2/highgui.hpp>
 
 #include <pcl/io/ply_io.h>
+#include <pcl/io/pcd_io.h>
 #include <pcl/point_types.h>
 
 
@@ -121,7 +122,7 @@ namespace okvis {
   }
 
   void SubmappingInterface::drawSubmaps() {
-    if(seSubmapLookup_.size() == 0)
+    if(planeOnlyMapping() || seSubmapLookup_.size() == 0)
       return;
 
     cv::Mat submapTopView;
@@ -490,7 +491,7 @@ namespace okvis {
       
       LOG(INFO) << "In the integration loop";
       while(!isFinished()){
-        checkForAvailableData();
+        if (!checkForAvailableData()) std::this_thread::sleep_for(std::chrono::milliseconds(1));
       }
     }
 
@@ -498,10 +499,13 @@ namespace okvis {
     bool SubmappingInterface::finishedIntegrating(){
       uint64_t numMessages;
       numMessages = supereightFrames_.Size() + stateUpdates_.Size();
+      if (numMessages == 0 && seSubmapLookup_.empty() && !isProcessingSeFrame_ && !frame_) {
+        return true;
+      }
       if(numMessages == 0 && seSubmapLookup_.size() > 0 && !isProcessingSeFrame_){
 
         if(lidarSensors_){
-          lidarMap2MapFactors();
+          if (submapConfig_.useMap2MapFactors) lidarMap2MapFactors();
 
           if(visualizeSubmaps_) {
             drawSubmaps();
@@ -601,6 +605,7 @@ namespace okvis {
 
 
     void SubmappingInterface::saveSubmap(uint64_t kfId){
+      if (!meshEnabled()) return;
       std::string mesh_numbering;
       if (kfId < 10) {
         mesh_numbering = "00000" + std::to_string(kfId);
@@ -719,338 +724,360 @@ namespace okvis {
     }
 
     void SubmappingInterface::processSupereightFrames() {
+      SupereightFrames frame;
+      while (!isFinished() && supereightFrames_.PopBlocking(&frame)) {
+        processSupereightFrame(frame);
+      }
+    }
 
-      // Get Supereight Frames --> supposed to be integrated into submaps
-      SupereightFrames supereightFrame;
-      while(!isFinished()){
-        while (supereightFrames_.PopBlocking(&supereightFrame)){
-          if (visualizeSubmaps_) {
-            drawSubmaps();
-          }
-          TimerSwitchable timingProcessSeFrame("9 Process supereight frames");
-          isProcessingSeFrame_ = true;
+    void SubmappingInterface::processSupereightFrame(SupereightFrames& supereightFrame) {
+    if (visualizeSubmaps_) {
+      drawSubmaps();
+    }
+    TimerSwitchable timingProcessSeFrame("9 Process supereight frames");
+    isProcessingSeFrame_ = true;
 
-          TimerSwitchable timingNewSubmap("9.1 Decide a new submap");
-          bool create_new_submap = decideNewSubmap(supereightFrame);
-          timingNewSubmap.stop();
+    TimerSwitchable timingNewSubmap("9.1 Decide a new submap");
+    bool create_new_submap = decideNewSubmap(supereightFrame);
+    timingNewSubmap.stop();
 
-          updated_maps_.insert(supereightFrame.keyFrameId);
+    updated_maps_.insert(supereightFrame.keyFrameId);
 
-          for (auto &frameData: supereightFrame.frameData_) {
-
-            // We only update the poses of the keyframes which have a submap associated to it
-            const Transformation T_WS = frameData.second.T_WS;
-            if(covisibleFrames_.find(StateId(frameData.first)) == covisibleFrames_.end()){
-              covisibleFrames_.emplace(StateId(frameData.first), frameData.second.covisibles_);
-            } else {
-              covisibleFrames_[StateId(frameData.first)] = frameData.second.covisibles_;
-            }
-
-            // Check If Id exists.
-            if (seSubmapLookup_.count(frameData.first)) {
-              updated_maps_.insert(frameData.first);
-              seSubmapLookup_[frameData.first].T_WK = Eigen::Isometry3f(T_WS.T().cast<float>());
-            } else if(frameData.first == supereightFrame.keyFrameId){
-              // Insert
-              seSubmapLookup_[supereightFrame.keyFrameId] = {nullptr, Eigen::Isometry3f(T_WS.T().cast<float>())};
-            }
-          }
-
-          // Create a new submap and reset frame counter
-          if (create_new_submap) {
-
-            submapCounter_++;
-            if(submapCounter_ > 1){
-              previousSubmap_ = seSubmapLookup_[prevKeyframeId_].map.get();
-              previousSubmapId_ = prevKeyframeId_;
-            }
-
-            addSubmapAlignmentFactors(supereightFrame);
-
-            LOG(INFO) << "New submap generation with counter " << submapCounter_ << " (kf Id: " << supereightFrame.keyFrameId << ")";
-
-            // now we integrate in this keyframe, until we find a new one that is distant enough
-            seSubmapLookup_[supereightFrame.keyFrameId].map = std::shared_ptr<SupereightMapType>(new SupereightMapType(mapConfig_, dataConfig_));
-            prevKeyframeId_ = supereightFrame.keyFrameId;
-
-            lidarKfDetected_ = false;
-            numIntegratedLidarFrames_ = 0;
-            numIntegratedDepthFrames_ = 0; 
-          }
-          auto& activeMap = *(seSubmapLookup_[supereightFrame.keyFrameId].map);
-
-          se::MapIntegrator integrator(activeMap);
-
-          TimerSwitchable batchIntegration("9.2 Lidar batch integration");
-          if(lidarSensors_ && supereightFrame.vecRayMeasurements.size() > 0 && supereightFrames_.Size() <= 1){
-            // Here prevKeyframeId_ will always be the current active submap
-            okvis::kinematics::Transformation T_WK(seSubmapLookup_[prevKeyframeId_].T_WK.matrix().cast<double>());
-            TimerSwitchable prepareInput("9.2.0 SE2 LiDAR prepare input");
-            updateLidarAlignBlock(supereightFrame.vecRayMeasurements, T_WK);
-            prepareInput.stop();
-            // Now we transform the measurements into the map frame for integration
-            if(integrationPublishCallback_) integrationPublishCallback_(supereightFrame.vecRayMeasurements);
-            TimerSwitchable actualIntegrationTimer("9.2.1 Actual lidar integration");
-            integrator.integrateRayBatch(integration_counter_, supereightFrame.vecRayMeasurements, (*lidarSensors_).second);
-            actualIntegrationTimer.stop();
-            numIntegratedLidarFrames_++;
-            integration_counter_++;
-
-          }
-
-          batchIntegration.stop();
-
-          if(cameraSensors_ && supereightFrames_.Size() <= 1){
-            okvis::kinematics::Transformation T_WK(seSubmapLookup_[prevKeyframeId_].T_WK.matrix().cast<double>());
-
-            for(size_t i = 0; i < supereightFrame.vecDepthFrames.size(); i++){
-              TimerSwitchable diIntegration("9.3 Depth integration");
-              try{
-                int depthImage_idx = -1;
-                int colourImage_idx = -1;
-                for(const auto& idx_cam_measurements: supereightFrame.vecDepthFrames[i]) {
-                  if(viParameters_.nCameraSystem.isDepthCamera(idx_cam_measurements.first) &&
-                    (*cameraSensors_).find(idx_cam_measurements.first) != (*cameraSensors_).end()){
-                      for(const auto& measurement : idx_cam_measurements.second) {
-                        if(!measurement.second.measurement.depthImage.empty()) {
-                          depthImage_idx = idx_cam_measurements.first;
-                        }
-                      }
-                  }
-
-                  if(viParameters_.nCameraSystem.cameraType(idx_cam_measurements.first).isColour
-                            && (*cameraSensors_).find(idx_cam_measurements.first) != (*cameraSensors_).end()) {
-                      for(const auto& measurement : idx_cam_measurements.second) {
-                        if(!measurement.second.measurement.image.empty()) {
-                          colourImage_idx = idx_cam_measurements.first;
-                        }
-                      }
-                  }
-                }
-
-                std::pair<Eigen::Isometry3f, okvis::CameraMeasurement> depthData;
-                std::pair<Eigen::Isometry3f, okvis::CameraMeasurement> rgbData;
-
-                if(depthImage_idx == -1) {
-                  LOG(WARNING) << "No integration is going to happen, either there is no depth camera with the mapping flag set to true or there are no depth images";
-                  continue;
-                } else if(depthImage_idx != -1 && colourImage_idx == -1) {
-                  DLOG(INFO) << "Only depth";
-
-                  for(const auto& measurements : supereightFrame.vecDepthFrames[i].at(depthImage_idx)) {
-                    if(!measurements.second.measurement.depthImage.empty()) {
-                      depthData = measurements;
-                      break;
-                    }
-                  }
-
-                  se::Measurements seMeasurements = {se::Measurement{
-                    depthMat2Image(depthData.second.measurement.depthImage),
-                    (*cameraSensors_).at(depthImage_idx).second,
-                    Eigen::Isometry3f(T_WK.inverse().T().cast<float>() * depthData.first.matrix())}};
-                  se::Image<float> seSigmaImage(depthData.second.measurement.depthImage.cols,
-                                                depthData.second.measurement.depthImage.rows);
-                  if (submapConfig_.useUncertainty && !depthData.second.measurement.sigmaImage.empty()) {
-                    seSigmaImage = depthMat2Image(depthData.second.measurement.sigmaImage);
-                    seMeasurements.depth_sigma = &seSigmaImage;
-                  }
-                  integrator.integrateDepth(integration_counter_, seMeasurements);
-                  integration_counter_++;
-                  numIntegratedDepthFrames_++;
-                } else if(depthImage_idx != -1 && colourImage_idx != -1) {
-
-                  for(const auto& measurements : supereightFrame.vecDepthFrames[i].at(depthImage_idx)) {
-                    if(!measurements.second.measurement.depthImage.empty()) {
-                      depthData = measurements;
-                      break;
-                    }
-                  }
-
-                  for(const auto& measurements : supereightFrame.vecDepthFrames[i].at(colourImage_idx)) {
-                    if(!measurements.second.measurement.image.empty()) {
-                      rgbData = measurements;
-                      break;
-                    }
-                  }
-
-
-                  TimerSwitchable diWarp("8.5.2 -- warping");
-                  // Register depth
-                  cv::Mat warped_depth(depthData.second.measurement.depthImage.size(),
-                                       CV_64F);
-
-                  if(!warpDepthImageToColor(depthData, rgbData, depthImage_idx, colourImage_idx, warped_depth)) {
-                    LOG(WARNING) << "Warping Depth failed. Use original depth.";
-                    warped_depth = depthData.second.measurement.depthImage;
-                  }
-                  diWarp.stop();
-
-                  if(rgbData.second.measurement.deep_learning_data.find("language_features") != rgbData.second.measurement.deep_learning_data.end() &&
-                     rgbData.second.measurement.deep_learning_data.find("sam_masks") != rgbData.second.measurement.deep_learning_data.end()){
-
-                    #ifdef OKVIS_COLIDMAP
-
-                    TimerSwitchable diLookup("8.5.3 -- segment lookup");
-                    se::Image<se::id_t> surface_segment_id = se::raycaster::lookup_ids(activeMap,
-                            depthMat2Image(warped_depth),
-                            (*cameraSensors_).at(depthImage_idx).second,
-                            Eigen::Isometry3f(T_WK.inverse().T().cast<float>() * rgbData.first.matrix()));
-                    diLookup.stop();
-
-                    // Get masks of invalid depth regions
-                    TimerSwitchable diInvalid("8.5.4 -- invalid mask");
-                    cv::Mat invalid_depth_mask(depthData.second.measurement.depthImage.rows,
-                                              depthData.second.measurement.depthImage.cols,
-                                              CV_8UC1, cv::Scalar(0));
-                    invalid_depth_mask.setTo(cv::Scalar(1), warped_depth < (*cameraSensors_).at(depthImage_idx).second.near_plane);
-                    invalid_depth_mask.setTo(cv::Scalar(1), warped_depth > (*cameraSensors_).at(depthImage_idx).second.far_plane);
-                    diInvalid.stop();
-
-                    // Do Matching of segments in current image and active Submap
-                    TimerSwitchable diUnique("8.5.5 -- unique segments");
-                    cv::Mat unique_segments = objectMap_->processData(prevKeyframeId_,
-                                                                    invalid_depth_mask,
-                                                                    rgbData.second.measurement.deep_learning_data["sam_masks"],
-                                                                    rgbData.second.measurement.deep_learning_data["language_features"],
-                                                                    surface_segment_id);
-                    se::Image<se::id_t> unique_segments_as_se_image(unique_segments.cols, unique_segments.rows, reinterpret_cast<se::id_t*>(unique_segments.data));
-                    diUnique.stop();
-
-
-                    TimerSwitchable diIntegrate("8.5.5 -- actual integration");
-                    // Now Integrate Depth, Color, as well as Segments
-                    integrator.integrateDepth(
-                        integration_counter_,
-                        se::Measurements{se::Measurement{
-                                            depthMat2Image(depthData.second.measurement.depthImage),
-                                            (*cameraSensors_).at(depthImage_idx).second,
-                                            Eigen::Isometry3f(T_WK.inverse().T().cast<float>() * depthData.first.matrix())},
-                                          se::Measurement<se::PinholeCamera, se::colour_t>{
-                                            rgbMat2Image(rgbData.second.measurement.image),
-                                            (*cameraSensors_).at(colourImage_idx).second,
-                                            Eigen::Isometry3f(T_WK.inverse().T().cast<float>() * rgbData.first.matrix())},
-                                          se::Measurement{unique_segments_as_se_image, (*cameraSensors_).at(colourImage_idx).second,
-                                            Eigen::Isometry3f(T_WK.inverse().T().cast<float>() * rgbData.first.matrix())}
-                                          });
-                    #else
-                      static bool dbg_message = true;
-                      if(dbg_message) {
-                        dbg_message = false;
-                        LOG(ERROR) << "Detected SAM and Language features but the map does not support it, doing normal integration." \
-                         "Please check the CMakeLists.txt OKVIS_COLIDMAP option in case this is not the desired usage";
-                      }
-                      TimerSwitchable diIntegrate("8.5.5 -- actual integration");
-                      integrator.integrateDepth(
-                          integration_counter_,
-                          se::Measurements{se::Measurement{
-                                              depthMat2Image(depthData.second.measurement.depthImage),
-                                              (*cameraSensors_).at(depthImage_idx).second,
-                                              Eigen::Isometry3f(T_WK.inverse().T().cast<float>() * depthData.first.matrix())},
-                                            se::Measurement<se::PinholeCamera, se::colour_t>{
-                                              rgbMat2Image(rgbData.second.measurement.image),
-                                              (*cameraSensors_).at(colourImage_idx).second,
-                                              Eigen::Isometry3f(T_WK.inverse().T().cast<float>() * rgbData.first.matrix())}
-                                            });
-                    #endif
-                    diIntegrate.stop();
-
-
-                  } else {
-                    integrator.integrateDepth(
-                        integration_counter_,
-                        se::Measurements{se::Measurement{
-                                            depthMat2Image(depthData.second.measurement.depthImage),
-                                            (*cameraSensors_).at(depthImage_idx).second,
-                                            Eigen::Isometry3f(T_WK.inverse().T().cast<float>() * depthData.first.matrix())},
-                                          se::Measurement<se::PinholeCamera, se::colour_t>{
-                                            rgbMat2Image(rgbData.second.measurement.image),
-                                            (*cameraSensors_).at(colourImage_idx).second,
-                                            Eigen::Isometry3f(T_WK.inverse().T().cast<float>() * rgbData.first.matrix())}
-                                          });
-                  }
-                  integration_counter_++;
-                  numIntegratedDepthFrames_++;
-                }
-                last_integrated_state_ = supereightFrame.frameData_.rbegin()->first;
-                diIntegration.stop();
-
-                if (submapConfig_.useMap2MapFactors) {
-                  updateDepthAlignBlock(depthData, T_WK, depthImage_idx);
-                }
-              } catch (const std::exception& e) {
-                throw std::runtime_error(e.what());
-              }   
-            } 
-          }
-
-          //Do it with depth images
-
-          // Get the latest state estimate if one exists.
-          okvis::State current_state; // Use only T_WS
-          Eigen::Matrix4f currentPose_WS;
-          {
-            std::lock_guard lockCurrentPose(currentPose_mtx_);
-            currentPose_WS = currentPose_;
-          }
-          current_state.T_WS = okvis::kinematics::Transformation(currentPose_WS.cast<double>());
-
-          State lastKnownState;
-          TrackingState lastTrackingState;
-          {
-            std::lock_guard _(state_mtx_);
-            lastKnownState = latestState_;
-            lastTrackingState = latestTrackingState_;
-          }
-
-          if (fieldCallback_) {
-            fieldCallback_(current_state, seSubmapLookup_);
-          }
-
-          {
-            std::lock_guard _(language_embedding_mtx);
-            Descriptor ldesc = languageDescriptor_.normalized();
-          }
-        
-          if(create_new_submap && previousSubmapId_ != UNINITIALIZED_ID){
-
-            LOG(INFO) << "Completed integrating submap " << previousSubmapId_ << " which is submap number " << seSubmapLookup_.size();
-            LOG(INFO) << okvis::timing::Timing::print();
-
-            DLOG(INFO) << "Trying to mesh for frame " << previousSubmapId_;
-            if(previousSubmapId_ != UNINITIALIZED_ID){
-              // ToDo: mesh in asynchronous thread, not to block processing
-              seMeshLookup_[previousSubmapId_] = seSubmapLookup_[previousSubmapId_].map->mesh();
-
-              // Finish Objects for completed submap, means coloring of mesh for text query and extracting poses
-              objectMap_->finishSubmapObjects(previousSubmapId_);
-            }
-
-
-            // save mesh and publish submap
-            if (submapCallback_) {
-              AlignedUnorderedMap<uint64_t, Transformation> submapPoses;
-              std::unordered_map<uint64_t, std::shared_ptr<SupereightMapType>> submaps;
-
-              for(auto it: updated_maps_){
-                if(it == prevKeyframeId_) continue;
-                okvis::kinematics::Transformation submapPose(seSubmapLookup_[it].T_WK.matrix().cast<double>());
-                submapPoses[it] = submapPose;
-                submaps[it] = seSubmapLookup_[it].map;
-              }
-              updated_maps_.clear();
-              
-              TimerSwitchable submap_viz("9.4 Submap visualization");
-
-              publishSubmaps(submapPoses, submaps);
-              submap_viz.stop();
-            }
-          }
-          isProcessingSeFrame_ = false;
-          timingProcessSeFrame.stop();
+    applyPendingPointCloudPoses();
+    if (pointCloudMap_) {
+      std::lock_guard lock(pointCloudMapMutex_);
+      for (const auto& frame : supereightFrame.frameData_) {
+        if (frame.first == supereightFrame.keyFrameId || pointCloudMap_->hasSubmap(frame.first)) {
+          pointCloudMap_->updatePose(frame.first, Eigen::Isometry3d(frame.second.T_WS.T()));
         }
       }
-      return;
     }
+
+    for (auto &frameData: supereightFrame.frameData_) {
+
+      // We only update the poses of the keyframes which have a submap associated to it
+      const Transformation T_WS = frameData.second.T_WS;
+      if(covisibleFrames_.find(StateId(frameData.first)) == covisibleFrames_.end()){
+        covisibleFrames_.emplace(StateId(frameData.first), frameData.second.covisibles_);
+      } else {
+        covisibleFrames_[StateId(frameData.first)] = frameData.second.covisibles_;
+      }
+
+      // Check If Id exists.
+      if (seSubmapLookup_.count(frameData.first)) {
+        updated_maps_.insert(frameData.first);
+        seSubmapLookup_[frameData.first].T_WK = Eigen::Isometry3f(T_WS.T().cast<float>());
+      } else if(frameData.first == supereightFrame.keyFrameId){
+        // Insert
+        seSubmapLookup_[supereightFrame.keyFrameId] = {nullptr, Eigen::Isometry3f(T_WS.T().cast<float>())};
+      }
+    }
+
+    // Create a new submap and reset frame counter
+    if (create_new_submap) {
+
+      submapCounter_++;
+      if(submapCounter_ > 1){
+        previousSubmap_ = seSubmapLookup_[prevKeyframeId_].map.get();
+        previousSubmapId_ = prevKeyframeId_;
+      }
+
+      addSubmapAlignmentFactors(supereightFrame);
+
+      LOG(INFO) << "New submap generation with counter " << submapCounter_ << " (kf Id: " << supereightFrame.keyFrameId << ")";
+
+      // now we integrate in this keyframe, until we find a new one that is distant enough
+      if (!planeOnlyMapping()) {
+        seSubmapLookup_[supereightFrame.keyFrameId].map = std::make_shared<SupereightMapType>(mapConfig_, dataConfig_);
+      }
+      if (lidarSensors_ && submapConfig_.usePointToPlaneFactors) {
+        planeMaps_[supereightFrame.keyFrameId] = std::make_shared<PlaneMap>(submapConfig_.planeMapConfig);
+      }
+      prevKeyframeId_ = supereightFrame.keyFrameId;
+
+      lidarKfDetected_ = false;
+      numIntegratedLidarFrames_ = 0;
+      numIntegratedDepthFrames_ = 0;
+    }
+    std::unique_ptr<se::MapIntegrator<SupereightMapType>> integrator;
+    if (!planeOnlyMapping()) {
+      integrator = std::make_unique<se::MapIntegrator<SupereightMapType>>(
+          *seSubmapLookup_.at(supereightFrame.keyFrameId).map);
+    }
+
+    TimerSwitchable batchIntegration("9.2 LiDAR map update");
+    if(lidarSensors_ && supereightFrame.vecRayMeasurements.size() > 0 && supereightFrames_.Size() <= 1){
+      // Here prevKeyframeId_ will always be the current active submap
+      okvis::kinematics::Transformation T_WK(seSubmapLookup_[prevKeyframeId_].T_WK.matrix().cast<double>());
+      TimerSwitchable prepareInput("9.2.0 LiDAR input preparation");
+      updateLidarAlignBlock(supereightFrame.vecRayMeasurements, T_WK);
+      prepareInput.stop();
+      if (submapConfig_.usePointToPlaneFactors || pointCloudMap_) {
+        PlaneMap::Points endpoints;
+        endpoints.reserve(supereightFrame.vecRayMeasurements.size());
+        for (const auto& ray : supereightFrame.vecRayMeasurements) {
+          const double range = ray.second.norm();
+          if (!std::isfinite(range) || range < lidarSensors_->second.near_plane
+              || range > lidarSensors_->second.far_plane) continue;
+          endpoints.push_back((ray.first * ray.second).cast<double>());
+        }
+        if (submapConfig_.usePointToPlaneFactors) planeMaps_.at(prevKeyframeId_)->addPoints(endpoints);
+        if (pointCloudMap_) {
+          std::lock_guard lock(pointCloudMapMutex_);
+          pointCloudMap_->addPoints(prevKeyframeId_, Eigen::Isometry3d(T_WK.T()), endpoints);
+        }
+      }
+      // Now we transform the measurements into the map frame for integration
+      if(integrationPublishCallback_) integrationPublishCallback_(supereightFrame.vecRayMeasurements);
+      if (integrator) {
+        TimerSwitchable actualIntegrationTimer("9.2.1 Occupancy lidar integration");
+        integrator->integrateRayBatch(integration_counter_, supereightFrame.vecRayMeasurements, (*lidarSensors_).second);
+      }
+      numIntegratedLidarFrames_++;
+      integration_counter_++;
+
+    }
+
+    batchIntegration.stop();
+
+    if(cameraSensors_ && supereightFrames_.Size() <= 1){
+      okvis::kinematics::Transformation T_WK(seSubmapLookup_[prevKeyframeId_].T_WK.matrix().cast<double>());
+
+      for(size_t i = 0; i < supereightFrame.vecDepthFrames.size(); i++){
+        TimerSwitchable diIntegration("9.3 Depth integration");
+        try{
+          int depthImage_idx = -1;
+          int colourImage_idx = -1;
+          for(const auto& idx_cam_measurements: supereightFrame.vecDepthFrames[i]) {
+            if(viParameters_.nCameraSystem.isDepthCamera(idx_cam_measurements.first) &&
+              (*cameraSensors_).find(idx_cam_measurements.first) != (*cameraSensors_).end()){
+                for(const auto& measurement : idx_cam_measurements.second) {
+                  if(!measurement.second.measurement.depthImage.empty()) {
+                    depthImage_idx = idx_cam_measurements.first;
+                  }
+                }
+            }
+
+            if(viParameters_.nCameraSystem.cameraType(idx_cam_measurements.first).isColour
+                      && (*cameraSensors_).find(idx_cam_measurements.first) != (*cameraSensors_).end()) {
+                for(const auto& measurement : idx_cam_measurements.second) {
+                  if(!measurement.second.measurement.image.empty()) {
+                    colourImage_idx = idx_cam_measurements.first;
+                  }
+                }
+            }
+          }
+
+          std::pair<Eigen::Isometry3f, okvis::CameraMeasurement> depthData;
+          std::pair<Eigen::Isometry3f, okvis::CameraMeasurement> rgbData;
+
+          if(depthImage_idx == -1) {
+            LOG(WARNING) << "No integration is going to happen, either there is no depth camera with the mapping flag set to true or there are no depth images";
+            continue;
+          } else if(depthImage_idx != -1 && colourImage_idx == -1) {
+            DLOG(INFO) << "Only depth";
+
+            for(const auto& measurements : supereightFrame.vecDepthFrames[i].at(depthImage_idx)) {
+              if(!measurements.second.measurement.depthImage.empty()) {
+                depthData = measurements;
+                break;
+              }
+            }
+
+            se::Measurements seMeasurements = {se::Measurement{
+              depthMat2Image(depthData.second.measurement.depthImage),
+              (*cameraSensors_).at(depthImage_idx).second,
+              Eigen::Isometry3f(T_WK.inverse().T().cast<float>() * depthData.first.matrix())}};
+            se::Image<float> seSigmaImage(depthData.second.measurement.depthImage.cols,
+                                          depthData.second.measurement.depthImage.rows);
+            if (submapConfig_.useUncertainty && !depthData.second.measurement.sigmaImage.empty()) {
+              seSigmaImage = depthMat2Image(depthData.second.measurement.sigmaImage);
+              seMeasurements.depth_sigma = &seSigmaImage;
+            }
+            integrator->integrateDepth(integration_counter_, seMeasurements);
+            integration_counter_++;
+            numIntegratedDepthFrames_++;
+          } else if(depthImage_idx != -1 && colourImage_idx != -1) {
+
+            for(const auto& measurements : supereightFrame.vecDepthFrames[i].at(depthImage_idx)) {
+              if(!measurements.second.measurement.depthImage.empty()) {
+                depthData = measurements;
+                break;
+              }
+            }
+
+            for(const auto& measurements : supereightFrame.vecDepthFrames[i].at(colourImage_idx)) {
+              if(!measurements.second.measurement.image.empty()) {
+                rgbData = measurements;
+                break;
+              }
+            }
+
+
+            TimerSwitchable diWarp("8.5.2 -- warping");
+            // Register depth
+            cv::Mat warped_depth(depthData.second.measurement.depthImage.size(),
+                                 CV_64F);
+
+            if(!warpDepthImageToColor(depthData, rgbData, depthImage_idx, colourImage_idx, warped_depth)) {
+              LOG(WARNING) << "Warping Depth failed. Use original depth.";
+              warped_depth = depthData.second.measurement.depthImage;
+            }
+            diWarp.stop();
+
+            if(rgbData.second.measurement.deep_learning_data.find("language_features") != rgbData.second.measurement.deep_learning_data.end() &&
+               rgbData.second.measurement.deep_learning_data.find("sam_masks") != rgbData.second.measurement.deep_learning_data.end()){
+
+              #ifdef OKVIS_COLIDMAP
+
+              TimerSwitchable diLookup("8.5.3 -- segment lookup");
+              se::Image<se::id_t> surface_segment_id = se::raycaster::lookup_ids(*seSubmapLookup_.at(supereightFrame.keyFrameId).map,
+                      depthMat2Image(warped_depth),
+                      (*cameraSensors_).at(depthImage_idx).second,
+                      Eigen::Isometry3f(T_WK.inverse().T().cast<float>() * rgbData.first.matrix()));
+              diLookup.stop();
+
+              // Get masks of invalid depth regions
+              TimerSwitchable diInvalid("8.5.4 -- invalid mask");
+              cv::Mat invalid_depth_mask(depthData.second.measurement.depthImage.rows,
+                                        depthData.second.measurement.depthImage.cols,
+                                        CV_8UC1, cv::Scalar(0));
+              invalid_depth_mask.setTo(cv::Scalar(1), warped_depth < (*cameraSensors_).at(depthImage_idx).second.near_plane);
+              invalid_depth_mask.setTo(cv::Scalar(1), warped_depth > (*cameraSensors_).at(depthImage_idx).second.far_plane);
+              diInvalid.stop();
+
+              // Do Matching of segments in current image and active Submap
+              TimerSwitchable diUnique("8.5.5 -- unique segments");
+              cv::Mat unique_segments = objectMap_->processData(prevKeyframeId_,
+                                                              invalid_depth_mask,
+                                                              rgbData.second.measurement.deep_learning_data["sam_masks"],
+                                                              rgbData.second.measurement.deep_learning_data["language_features"],
+                                                              surface_segment_id);
+              se::Image<se::id_t> unique_segments_as_se_image(unique_segments.cols, unique_segments.rows, reinterpret_cast<se::id_t*>(unique_segments.data));
+              diUnique.stop();
+
+
+              TimerSwitchable diIntegrate("8.5.5 -- actual integration");
+              // Now Integrate Depth, Color, as well as Segments
+              integrator->integrateDepth(
+                  integration_counter_,
+                  se::Measurements{se::Measurement{
+                                      depthMat2Image(depthData.second.measurement.depthImage),
+                                      (*cameraSensors_).at(depthImage_idx).second,
+                                      Eigen::Isometry3f(T_WK.inverse().T().cast<float>() * depthData.first.matrix())},
+                                    se::Measurement<se::PinholeCamera, se::colour_t>{
+                                      rgbMat2Image(rgbData.second.measurement.image),
+                                      (*cameraSensors_).at(colourImage_idx).second,
+                                      Eigen::Isometry3f(T_WK.inverse().T().cast<float>() * rgbData.first.matrix())},
+                                    se::Measurement{unique_segments_as_se_image, (*cameraSensors_).at(colourImage_idx).second,
+                                      Eigen::Isometry3f(T_WK.inverse().T().cast<float>() * rgbData.first.matrix())}
+                                    });
+              #else
+                static bool dbg_message = true;
+                if(dbg_message) {
+                  dbg_message = false;
+                  LOG(ERROR) << "Detected SAM and Language features but the map does not support it, doing normal integration." \
+                   "Please check the CMakeLists.txt OKVIS_COLIDMAP option in case this is not the desired usage";
+                }
+                TimerSwitchable diIntegrate("8.5.5 -- actual integration");
+                integrator->integrateDepth(
+                    integration_counter_,
+                    se::Measurements{se::Measurement{
+                                        depthMat2Image(depthData.second.measurement.depthImage),
+                                        (*cameraSensors_).at(depthImage_idx).second,
+                                        Eigen::Isometry3f(T_WK.inverse().T().cast<float>() * depthData.first.matrix())},
+                                      se::Measurement<se::PinholeCamera, se::colour_t>{
+                                        rgbMat2Image(rgbData.second.measurement.image),
+                                        (*cameraSensors_).at(colourImage_idx).second,
+                                        Eigen::Isometry3f(T_WK.inverse().T().cast<float>() * rgbData.first.matrix())}
+                                      });
+              #endif
+              diIntegrate.stop();
+
+
+            } else {
+              integrator->integrateDepth(
+                  integration_counter_,
+                  se::Measurements{se::Measurement{
+                                      depthMat2Image(depthData.second.measurement.depthImage),
+                                      (*cameraSensors_).at(depthImage_idx).second,
+                                      Eigen::Isometry3f(T_WK.inverse().T().cast<float>() * depthData.first.matrix())},
+                                    se::Measurement<se::PinholeCamera, se::colour_t>{
+                                      rgbMat2Image(rgbData.second.measurement.image),
+                                      (*cameraSensors_).at(colourImage_idx).second,
+                                      Eigen::Isometry3f(T_WK.inverse().T().cast<float>() * rgbData.first.matrix())}
+                                    });
+            }
+            integration_counter_++;
+            numIntegratedDepthFrames_++;
+          }
+          last_integrated_state_ = supereightFrame.frameData_.rbegin()->first;
+          diIntegration.stop();
+
+          if (submapConfig_.useMap2MapFactors) {
+            updateDepthAlignBlock(depthData, T_WK, depthImage_idx);
+          }
+        } catch (const std::exception& e) {
+          throw std::runtime_error(e.what());
+        }
+      }
+    }
+
+    //Do it with depth images
+
+    // Get the latest state estimate if one exists.
+    okvis::State current_state; // Use only T_WS
+    Eigen::Matrix4f currentPose_WS;
+    {
+      std::lock_guard lockCurrentPose(currentPose_mtx_);
+      currentPose_WS = currentPose_;
+    }
+    current_state.T_WS = okvis::kinematics::Transformation(currentPose_WS.cast<double>());
+
+    if (fieldCallback_ && !planeOnlyMapping()) {
+      fieldCallback_(current_state, seSubmapLookup_);
+    }
+
+    if(create_new_submap && previousSubmapId_ != UNINITIALIZED_ID){
+
+      LOG(INFO) << "Completed building submap " << previousSubmapId_ << " which is submap number " << seSubmapLookup_.size();
+      LOG(INFO) << okvis::timing::Timing::print();
+
+      if(meshEnabled() && previousSubmapId_ != UNINITIALIZED_ID){
+        DLOG(INFO) << "Trying to mesh for frame " << previousSubmapId_;
+        // ToDo: mesh in asynchronous thread, not to block processing
+        seMeshLookup_[previousSubmapId_] = seSubmapLookup_[previousSubmapId_].map->mesh();
+
+        // Finish Objects for completed submap, means coloring of mesh for text query and extracting poses
+        objectMap_->finishSubmapObjects(previousSubmapId_);
+      }
+
+
+      // save mesh and publish submap
+      if (meshEnabled() && submapCallback_) {
+        AlignedUnorderedMap<uint64_t, Transformation> submapPoses;
+        std::unordered_map<uint64_t, std::shared_ptr<SupereightMapType>> submaps;
+
+        for(auto it: updated_maps_){
+          if(it == prevKeyframeId_) continue;
+          okvis::kinematics::Transformation submapPose(seSubmapLookup_[it].T_WK.matrix().cast<double>());
+          submapPoses[it] = submapPose;
+          submaps[it] = seSubmapLookup_[it].map;
+        }
+        updated_maps_.clear();
+
+        TimerSwitchable submap_viz("9.4 Submap visualization");
+
+        publishSubmaps(submapPoses, submaps);
+        submap_viz.stop();
+      }
+    }
+    publishLidarPointCloudMap();
+    if (planeOnlyMapping()) updated_maps_.clear();
+    isProcessingSeFrame_ = false;
+    timingProcessSeFrame.stop();
+    }
+
 
     void SubmappingInterface::generatePointCloud(const Eigen::Matrix4f& T_WS, const DepthFrame& dImage, const se::PinholeCamera& sensor, int counter){
 
@@ -1067,7 +1094,157 @@ namespace okvis {
 
     }
 
+    void SubmappingInterface::applyPendingPointCloudPoses() const {
+      if (!pointCloudMap_) return;
+      // Export/force snapshots must also wait for poses already swapped out by
+      // another consumer. Estimator callbacks never acquire this mutex.
+      std::lock_guard applyingLock(pointCloudPoseApplyMutex_);
+      std::map<uint64_t, PendingPointCloudPose> poses;
+      {
+        std::lock_guard pendingLock(pendingPointCloudPosesMutex_);
+        poses.swap(pendingPointCloudPoses_);
+      }
+      if (poses.empty()) return;
+      std::lock_guard mapLock(pointCloudMapMutex_);
+      for (const auto& pose : poses) {
+        if (pose.second.keyframe || pointCloudMap_->hasSubmap(pose.first)) {
+          pointCloudMap_->updatePose(pose.first, pose.second.pose, true, pose.second.sequence);
+        }
+      }
+    }
+
+    LidarPointCloudMap::Points SubmappingInterface::lidarPointCloudMap() const {
+      if (!pointCloudMap_) return {};
+      applyPendingPointCloudPoses();
+      LidarPointCloudMap::Snapshot snapshot;
+      {
+        std::lock_guard lock(pointCloudMapMutex_);
+        snapshot = pointCloudMap_->snapshot();
+      }
+      return LidarPointCloudMap::assemble(snapshot, submapConfig_.pointCloudMapVoxelSize);
+    }
+
+    void SubmappingInterface::startPointCloudPublisher() {
+      if (!pointCloudMap_ || pointCloudPublishThread_.joinable()) return;
+      pointCloudPublishThread_ = std::thread(&SubmappingInterface::pointCloudPublisherLoop, this);
+    }
+
+    void SubmappingInterface::stopPointCloudPublisher() {
+      {
+        std::lock_guard lock(pointCloudPublishMutex_);
+        pointCloudPublisherStopping_ = true;
+      }
+      pointCloudPublishCv_.notify_all();
+      if (pointCloudPublishThread_.joinable()) pointCloudPublishThread_.join();
+    }
+
+    void SubmappingInterface::pointCloudPublisherLoop() {
+      for (;;) {
+        bool force;
+        uint64_t request;
+        {
+          std::unique_lock lock(pointCloudPublishMutex_);
+          pointCloudPublishCv_.wait(lock, [&] {
+            return pointCloudPublisherStopping_ || pointCloudPublishRequested_;
+          });
+          if (pointCloudPublisherStopping_ && !pointCloudPublishRequested_) return;
+          while (!pointCloudPublisherStopping_ && !pointCloudPublishForce_
+                 && publishedPointCloudRevision_ != std::numeric_limits<uint64_t>::max()) {
+            const auto deadline = lastPointCloudPublish_
+                + std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+                    std::chrono::duration<double>(submapConfig_.pointCloudMapPublishInterval));
+            if (std::chrono::steady_clock::now() >= deadline) break;
+            pointCloudPublishCv_.wait_until(lock, deadline, [&] {
+              return pointCloudPublisherStopping_ || pointCloudPublishForce_;
+            });
+          }
+          force = pointCloudPublishForce_;
+          request = pointCloudPublishRequestId_;
+          pointCloudPublishRequested_ = false;
+          pointCloudPublishForce_ = false;
+        }
+        try {
+          assembleAndPublishPointCloud(force);
+        } catch (const std::exception& error) {
+          LOG(ERROR) << "LiDAR map visualization failed: " << error.what();
+        }
+        {
+          std::lock_guard lock(pointCloudPublishMutex_);
+          pointCloudPublishCompletedId_ = request;
+        }
+        pointCloudPublishCv_.notify_all();
+      }
+    }
+
+    void SubmappingInterface::publishLidarPointCloudMap(bool force) {
+      if (!pointCloudMapCallback_ || !pointCloudMap_) return;
+      if (!pointCloudPublishThread_.joinable()) {
+        assembleAndPublishPointCloud(force); // synchronous/offline callers
+        return;
+      }
+      std::unique_lock lock(pointCloudPublishMutex_);
+      if (pointCloudPublisherStopping_) return;
+      const uint64_t request = ++pointCloudPublishRequestId_;
+      pointCloudPublishRequested_ = true;
+      pointCloudPublishForce_ = pointCloudPublishForce_ || force;
+      pointCloudPublishCv_.notify_all();
+      // Only shutdown/export explicitly waits; live processing just coalesces
+      // visualization requests and never waits for a global map or ROS output.
+      if (force) pointCloudPublishCv_.wait(lock, [&] {
+        return pointCloudPublishCompletedId_ >= request || pointCloudPublisherStopping_;
+      });
+    }
+
+    void SubmappingInterface::assembleAndPublishPointCloud(bool force) {
+      std::lock_guard buildLock(pointCloudBuildMutex_);
+      const auto now = std::chrono::steady_clock::now();
+      if (!force && publishedPointCloudRevision_ != std::numeric_limits<uint64_t>::max()
+          && std::chrono::duration<double>(now - lastPointCloudPublish_).count()
+          < submapConfig_.pointCloudMapPublishInterval) return;
+      applyPendingPointCloudPoses();
+      LidarPointCloudMap::Snapshot snapshot;
+      uint64_t revision;
+      {
+        std::lock_guard mapLock(pointCloudMapMutex_);
+        revision = pointCloudMap_->revision();
+        if (!force && revision == publishedPointCloudRevision_) return;
+        snapshot = pointCloudMap_->snapshot();
+      }
+      const auto points = LidarPointCloudMap::assemble(snapshot, submapConfig_.pointCloudMapVoxelSize,
+          submapConfig_.pointCloudMapMaxPublishPoints);
+      if (points.empty()) return;
+      Time timestamp;
+      {
+        std::lock_guard stateLock(state_mtx_);
+        timestamp = latestState_.timestamp;
+      }
+      pointCloudMapCallback_(timestamp, points);
+      lastPointCloudPublish_ = now;
+      publishedPointCloudRevision_ = revision;
+    }
+
+    bool SubmappingInterface::saveLidarPointCloudMap(const std::string& filename) const {
+      const auto points = lidarPointCloudMap();
+      if (points.empty() || filename.empty()) return false;
+      try {
+        const auto directory = std::filesystem::path(filename).parent_path();
+        if (!directory.empty()) std::filesystem::create_directories(directory);
+        pcl::PointCloud<pcl::PointXYZ> cloud;
+        cloud.reserve(points.size());
+        for (const auto& point : points) {
+          cloud.push_back(pcl::PointXYZ(float(point.x()), float(point.y()), float(point.z())));
+        }
+        if (pcl::io::savePCDFileBinary(filename, cloud) != 0) return false;
+        LOG(INFO) << "Saved LiDAR point cloud map: " << filename << " (" << points.size() << " points)";
+        return true;
+      } catch (const std::exception& error) {
+        LOG(ERROR) << "Could not save LiDAR point cloud map: " << error.what();
+        return false;
+      }
+    }
+
     void SubmappingInterface::saveAllSubmapMeshes(){
+      if (!meshEnabled()) return;
       LOG(INFO) << "There are " << seSubmapLookup_.size() << " submaps to save";
       for(auto it = seSubmapLookup_.begin(); it != seSubmapLookup_.end(); ++it){
         saveSubmap(it->first);
@@ -1195,8 +1372,9 @@ namespace okvis {
 
         }
 
+        publishLidarPointCloudMap();
         return false;
-      } 
+      }
 
       // Get oldest state update to iterate
       OkvisUpdate currentStateUpdate;
@@ -1392,6 +1570,7 @@ namespace okvis {
 
       LOG(INFO) << "\n\nStarting supereight processing... \n\n";
 
+      startPointCloudPublisher();
       dataIntegration_ = std::thread(&SubmappingInterface::integrationLoop, this);
       submapIntegration_ = std::thread(&SubmappingInterface::processSupereightFrames, this);
 
@@ -1401,6 +1580,19 @@ namespace okvis {
     bool SubmappingInterface::stateUpdateCallback(
             const State &latestState, const TrackingState &latestTrackingState,
             std::shared_ptr<const okvis::AlignedMap<StateId, State>> updatedStates) {
+
+      if (pointCloudMap_) {
+        // This callback runs on OKVIS's state-publication thread. Never acquire
+        // the point-storage/global-snapshot lock here: merge only small poses.
+        std::lock_guard pendingLock(pendingPointCloudPosesMutex_);
+        const uint64_t sequence = ++pointCloudPoseSequence_;
+        for (const auto& state : *updatedStates) {
+          auto& pending = pendingPointCloudPoses_[state.first.value()];
+          pending.pose = Eigen::Isometry3d(state.second.T_WS.T());
+          pending.sequence = sequence;
+          pending.keyframe = pending.keyframe || state.second.isKeyframe;
+        }
+      }
 
       {
         std::lock_guard lockCurrentPose(currentPose_mtx_);
@@ -1455,7 +1647,7 @@ namespace okvis {
       DLOG(INFO) << "publishing submaps";
 
       if (submapCallback_) {
-        submapCallback_(submapPoses, submaps, objectMap_);
+        if (meshEnabled()) submapCallback_(submapPoses, submaps, objectMap_);
       }
     }
     
@@ -1555,7 +1747,7 @@ namespace okvis {
   }
 
 
-  double SubmappingInterface::evaluateLidarOverlap(const SupereightMapType& map, uint64_t& mapId,
+  double SubmappingInterface::evaluateLidarOverlap(uint64_t& mapId,
                                                  SupereightFrames& seFrame, double overlapThreshold){
 
     size_t observed_counter = 0;
@@ -1576,12 +1768,20 @@ namespace okvis {
         }
         // Transform se frame measurement into submap: T_WM.inverse() * T_WD * ray == world_to_submap*depth_to_submap * measurement_in_depth_sensor_frame
         Eigen::Vector3f pt = T_MW_iso * seFrame.vecRayMeasurements[i].first * seFrame.vecRayMeasurements[i].second;
-        std::optional<float> occ = map.interpField<se::Safe::On>(pt);
-        if (occ){
-            observed_counter++;
+        bool observed = false;
+        if (submapConfig_.usePointToPlaneFactors) {
+          const auto reference = planeMap(mapId);
+          PlaneMap::Plane plane;
+          double sigma;
+          observed = reference && reference->match(pt.cast<double>(), submapConfig_.sensorError, plane, sigma);
+        } else {
+          const auto& map = seSubmapLookup_.at(mapId).map;
+          observed = map && bool(map->interpField<se::Safe::On>(pt));
         }
+        if (observed) ++observed_counter;
     }
 
+    if (number_of_actual_measurements == 0) return 1.0;
     double ratio = double(observed_counter)/double(number_of_actual_measurements);
 
     if (ratio <= overlapThreshold && ratio_streak_ > 0){
@@ -1604,14 +1804,30 @@ namespace okvis {
     return ratio;
   }
 
+  Eigen::AlignedBox3f SubmappingInterface::submapBounds(uint64_t id) const {
+    if (planeOnlyMapping()) {
+      const auto map = planeMap(id);
+      if (!map || map->bounds().isEmpty()) return Eigen::AlignedBox3f();
+      // Include cell support so a planar map has a nonzero-volume AABB.
+      const Eigen::Vector3f margin = Eigen::Vector3f::Constant(0.5 * submapConfig_.planeMapConfig.voxelSize);
+      return Eigen::AlignedBox3f(map->bounds().min().cast<float>() - margin,
+                                map->bounds().max().cast<float>() + margin);
+    }
+    const auto it = seSubmapLookup_.find(id);
+    if (it == seSubmapLookup_.end() || !it->second.map) return Eigen::AlignedBox3f();
+    return it->second.map->aabb();
+  }
+
   uint64_t SubmappingInterface::findMostOverlappingSubmap(
           std::vector<Eigen::Vector3f, Eigen::aligned_allocator<Eigen::Vector3f>> &downsampledPointCloud,
           uint64_t activeId, uint64_t previousId) {
 
     // Bounding box for active map
     // Get Maximum and Minimum of active submap (frame {B})
-    Eigen::Vector3f bbox_active_min = seSubmapLookup_[activeId].map->aabb().min();
-    Eigen::Vector3f bbox_active_max = seSubmapLookup_[activeId].map->aabb().max();
+    const auto activeBounds = submapBounds(activeId);
+    if (activeBounds.isEmpty()) return std::numeric_limits<uint64_t>::max();
+    Eigen::Vector3f bbox_active_min = activeBounds.min();
+    Eigen::Vector3f bbox_active_max = activeBounds.max();
     // Go through all submaps to find the most overlapping submap based on IoU
     // Take 5 most overlapping frames and choose the oldest one
     std::map <float, uint64_t> iou_id_map; // map: iou -> frame id
@@ -1630,7 +1846,12 @@ namespace okvis {
       // Get Bounding Box of Submap with testId in aciveIds frame
       Eigen::Vector3f bbox_test_max;
       Eigen::Vector3f bbox_test_min;
-      get_bbox(seSubmapLookup_[it.first], seSubmapLookup_[activeId].T_WK.inverse().matrix() * seSubmapLookup_[it.first].T_WK.matrix(), bbox_test_max, bbox_test_min);
+      const auto localBounds = submapBounds(it.first);
+      if (localBounds.isEmpty()) continue;
+      const auto relativePose = seSubmapLookup_.at(activeId).T_WK.inverse() * it.second.T_WK;
+      const auto transformedBounds = localBounds.transformed(relativePose);
+      bbox_test_min = transformedBounds.min();
+      bbox_test_max = transformedBounds.max();
       float iou = calculateIoU3D(bbox_active_min, bbox_active_max, bbox_test_min, bbox_test_max);
 
       iou_id_map[iou] = it.first;
@@ -1675,8 +1896,16 @@ namespace okvis {
 
       // Transform from submap B to submap A
       Eigen::Vector3f pt_A = T_MA_MB * points[i];
-      std::optional<float> occ = seSubmapLookup_[mapIdA].map->interpField<se::Safe::On>(pt_A);
-      if (occ){
+      bool observed = false;
+      if (lidarSensors_ && submapConfig_.usePointToPlaneFactors) {
+        const auto reference = planeMap(mapIdA);
+        PlaneMap::Plane plane;
+        double sigma;
+        observed = reference && reference->match(pt_A.cast<double>(), submapConfig_.sensorError, plane, sigma);
+      } else {
+        observed = bool(seSubmapLookup_[mapIdA].map->interpField<se::Safe::On>(pt_A));
+      }
+      if (observed){
         observedPoints.push_back(points[i]);
         observed_counter++;
       }
@@ -1765,7 +1994,7 @@ namespace okvis {
         }
         else{ // we check lidar overlap
           if(numIntegratedLidarFrames_ > submapConfig_.submapMinFrames){
-            evaluateLidarOverlap(*seSubmapLookup_[prevKeyframeId_].map, prevKeyframeId_,
+            evaluateLidarOverlap(prevKeyframeId_,
                                   supereightFrame, submapConfig_.submapOverlapRatio);
           }
           if(!lidarKfDetected_){
@@ -1789,7 +2018,7 @@ namespace okvis {
         else{
           // Evaluate Overlap
           if(numIntegratedLidarFrames_ > submapConfig_.submapMinFrames)
-            evaluateLidarOverlap(*seSubmapLookup_[prevKeyframeId_].map, prevKeyframeId_,
+            evaluateLidarOverlap(prevKeyframeId_,
                                   supereightFrame, submapConfig_.submapOverlapRatio);
         }
       }
@@ -1817,13 +2046,13 @@ namespace okvis {
         }
       }
       else{
-        if(alignCallback_ && previousSubmap_) {
+        if(alignCallback_ && (previousSubmap_ || planeMap(previousSubmapId_))) {
           DLOG(INFO) << "Calling callback with previousSubmapId_ = " << previousSubmapId_
                     << "and " << submapAlignBlock_.pointCloud_B.size() << " points";
           std::vector<float> zeros(submapAlignBlock_.pointCloud_B.size());
           std::fill(zeros.begin(), zeros.end(), 0.0f);
           alignCallback_(nullptr, seSubmapLookup_[previousSubmapId_].map.get(), 0, previousSubmapId_,
-                         submapAlignBlock_.pointCloud_B, zeros);
+                         submapAlignBlock_.pointCloud_B, zeros, nullptr, planeMap(previousSubmapId_));
         }
       }
 
@@ -1837,10 +2066,10 @@ namespace okvis {
                 << " and frame B id: " << supereightFrame.keyFrameId;
     }
     else if(submapConfig_.useMap2LiveFactors){
-        if(previousSubmap_){
+        if(alignCallback_ && (previousSubmap_ || planeMap(previousSubmapId_))){
             std::vector<float> zeros;
             alignCallback_(nullptr, seSubmapLookup_[previousSubmapId_].map.get(), 0, previousSubmapId_,
-                           submapAlignBlock_.pointCloud_B, zeros);
+                           submapAlignBlock_.pointCloud_B, zeros, nullptr, planeMap(previousSubmapId_));
         }
     }
   }
@@ -1873,7 +2102,8 @@ namespace okvis {
         alignCallback_(seSubmapLookup_[most_overlapping_id].map.get(), seSubmapLookup_[submapAlignBlock_.frame_B_id].map.get(),
                         most_overlapping_id,
                         submapAlignBlock_.frame_B_id,
-                        downsampledPointCloud, downsampledSigmas);
+                        downsampledPointCloud, downsampledSigmas,
+                        planeMap(most_overlapping_id), planeMap(submapAlignBlock_.frame_B_id));
 
         if (alignmentPublishCallback_) {
           okvis::kinematics::Transformation T_tmp(seSubmapLookup_[submapAlignBlock_.frame_B_id].T_WK.matrix().cast<double>());
@@ -1898,6 +2128,11 @@ namespace okvis {
 
   
   void SubmappingInterface::lidarMap2MapFactors() {
+    if (!submapConfig_.useMap2MapFactors
+        || submapAlignBlock_.frame_A_id == UNINITIALIZED_ID
+        || submapAlignBlock_.frame_A_id == submapAlignBlock_.frame_B_id
+        || !seSubmapLookup_.count(submapAlignBlock_.frame_A_id)
+        || !seSubmapLookup_.count(submapAlignBlock_.frame_B_id)) return;
     okvis::Time t_cb;
     t_cb.fromNSec(submapAlignBlock_.frame_B_id);
 
@@ -1932,7 +2167,8 @@ namespace okvis {
                 alignCallback_(seSubmapLookup_[most_overlapping_id].map.get(),
                                seSubmapLookup_[submapAlignBlock_.frame_B_id].map.get(),
                                most_overlapping_id, submapAlignBlock_.frame_B_id,
-                               downsampledPointCloudPrevious, sensorErrors);
+                               downsampledPointCloudPrevious, sensorErrors,
+                               planeMap(most_overlapping_id), planeMap(submapAlignBlock_.frame_B_id));
             }
         }
         else{
@@ -1956,8 +2192,8 @@ namespace okvis {
                 std::vector<float> sensorErrorsPrevious(downsampledPointCloudPrevious.size());
                 std::fill(sensorErrorsPrevious.begin(), sensorErrorsPrevious.end(), submapConfig_.sensorError);
 
-                alignCallback_(seSubmapLookup_[most_overlapping_id].map.get(), seSubmapLookup_[submapAlignBlock_.frame_B_id].map.get(), most_overlapping_id, submapAlignBlock_.frame_B_id, downsampledPointCloudOverlap, sensorErrorsOverlap);
-                alignCallback_(seSubmapLookup_[submapAlignBlock_.frame_A_id].map.get(), seSubmapLookup_[submapAlignBlock_.frame_B_id].map.get(), submapAlignBlock_.frame_A_id, submapAlignBlock_.frame_B_id, downsampledPointCloudPrevious, sensorErrorsPrevious);
+                alignCallback_(seSubmapLookup_[most_overlapping_id].map.get(), seSubmapLookup_[submapAlignBlock_.frame_B_id].map.get(), most_overlapping_id, submapAlignBlock_.frame_B_id, downsampledPointCloudOverlap, sensorErrorsOverlap, planeMap(most_overlapping_id), planeMap(submapAlignBlock_.frame_B_id));
+                alignCallback_(seSubmapLookup_[submapAlignBlock_.frame_A_id].map.get(), seSubmapLookup_[submapAlignBlock_.frame_B_id].map.get(), submapAlignBlock_.frame_A_id, submapAlignBlock_.frame_B_id, downsampledPointCloudPrevious, sensorErrorsPrevious, planeMap(submapAlignBlock_.frame_A_id), planeMap(submapAlignBlock_.frame_B_id));
             }
             DLOG(INFO) << "[Lidar: Map-to-map] Most overlap, ids: "
                       << most_overlapping_id << "-" << submapAlignBlock_.frame_B_id
@@ -2028,12 +2264,17 @@ namespace okvis {
     Eigen::Isometry3f T_KL;
     Eigen::Vector3f point_K;
 
+    const float sampleResolution = planeOnlyMapping() ? submapConfig_.voxelGridResolution : mapConfig_.res / 2.0f;
     for(const auto &rayMeasurement : vecRayMeasurements){
+      const double range = rayMeasurement.second.norm();
+      if (!std::isfinite(range) || range < lidarSensors_->second.near_plane
+          || range > lidarSensors_->second.far_plane) continue;
       // This seems to assume a world-aligned (0-based) voxel grid
       T_KL = T_KW * rayMeasurement.first;
       point_K = T_KL * rayMeasurement.second;
+      if (!point_K.allFinite()) continue;
 
-      const auto voxel = Voxel((point_K / (mapConfig_.res / 2.0f)).cast<int>());
+      const auto voxel = Voxel((point_K / sampleResolution).array().floor().cast<int>());
       if(allocatedVoxels.insert(voxel).second){
         vecRayMeasurements[write_idx++] = std::pair<Eigen::Isometry3f, Eigen::Vector3f>(T_KL, rayMeasurement.second);
         if(submapConfig_.useMap2MapFactors){

@@ -13,6 +13,10 @@
 #include <okvis/assert_macros.hpp>
 #include <okvis/LidarMotionUndistortion.hpp>
 #include <okvis/SubmappingUtils.hpp>
+#include <cmath>
+#include <limits>
+#include <stdexcept>
+#include <unordered_set>
 
 namespace okvis{
 LidarMotionUndistortion::LidarMotionUndistortion(const State& initialState, const kinematics::Transformation& T_WS_live,
@@ -79,6 +83,49 @@ bool LidarMotionUndistortion::deskew() {
   }
   return true;
 
+}
+
+size_t LidarMotionUndistortion::filterPlanes(PlaneMapPtr map,
+    const kinematics::Transformation& T_WM, double sensorSigma) {
+  if (!map) {
+    lidarScanPostProcessed_.clear();
+    return 0;
+  }
+  const auto T_MS = T_WM.inverse() * T_WS_live_;
+  size_t writeIndex = 0;
+  PlaneMap::Plane plane;
+  double sigma;
+  for (const auto& point : lidarScanPostProcessed_) {
+    const Eigen::Vector3d p = T_MS.C() * point.cast<double>() + T_MS.r();
+    if (map->match(p, sensorSigma, plane, sigma)) {
+      lidarScanPostProcessed_[writeIndex++] = point;
+    }
+  }
+  lidarScanPostProcessed_.resize(writeIndex);
+  return writeIndex;
+}
+
+bool LidarMotionUndistortion::voxelDownsample(double voxel_grid_resolution) {
+  if (!std::isfinite(voxel_grid_resolution) || voxel_grid_resolution <= 0.0) {
+    throw std::invalid_argument("LiDAR candidate voxel resolution must be finite and positive");
+  }
+  std::unordered_set<Voxel, VoxelHash> allocatedVoxels;
+  allocatedVoxels.reserve(lidarScanPostProcessed_.size());
+  size_t writeIndex = 0;
+  for (const auto& point : lidarScanPostProcessed_) {
+    // Compute in double before conversion: tiny resolutions, nonfinite points,
+    // and large coordinates must not reach an out-of-range integer cast.
+    const Eigen::Array3d index = (point.cast<double>().array() / voxel_grid_resolution).floor();
+    if (!index.isFinite().all()
+        || (index < double(std::numeric_limits<int>::min())).any()
+        || (index > double(std::numeric_limits<int>::max())).any()) continue;
+    const Voxel voxel = index.cast<int>().matrix();
+    if (allocatedVoxels.insert(voxel).second) {
+      lidarScanPostProcessed_[writeIndex++] = point;
+    }
+  }
+  lidarScanPostProcessed_.resize(writeIndex);
+  return writeIndex != 0;
 }
 
 bool LidarMotionUndistortion::downsample(size_t num_output_points, double voxel_grid_resolution)
