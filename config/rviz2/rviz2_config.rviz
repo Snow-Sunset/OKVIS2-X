@@ -176,15 +176,22 @@ Visualization Manager:
         Reliability Policy: Reliable
         Value: /okvis/cam1_matches
       Value: true
-    - Class: rviz_default_plugins/Marker
+    - Alpha: 1
+      Buffer Length: 1
+      Class: rviz_default_plugins/Path
+      Color: 204; 204; 0
       Enabled: true
+      Line Style: Billboards
+      Line Width: 0.015
       Name: Path
-      Namespaces:
-        {}
+      Offset:
+        X: 0
+        Y: 0
+        Z: 0
+      Pose Style: None
       Topic:
         Depth: 5
         Durability Policy: Volatile
-        Filter size: 10
         History Policy: Keep Last
         Reliability Policy: Reliable
         Value: /okvis/okvis_path

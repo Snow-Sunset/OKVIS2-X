@@ -54,7 +54,7 @@ void Publisher::setupNode(std::shared_ptr<rclcpp::Node> node)
   // set up publishers
   slice_pub_ =              threadedPublisher_->registerPublisher<visualization_msgs::msg::Marker>("se_map_slice");
   pubObometry_ =            threadedOdometryPublisher_->registerPublisher<nav_msgs::msg::Odometry>("okvis_odometry");
-  pubPath_ =                threadedPublisher_->registerPublisher<visualization_msgs::msg::Marker>("okvis_path");
+  pubPath_ =                threadedPublisher_->registerPublisher<nav_msgs::msg::Path>("okvis_path");
   pubTransform_ =           threadedPublisher_->registerPublisher<geometry_msgs::msg::TransformStamped>("okvis_transform");
   pubMesh_ =                threadedPublisher_->registerPublisher<visualization_msgs::msg::Marker>("okvis_mesh");
   pubSubmapMesh_ =          threadedPublisher_->registerPublisher<visualization_msgs::msg::MarkerArray>("okvis_submap_mesh");
@@ -292,70 +292,36 @@ void Publisher::publishEstimatorUpdate(
   trajectory_.update(trackingState, updatedStates, affectedStateIds);
   trajectoryLocked_ = false;
 
-  // now for the path (in segments of 1000 state IDs)
-  auto path = std::make_shared<visualization_msgs::msg::Marker>(); // The path message.
+  // Publish the complete trajectory as nav_msgs/Path. Styling is deliberately
+  // left to RViz so users can change colour, alpha, and line width at runtime.
+  auto path = std::make_shared<nav_msgs::msg::Path>();
   path->header.stamp = t;
   path->header.frame_id = "world";
-  path->ns = "okvis_path";
-  path->type = visualization_msgs::msg::Marker::LINE_STRIP; // Type of object
-  path->action = 0; // 0 add/modify an object, 1 (dprcd), 2 deletes an object, 3 deletes all objects
-  path->pose.position.x = 0.0;
-  path->pose.position.y = 0.0;
-  path->pose.position.z = 0.0;
-  path->pose.orientation.x = 0.0;
-  path->pose.orientation.y = 0.0;
-  path->pose.orientation.z = 0.0;
-  path->pose.orientation.w = 1.0;
-  path->color.r = 0.8;
-  path->color.g = 0.8;
-  path->color.b = 0.0;
-  path->color.a = 1.0;
-  path->scale.x = 0.015;
-  path->lifetime = rclcpp::Duration::from_seconds(0); // 0 for infinity
+  const auto& stateIds = trajectory_.stateIds();
+  path->poses.reserve(stateIds.size());
+  for(const auto& stateId : stateIds) {
+    okvis::State state;
+    if(!trajectory_.getState(stateId, state)) {
+      continue;
+    }
 
-  // publish paths as batches of 1000 points.
-  uint64_t firstId = affectedStateIds.begin()->value();
-  uint64_t id = (firstId/1000)*1000;
-  if(id==0) {
-    id = 1;
-  }
-  path->id = (id/1000)*1000;
-  if(path->id != 0) {
-    // link to previous path segment
-    okvis::State state;
-    if(trajectory_.getState(okvis::StateId(path->id-1), state)) {
-      const okvis::kinematics::Transformation T_WB_p = state.T_WS * T_SB;
-      const Eigen::Vector3d& r = T_WB_p.r();
-      geometry_msgs::msg::Point point;
-      point.x = r[0];
-      point.y = r[1];
-      point.z = r[2];
-      path->points.push_back(point);
-    }
-  }
-  const uint64_t latestId = updatedStates->rbegin()->first.value();
-  while(id <= latestId) {
-    uint64_t roundedId = (id/1000)*1000;
-    if(path->id != int64_t(roundedId)) {
-      pubPath_.publish(path); // first publish finished segment
-      path->id = roundedId;
-      // ..object ID useful in conjunction with namespace for manipulating&deleting the object later
-      geometry_msgs::msg::Point lastPoint =  path->points.back(); // save last point
-      path->points.clear(); // start new segment
-      path->points.push_back(lastPoint);
-    }
-    okvis::State state;
-    if(!trajectory_.getState(okvis::StateId(id), state)) continue;
     const okvis::kinematics::Transformation T_WB_p = state.T_WS * T_SB;
     const Eigen::Vector3d& r = T_WB_p.r();
-    geometry_msgs::msg::Point point;
-    point.x = r[0];
-    point.y = r[1];
-    point.z = r[2];
-    path->points.push_back(point);
-    ++id;
+    const Eigen::Quaterniond& q = T_WB_p.q();
+
+    geometry_msgs::msg::PoseStamped pose;
+    pose.header.frame_id = "world";
+    pose.header.stamp = rclcpp::Time(state.timestamp.sec, state.timestamp.nsec);
+    pose.pose.position.x = r[0];
+    pose.pose.position.y = r[1];
+    pose.pose.position.z = r[2];
+    pose.pose.orientation.x = q.x();
+    pose.pose.orientation.y = q.y();
+    pose.pose.orientation.z = q.z();
+    pose.pose.orientation.w = q.w();
+    path->poses.push_back(pose);
   }
-  pubPath_.publish(path); // publish last segment
+  pubPath_.publish(path);
 
   // finally the landmarks
   pcl::PointCloud<pcl::PointXYZRGB> pointsMatched; // Point cloud for matched points.

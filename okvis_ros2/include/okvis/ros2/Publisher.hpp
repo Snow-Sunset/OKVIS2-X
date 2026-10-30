@@ -218,8 +218,8 @@ class Publisher
   okvis::ThreadedPublisher::PublisherHandle<sensor_msgs::msg::PointCloud2> pubPointsMatched_;
   /// \brief The publisher for the odometry.
   okvis::ThreadedPublisher::PublisherHandle<nav_msgs::msg::Odometry> pubObometry_;
-  /// \brief The publisher for the path.
-  okvis::ThreadedPublisher::PublisherHandle<visualization_msgs::msg::Marker> pubPath_;
+  /// \brief The publisher for the path. RViz controls its colour and line width.
+  okvis::ThreadedPublisher::PublisherHandle<nav_msgs::msg::Path> pubPath_;
   /// \brief The publisher for the transform.
   okvis::ThreadedPublisher::PublisherHandle<geometry_msgs::msg::TransformStamped> pubTransform_;
   /// \brief The publisher for a robot / camera mesh.
@@ -250,7 +250,6 @@ class Publisher
   TrajectoryOutput trajectoryOutput_; ///< Trajectory output in case demanded.
   std::atomic_bool trajectoryLocked_; ///< Lock the trajectory object (realtime/update are async.).
   std::string meshesDir_; ///< Directory for meshes.
-  nav_msgs::msg::Path path_; ///< The path message.
   Eigen::Matrix4d T_SC_; // Tf from Sensor to Camera
   Eigen::Quaterniond q_sc_;
   
