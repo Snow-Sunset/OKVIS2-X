@@ -114,6 +114,7 @@ class ThreadedSlam : public ViInterface {
    */
   virtual bool addLidarMeasurement(const okvis::Time & stamp,
                                    const Eigen::Vector3d & rayMeasurement) override final;
+  bool addLidarMeasurements(const LidarMeasurementBatch& measurements) override final;
 
   /**
    * @brief Adds a depth image image to the measurement Queue
@@ -412,7 +413,7 @@ private:
 
   AlignmentPublishCallback alignmentPublishCallback_;
 
-  int sensorMeasurementDownsamplingCounter_ = 0;
+  size_t sensorMeasurementDownsamplingCounter_ = 0;
   std::shared_ptr<se::PinholeCamera> depthCamera_;
 
   void saveAlignedPoints(size_t id,

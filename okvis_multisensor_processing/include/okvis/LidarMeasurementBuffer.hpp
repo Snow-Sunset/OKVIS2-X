@@ -21,7 +21,23 @@ namespace okvis {
 /// tail. The spool is an internal session file, not a raw-scan export format.
 class LidarMeasurementBuffer {
  public:
-  using Batch = std::vector<LidarMeasurement, Eigen::aligned_allocator<LidarMeasurement>>;
+  using Batch = LidarMeasurementBatch;
+
+  struct PushResult {
+    size_t stored = 0;
+    size_t dropped = 0;
+    bool stopped = false;
+  };
+  struct Statistics {
+    size_t queued = 0;
+    size_t resident = 0;
+    uint64_t stored = 0;
+    uint64_t dropped = 0;
+    uint64_t consumed = 0;
+    bool hasFront = false;
+    Time oldest;
+    Time newest;
+  };
 
   void configure(const std::string& filename, size_t maxPoints) {
     std::lock_guard<std::mutex> lock(mutex_);
@@ -60,9 +76,30 @@ class LidarMeasurementBuffer {
     if (stopped_) return false;
     if (memoryOnly_ && memory_.size() >= maxPoints_) {
       if (droppedNewest) *droppedNewest = true;
+      ++droppedPoints_;
       return false;
     }
     return pushLocked(value);
+  }
+  /// Store an entire input batch with one lock acquisition. RAM overflow drops
+  /// incoming points only; a prefix copied by the sole consumer stays valid.
+  /// Spool mode appends every point and bounds only the resident read cache.
+  PushResult PushBatch(const Batch& values) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    PushResult result;
+    if (stopped_) {
+      result.stopped = true;
+      return result;
+    }
+    const size_t acceptedLimit = memoryOnly_
+        ? std::min(values.size(), maxPoints_ - memory_.size()) : values.size();
+    result.dropped = values.size() - acceptedLimit;
+    droppedPoints_ += result.dropped;
+    for (size_t i = 0; i < acceptedLimit; ++i) {
+      if (pushLocked(values[i], false)) ++result.stored;
+    }
+    if (result.stored) cv_.notify_one();
+    return result;
   }
   bool getCopyOfFront(LidarMeasurement* value) {
     std::lock_guard<std::mutex> lock(mutex_);
@@ -91,6 +128,7 @@ class LidarMeasurementBuffer {
       values->push_back(std::move(memory_.front()));
       memory_.pop_front();
     }
+    consumedPoints_ += values->size();
     cv_.notify_all();
     return values->size();
   }
@@ -124,6 +162,7 @@ class LidarMeasurementBuffer {
       memory_.pop_front();
       ++popped;
     }
+    consumedPoints_ += popped;
     cv_.notify_all();
     return popped;
   }
@@ -141,6 +180,19 @@ class LidarMeasurementBuffer {
   size_t residentPoints() const {
     std::lock_guard<std::mutex> lock(mutex_);
     return memory_.size();
+  }
+  Statistics statistics() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    Statistics result;
+    result.queued = memory_.size() + size_t(diskWritten_ - diskRead_);
+    result.resident = memory_.size();
+    result.stored = storedPoints_;
+    result.dropped = droppedPoints_;
+    result.consumed = consumedPoints_;
+    result.hasFront = !memory_.empty();
+    if (result.hasFront) result.oldest = memory_.front().timeStamp;
+    result.newest = newestAcceptedTimestamp_;
+    return result;
   }
   void Shutdown() {
     std::lock_guard<std::mutex> lock(mutex_);
@@ -175,7 +227,7 @@ class LidarMeasurementBuffer {
     if (stopped_) return false;
     return pushLocked(value);
   }
-  bool pushLocked(const LidarMeasurement& value) {
+  bool pushLocked(const LidarMeasurement& value, bool notify = true) {
     if (memoryOnly_ || filename_.empty()) {
       if (memoryOnly_ && memory_.size() >= maxPoints_) return false;
       memory_.push_back(value);
@@ -198,7 +250,9 @@ class LidarMeasurementBuffer {
         ++diskRead_;
       }
     }
-    cv_.notify_one();
+    ++storedPoints_;
+    newestAcceptedTimestamp_ = value.timeStamp;
+    if (notify) cv_.notify_one();
     return true;
   }
   void fill() {
@@ -235,6 +289,7 @@ class LidarMeasurementBuffer {
     if (memory_.empty()) return false;
     *value = memory_.front();
     memory_.pop_front();
+    ++consumedPoints_;
     cv_.notify_all();
     return true;
   }
@@ -244,6 +299,8 @@ class LidarMeasurementBuffer {
   std::string filename_;
   size_t maxPoints_ = 200000;
   uint64_t diskRead_ = 0, diskWritten_ = 0;
+  uint64_t storedPoints_ = 0, droppedPoints_ = 0, consumedPoints_ = 0;
+  Time newestAcceptedTimestamp_;
   std::ofstream writer_;
   std::ifstream reader_;
   bool memoryOnly_ = false;

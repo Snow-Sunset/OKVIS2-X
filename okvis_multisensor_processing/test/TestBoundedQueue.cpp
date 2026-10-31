@@ -5,6 +5,7 @@
 #include <iostream>
 #include <memory>
 #include <stdexcept>
+#include <vector>
 
 namespace {
 void check(bool condition, const char* message) {
@@ -68,6 +69,31 @@ void run() {
         "Move-only bounded producer was not released");
   check(moveQueue.PopNonBlocking(&result) && result && *result == 9,
         "Move-only blocking push lost its payload");
+
+  okvis::threadsafe::Queue<int> batches;
+  const std::vector<int> input{1, 2, 3, 4};
+  const auto pushed = batches.PushBatch(input.begin(), input.end(), 3, false);
+  check(pushed.accepted == 4 && pushed.dropped == 1 && batches.Size() == 3,
+        "Batch overflow did not preserve the latest bounded prefix");
+  std::vector<int> prefix;
+  check(batches.PopWhile([](int v) { return v < 4; }, &prefix) == 2
+            && prefix == std::vector<int>({2, 3}) && batches.Size() == 1,
+        "Batch prefix pop consumed a future entry or changed FIFO order");
+  check(batches.PopNonBlocking(&value) && value == 4, "Batch pop lost its boundary entry");
+  batches.Shutdown();
+  const auto stopped = batches.PushBatch(input.begin(), input.end(), 3, false);
+  check(!stopped.accepted && !stopped.dropped && batches.Empty(),
+        "Stopped queue accepted batch input");
+
+  okvis::threadsafe::Queue<int> batchWake;
+  const std::vector<int> pair{11, 12};
+  auto batchProducer = std::async(std::launch::async, [&] {
+    return batchWake.PushBatch(pair.begin(), pair.end(), 1, true);
+  });
+  check(batchWake.PopBlocking(&value) && value == 11, "Blocking batch did not wake its consumer");
+  check(batchWake.PopBlocking(&value) && value == 12, "Blocking batch changed entry order");
+  check(batchProducer.wait_for(1s) == std::future_status::ready && batchProducer.get().accepted == 2,
+        "Blocking batch did not finish after consumption");
 }
 }
 int main() {

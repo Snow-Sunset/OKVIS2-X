@@ -298,9 +298,11 @@ bool ThreadedSlam::addLidarMeasurement(const okvis::Time &stamp,
   lidarMeasurement.timeStamp = stamp;
 
   const int lidarQueueSize = 500000;
-  sensorMeasurementDownsamplingCounter_ ++;
+  const size_t stride = submapConfig_.sensorMeasurementDownsampling;
+  if (!stride) throw std::invalid_argument("LiDAR downsampling stride must be positive");
+  sensorMeasurementDownsamplingCounter_ = (sensorMeasurementDownsamplingCounter_ + 1) % stride;
   bool drop = false;
-  if(sensorMeasurementDownsamplingCounter_ % submapConfig_.sensorMeasurementDownsampling == 0){
+  if(!sensorMeasurementDownsamplingCounter_){
     if (blocking_)
     {
       return lidarMeasurementsReceived_.PushBlockingIfFull(lidarMeasurement, size_t(lidarQueueSize));
@@ -348,6 +350,31 @@ bool ThreadedSlam::addDepthMeasurement(const okvis::Time &stamp,
     return drop;
   }
   return true;
+}
+
+bool ThreadedSlam::addLidarMeasurements(const LidarMeasurementBatch& measurements) {
+  if (!useAlignmentFactors_) return false;
+  const size_t stride = submapConfig_.sensorMeasurementDownsampling;
+  if (!stride) throw std::invalid_argument("LiDAR downsampling stride must be positive");
+  LidarMeasurementBatch sampled;
+  const LidarMeasurementBatch* input = &measurements;
+  if (stride != 1) {
+    sampled.reserve(measurements.size() / stride + 1);
+    for (const auto& measurement : measurements) {
+      sensorMeasurementDownsamplingCounter_ = (sensorMeasurementDownsamplingCounter_ + 1) % stride;
+      if (!sensorMeasurementDownsamplingCounter_) sampled.push_back(measurement);
+    }
+    input = &sampled;
+  } else {
+    sensorMeasurementDownsamplingCounter_ = 0;
+  }
+  const auto result = lidarMeasurementsReceived_.PushBatch(
+      input->begin(), input->end(), 500000, blocking_);
+  if (result.dropped) {
+    LOG_EVERY_N(WARNING, 40) << "Realtime LiDAR queue overflow: replaced " << result.dropped
+                           << " old rays in this scan; pending " << lidarMeasurementsReceived_.Size();
+  }
+  return result.accepted == input->size() && result.dropped == 0;
 }
 
 // Add a GPS measurement.
@@ -528,7 +555,6 @@ bool ThreadedSlam::processFrame() {
   processPendingSubmapAlignments();
   MultiFramePtr multiFrame;
   ImuMeasurement imuMeasurement;
-  LidarMeasurement lidarMeasurement;
   GpsMeasurement gpsMeasurement;
   CameraMeasurement depthMeasurement;
   const size_t numCameras = parameters_.nCameraSystem.numCameras();
@@ -578,11 +604,10 @@ bool ThreadedSlam::processFrame() {
               < multiFrame->timestamp() + Duration(imuTemporalOverlap));
     }
 
-    // Drop LiDAR MEasurements before first frame ToDo: is this necessary?
-    while(!lidarMeasurementsReceived_.Empty()
-      && lidarMeasurementsReceived_.queue_.front().timeStamp < multiFrame->timestamp()){
-      lidarMeasurementsReceived_.PopBlocking(&lidarMeasurement);
-    }
+    lidarMeasurementsReceived_.PopWhile(
+        [&](const LidarMeasurement& measurement) {
+          return measurement.timeStamp < multiFrame->timestamp();
+        }, static_cast<LidarMeasurementDeque*>(nullptr));
 
     // Drop GPS Measurements that are older than the first frame (= first state)
     while(!gpsMeasurementsReceived_.Empty() && gpsMeasurementsReceived_.queue_.front().timeStamp < multiFrame ->timestamp()){
@@ -711,13 +736,10 @@ bool ThreadedSlam::processFrame() {
     }
 
     // now also get all relevant LiDAR measurements received thus far
-    while(!shutdown_ && !lidarMeasurementsReceived_.Empty() && lidarMeasurementsReceived_.queue_.front().timeStamp < multiFrame->timestamp())
-    {
-      if(lidarMeasurementsReceived_.PopBlocking(&lidarMeasurement))
-      {
-        lidarMeasurementDeque_.push_back(lidarMeasurement);
-      }
-    }
+    lidarMeasurementsReceived_.PopWhile(
+        [&](const LidarMeasurement& measurement) {
+          return measurement.timeStamp < multiFrame->timestamp();
+        }, &lidarMeasurementDeque_);
 
     // Get depth measurements: in stereo network, depth and multiFrame are perfectly synced.
     while(!shutdown_ && !depthMeasurementsReceived_.Empty() && depthMeasurementsReceived_.queue_.front().timeStamp <= multiFrame->timestamp())
@@ -843,32 +865,58 @@ bool ThreadedSlam::processFrame() {
                                                     lidarMeasurementDeque_, imuMeasurementDeque_);
 
           TimerSwitchable tLiveUndistortion("8.1 Live undistortion");
-          motionUndistortion.deskew();
+          const bool deskewed = motionUndistortion.deskew();
           tLiveUndistortion.stop();          
 
           TimerSwitchable tFilterObserved("8.2 Filter observed points");
           size_t observed_points = 0;
-          if (submapConfig_.usePointToPlaneFactors) {
-            // Bound association work spatially before the 27-cell plane search;
-            // retain all voxel candidates until validity has been checked.
+          bool overlapEvaluated = false;
+          if (deskewed && submapConfig_.usePointToPlaneFactors) {
+            // Spread the bounded search pool across occupied spatial voxels,
+            // expanding it when the initial pool yields too few valid planes.
             motionUndistortion.voxelDownsample(submapConfig_.voxelGridResolution);
+            auto& candidates = motionUndistortion.deskewedDownsampledPointCloud();
+            overlapEvaluated = !candidates.empty();
+            const size_t maximum = submapConfig_.lidarMaxPlaneCandidates
+                ? std::min(candidates.size(), submapConfig_.lidarMaxPlaneCandidates)
+                : candidates.size();
+            const size_t initial = submapConfig_.lidarMaxPlaneCandidates
+                ? std::min<size_t>(maximum, 4096) : maximum;
+            Point3Cloud<float> fullCandidates;
+            if (initial < maximum) fullCandidates = candidates;
+            if (initial) motionUndistortion.selectPlaneCandidates(initial, submapConfig_.voxelGridResolution);
             observed_points = motionUndistortion.filterPlanes(previousPlaneMap_,
                 estimator_.pose(StateId(previousSubmapId_)), submapConfig_.sensorError);
-          } else {
+            if (observed_points < submapConfig_.numSubmapFactors && initial < maximum) {
+              candidates = std::move(fullCandidates);
+              motionUndistortion.selectPlaneCandidates(maximum, submapConfig_.voxelGridResolution);
+              observed_points = motionUndistortion.filterPlanes(previousPlaneMap_,
+                  estimator_.pose(StateId(previousSubmapId_)), submapConfig_.sensorError);
+            }
+            LOG_EVERY_N(INFO, 100) << "Live LiDAR plane candidates: initial " << initial
+                                  << ", maximum " << maximum << ", valid " << observed_points;
+          } else if (deskewed) {
+            overlapEvaluated = !motionUndistortion.deskewedDownsampledPointCloud().empty();
             observed_points = motionUndistortion.filterObserved(previousSubmap_, estimator_.pose(StateId(previousSubmapId_)));
+          }
+          if (!deskewed) {
+            LOG_EVERY_N(WARNING, 40) << "Skipped live LiDAR factors: incomplete motion propagation";
           }
           // For point-to-plane, count valid spatial candidates before the final
           // factor limit, rather than raw duplicates or the truncated factor set.
-          if(observed_points < submapConfig_.numSubmapFactors){
+          if (overlapEvaluated && observed_points < submapConfig_.numSubmapFactors){
               noOverlapCounter_++;
           }
-          else{
+          else if (overlapEvaluated){
               noOverlapCounter_ = 0;
           }
           tFilterObserved.stop();
 
           TimerSwitchable tDownsampling("8.3 Downsampling");
-          motionUndistortion.downsample(submapConfig_.numSubmapFactors, submapConfig_.voxelGridResolution);
+          if (submapConfig_.usePointToPlaneFactors)
+            motionUndistortion.randomDownsample(submapConfig_.numSubmapFactors);
+          else
+            motionUndistortion.downsample(submapConfig_.numSubmapFactors, submapConfig_.voxelGridResolution);
           tDownsampling.stop();
           
           if(alignmentPublishCallback_){
@@ -876,7 +924,7 @@ bool ThreadedSlam::processFrame() {
           } 
           // Also add LiDAR Factors (live factors only)
           std::vector<float> sensorErrors(motionUndistortion.deskewedDownsampledPointCloud().size(), submapConfig_.sensorError);
-          estimator_.addSubmapAlignmentConstraints(
+          if (!sensorErrors.empty()) estimator_.addSubmapAlignmentConstraints(
                   previousSubmap_, previousSubmapId_, multiFrame->id(),
                   motionUndistortion.deskewedDownsampledPointCloud(), sensorErrors, true, "Tukey",
                   previousPlaneMap_, submapConfig_.usePointToPlaneFactors);

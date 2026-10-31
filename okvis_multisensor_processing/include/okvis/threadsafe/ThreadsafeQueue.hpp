@@ -25,6 +25,7 @@
 #include <queue>
 #include <sys/time.h>
 #include <utility>
+#include <stdexcept>
 
 #include <glog/logging.h>
 
@@ -40,6 +41,24 @@ namespace threadsafe {
  */
 template<typename QueueType, class Allocator = std::allocator<QueueType>>
 class Queue {
+  // Keep batch operations exception-safe when an output container allocates.
+  struct BatchLock {
+    BatchLock(pthread_mutex_t& mutex, pthread_cond_t& empty, pthread_cond_t& full)
+        : mutex_(mutex), empty_(empty), full_(full) {
+      pthread_mutex_lock(&mutex_);
+    }
+    ~BatchLock() {
+      // Also wake peers when an allocation/predicate throws after partial work.
+      pthread_cond_broadcast(&empty_);
+      pthread_cond_broadcast(&full_);
+      pthread_mutex_unlock(&mutex_);
+    }
+    BatchLock(const BatchLock&) = delete;
+    BatchLock& operator=(const BatchLock&) = delete;
+    pthread_mutex_t& mutex_;
+    pthread_cond_t& empty_;
+    pthread_cond_t& full_;
+  };
 
  public:
 
@@ -128,6 +147,50 @@ class Queue {
     pthread_cond_signal(&condition_empty_);
     pthread_mutex_unlock(&mutex_);
     return true;
+  }
+
+  struct BatchPushResult {
+    size_t accepted = 0;
+    size_t dropped = 0;
+  };
+
+  /// Preserve the single-item policy, taking the queue lock once per batch.
+  /// Nonblocking overflow replaces oldest entries; blocking mode waits for space.
+  template<class InputIterator>
+  BatchPushResult PushBatch(InputIterator first, InputIterator last,
+                            size_t max_queue_size, bool blocking) {
+    if (!max_queue_size) throw std::invalid_argument("Queue capacity must be positive");
+    BatchLock lock(mutex_, condition_empty_, condition_full_);
+    BatchPushResult result;
+    for (; first != last && !shutdown_; ++first) {
+      if (blocking) {
+        while (!shutdown_ && queue_.size() >= max_queue_size) {
+          pthread_cond_signal(&condition_empty_);
+          pthread_cond_wait(&condition_full_, &mutex_);
+        }
+        if (shutdown_) break;
+      } else if (queue_.size() >= max_queue_size) {
+        queue_.pop();
+        ++result.dropped;
+      }
+      queue_.push(*first);
+      ++result.accepted;
+    }
+    return result;
+  }
+
+  /// Append an ordered prefix to output, or discard it when output is null.
+  /// The predicate must be cheap and must not call back into this queue.
+  template<class Predicate, class OutputContainer>
+  size_t PopWhile(Predicate predicate, OutputContainer* output) {
+    BatchLock lock(mutex_, condition_empty_, condition_full_);
+    size_t count = 0;
+    while (!queue_.empty() && predicate(queue_.front())) {
+      if (output) output->push_back(std::move(queue_.front()));
+      queue_.pop();
+      ++count;
+    }
+    return count;
   }
 
   /// \brief Return the size of the queue.

@@ -48,8 +48,26 @@ void saveAlignedPoints(std::vector<Eigen::Vector3d, Eigen::aligned_allocator<Eig
 
 namespace okvis {
 
+  namespace {
+    const char* lidarPoseLookupStatusName(Trajectory::PoseLookupStatus status) {
+      switch (status) {
+        case Trajectory::PoseLookupStatus::Complete: return "complete";
+        case Trajectory::PoseLookupStatus::WaitingForState: return "waiting_for_state";
+        case Trajectory::PoseLookupStatus::WaitingForImu: return "waiting_for_imu";
+        case Trajectory::PoseLookupStatus::ExpiredImu: return "expired_imu";
+        case Trajectory::PoseLookupStatus::Invalid: return "invalid_pose_or_timestamp";
+      }
+      return "unknown";
+    }
+  }
+
   void SubmappingInterface::initializeMemoryStorage() {
-    if (!submapConfig_.memoryBounded || !viParameters_.lidar) return;
+    if (!viParameters_.lidar) return;
+    if (!submapConfig_.memoryBounded) {
+      LOG(INFO) << "LiDAR mapping input: unbounded RAM FIFO; configured lidar_queue_max_points="
+                << submapConfig_.lidarQueueMaxPoints << " is inactive when memory_bounded=false";
+      return;
+    }
     if (!submapConfig_.pointCloudMemoryMb || !submapConfig_.planeCacheMemoryMb
         || !submapConfig_.planeActiveMaxCells || !submapConfig_.lidarQueueMaxPoints
         || !submapConfig_.mappingQueueMaxFrames || !submapConfig_.stateQueueMaxUpdates
@@ -95,6 +113,11 @@ namespace okvis {
               << ", persistent voxel chunks "
               << (submapConfig_.pointCloudPersistentChunks ? "enabled" : "disabled")
               << ", local window half extent " << submapConfig_.pointCloudWindowHalfExtent << " m"
+              << "; effective LiDAR RAM cap " << submapConfig_.lidarQueueMaxPoints
+              << (submapConfig_.lidarSpoolEnabled ? " points (spool backlog is not capped)" : " points (drop incoming at capacity)")
+              << "; mapping packet cap " << submapConfig_.mappingQueueMaxFrames
+              << ", state update cap " << submapConfig_.stateQueueMaxUpdates
+              << ", plane candidate cap " << submapConfig_.lidarMaxPlaneCandidates
               << "; RViz publishes all retained map points without display sampling";
   }
 
@@ -122,6 +145,7 @@ namespace okvis {
         throw std::runtime_error("LiDAR input changed while discarding pre-initialization data");
       }
       discarded += stale;
+      lidarPreinitializationPoints_ += stale;
       if (stale < candidates->size()) {
         candidates->erase(candidates->begin(), candidates->begin() + stale);
         break;
@@ -139,54 +163,158 @@ namespace okvis {
     return discarded;
   }
 
-  bool SubmappingInterface::enqueueLidarBacklog(uint64_t anchorId) {
+  size_t SubmappingInterface::consumePosedLidar(
+      const Time& maxTime, size_t maxCount, LidarMeasurementBuffer::Batch* measurements,
+      std::vector<Eigen::Matrix4d, Eigen::aligned_allocator<Eigen::Matrix4d>>* poses) {
+    measurements->clear();
+    poses->clear();
+    uint64_t version;
+    {
+      std::lock_guard trajectoryLock(trajectoryMutex_);
+      version = trajectoryVersion_;
+    }
+    if (lidarWaiting_ && lidarWaitVersion_ == version && lidarWaitMaxTime_ == maxTime
+        && (!lidarWaitForInput_
+            || lidarMeasurements_.statistics().stored == lidarWaitStoredPoints_)) {
+      return 0;
+    }
+    lidarWaiting_ = false;
+    while (true) {
+      const uint64_t inputStoredBeforeCopy = lidarMeasurements_.statistics().stored;
+      LidarMeasurementBuffer::Batch candidates;
+      copyLidarAfterTrajectoryStart(maxTime, maxCount, &candidates);
+      if (candidates.empty()) {
+        // New input can satisfy an empty/time-limited FIFO without a trajectory
+        // update. An unsupported existing head only needs a trajectory update.
+        lidarWaiting_ = true;
+        lidarWaitForInput_ = true;
+        lidarWaitVersion_ = version;
+        lidarWaitStoredPoints_ = inputStoredBeforeCopy;
+        lidarWaitMaxTime_ = maxTime;
+        lidarWaitStatus_ = Trajectory::PoseLookupStatus::WaitingForState;
+        return 0;
+      }
+      std::vector<Time> times;
+      times.reserve(candidates.size());
+      for (const auto& candidate : candidates) times.push_back(candidate.timeStamp);
+      Trajectory::PoseLookupResult result;
+      {
+        std::lock_guard trajectoryLock(trajectoryMutex_);
+        version = trajectoryVersion_;
+        result = propagatedStates.getStatePosePrefix(times, *poses);
+      }
+      if (result.supportedCount != poses->size()
+          || result.supportedCount + result.expiredCount > candidates.size()) {
+        throw std::runtime_error("Invalid LiDAR pose prefix result");
+      }
+      size_t invalidCount = 0;
+      if (result.status == Trajectory::PoseLookupStatus::Invalid
+          && result.supportedCount < candidates.size()) {
+        const Time invalidTimestamp = candidates[result.supportedCount].timeStamp;
+        do {
+          ++invalidCount;
+        } while (result.supportedCount + invalidCount < candidates.size()
+            && candidates[result.supportedCount + invalidCount].timeStamp == invalidTimestamp);
+        ++lidarInvalidPoses_;
+      }
+      const size_t consumed = result.supportedCount + result.expiredCount + invalidCount;
+      if (consumed) {
+        if (lidarMeasurements_.PopCount(consumed, measurements) != consumed) {
+          throw std::runtime_error("LiDAR input changed while consuming a posed prefix");
+        }
+        measurements->resize(result.supportedCount);
+        lidarPosedPoints_ += result.supportedCount;
+        if (result.expiredCount && !lidarExpiredPoints_) {
+          LOG(WARNING) << "Discarding " << result.expiredCount
+                       << " LiDAR rays whose required IMU interval has expired; releasing the FIFO prefix"
+                       << (submapConfig_.lidarSpoolEnabled ? "; raw spool records are retained" : "");
+        }
+        lidarExpiredPoints_ += result.expiredCount;
+        if (invalidCount && !lidarInvalidPoints_) {
+          LOG(WARNING) << "Discarding " << invalidCount
+                       << " LiDAR rays at a timestamp with an invalid/nonfinite pose; "
+                          "these are counted separately from expired IMU input";
+        }
+        lidarInvalidPoints_ += invalidCount;
+      }
+      lidarWaitStatus_ = result.status;
+      if (result.status == Trajectory::PoseLookupStatus::WaitingForState
+          || result.status == Trajectory::PoseLookupStatus::WaitingForImu) {
+        // Keep the unsupported head in order, but do not copy and propagate it
+        // every idle millisecond while neither states nor IMU have changed.
+        lidarWaiting_ = true;
+        lidarWaitForInput_ = false;
+        lidarWaitVersion_ = version;
+        lidarWaitMaxTime_ = maxTime;
+        if (result.status == Trajectory::PoseLookupStatus::WaitingForState) ++lidarWaitingForState_;
+        else if (result.status == Trajectory::PoseLookupStatus::WaitingForImu) ++lidarWaitingForImu_;
+      }
+      if (result.supportedCount) return result.supportedCount;
+      if (!result.expiredCount && !invalidCount) return 0;
+      // An expired/invalid prefix was removed. Retry the next prefix immediately
+      // so permanently unpropagatable old input cannot block current geometry.
+    }
+  }
+
+  void SubmappingInterface::reportLidarQueueStatistics(bool force) {
+    if (!lidarSensors_) return;
+    if (lidarFinalStatisticsReported_) return;
+    const auto now = std::chrono::steady_clock::now();
+    if (!force && now - lastLidarStatisticsReport_ < std::chrono::seconds(1)) return;
+    lastLidarStatisticsReport_ = now;
+    if (force) lidarFinalStatisticsReported_ = true;
+    const auto stats = lidarMeasurements_.statistics();
+    LOG(INFO) << "LiDAR mapping input" << (force ? " final" : "")
+              << ": queued=" << stats.queued << ", resident=" << stats.resident
+              << ", accepted=" << stats.stored << ", dropped_incoming=" << stats.dropped
+              << ", range_filtered=" << lidarRangeFilteredPoints_.load(std::memory_order_relaxed)
+              << ", consumed=" << stats.consumed
+              << ", posed=" << lidarPosedPoints_ << ", expired_imu=" << lidarExpiredPoints_
+              << ", preinitialization=" << lidarPreinitializationPoints_
+              << ", wait_state=" << lidarWaitingForState_ << ", wait_imu=" << lidarWaitingForImu_
+              << ", invalid_pose=" << lidarInvalidPoses_
+              << ", invalid_dropped=" << lidarInvalidPoints_
+              << ", pending_reason=" << (stats.queued ? lidarPoseLookupStatusName(lidarWaitStatus_) : "none")
+              << ", queue_span_s=" << (stats.hasFront ? (stats.newest - stats.oldest).toSec() : 0.0)
+              << ", state_minus_oldest_s="
+              << (stats.hasFront ? (lastTrajectoryUpdateTimestamp_ - stats.oldest).toSec() : 0.0);
+  }
+
+  bool SubmappingInterface::enqueueLidarBacklog(uint64_t anchorId, bool yieldToStateUpdates) {
     if (anchorId == UNINITIALIZED_ID) {
       std::lock_guard mappingLock(mappingDataMutex_);
       if (!frame_ || frame_->frameData_.empty()) return false;
     }
-    LidarMeasurementBuffer::Batch candidates;
-    copyLidarAfterTrajectoryStart(lastTrajectoryUpdateTimestamp_, 8192, &candidates);
-    if (!candidates.empty()) {
-      // A ray can arrive after the last state update was consumed. Drain
-      // only the portion supported by available state/IMU propagation.
-      std::vector<Time> times;
-      times.reserve(candidates.size());
-      for (const auto& ray : candidates) times.push_back(ray.timeStamp);
-      std::vector<Eigen::Matrix4d, Eigen::aligned_allocator<Eigen::Matrix4d>> poses;
-      {
-        std::lock_guard trajectoryLock(trajectoryMutex_);
-        poses.reserve(times.size());
-        for (const auto& time : times) {
-          State state;
-          if (!propagatedStates.getState(time, state)) break;
-          const Eigen::Matrix4d pose = state.T_WS.T();
-          if (!pose.allFinite()) break;
-          poses.push_back(pose);
-        }
-      }
-      // Keep the first unsupported ray in the input FIFO. Timestamps are
-      // ordered, so consuming a later ray would make retry/recovery unsafe.
-      const size_t supported = poses.size();
-      if (!supported) return false;
+    bool queued = false;
+    while (true) {
       LidarMeasurementBuffer::Batch rays;
-      if (lidarMeasurements_.PopCount(supported, &rays) != supported) return false;
+      std::vector<Eigen::Matrix4d, Eigen::aligned_allocator<Eigen::Matrix4d>> poses;
+      const size_t supported = consumePosedLidar(lastTrajectoryUpdateTimestamp_, 32768, &rays, &poses);
+      if (!supported) return queued;
       SupereightFrames tail(anchorId);
       if (anchorId == UNINITIALIZED_ID) {
         std::lock_guard mappingLock(mappingDataMutex_);
-        if (!frame_ || frame_->frameData_.empty()) return false;
+        if (!frame_ || frame_->frameData_.empty())
+          throw std::runtime_error("LiDAR backlog lost its initial mapping anchor");
         tail = std::move(*frame_);
         frame_.reset();
       } else tail.useCurrentActiveSubmap = true;
+      tail.vecRayMeasurements.reserve(supported);
       for (size_t i = 0; i < supported; ++i) {
         tail.vecRayMeasurements.emplace_back(Eigen::Isometry3f(
             poses[i].cast<float>() * viParameters_.lidar->T_SL.T().cast<float>()),
             rays[i].measurement.rayMeasurement.cast<float>());
       }
-      if (!tail.vecRayMeasurements.empty())
-        return supereightFrames_.PushBlockingIfFull(std::move(tail), submapConfig_.mappingQueueMaxFrames);
-      return false;
+      if (!supereightFrames_.PushBlockingIfFull(std::move(tail), submapConfig_.mappingQueueMaxFrames))
+        return queued;
+      queued = true;
+      // The first packet carries state metadata. Further backlog packets use
+      // the anchor chosen by the mapping thread when it processes that packet.
+      if (anchorId == UNINITIALIZED_ID) return true;
+      // Do not let a large old backlog starve newly published state/IMU
+      // intervals. Their queue has its own bounded budget and must advance.
+      if (yieldToStateUpdates && !stateUpdates_.Empty()) return queued;
     }
-    return false;
   }
 
   size_t SubmappingInterface::planeResidentBytes() const {
@@ -565,34 +693,55 @@ namespace okvis {
   }
 
   bool SubmappingInterface::addLidarMeasurement(const okvis::Time &stamp,
-                                                  const Eigen::Vector3d &ray) { // ToDo: adjust logic for lidar (consider large number of measurements)
-    // Create an OKVIS LiDAR measurement.
+                                                  const Eigen::Vector3d &ray) {
     LidarMeasurement lidarMeasurement;
     lidarMeasurement.timeStamp = stamp;
     lidarMeasurement.measurement.rayMeasurement = ray;
+    lidarMeasurement.measurement.intensity = 0;
+    return addLidarMeasurements(LidarMeasurementBatch{lidarMeasurement});
+  }
 
-    // Push data to the Queue.
-    const size_t lidarQueueSize = submapConfig_.lidarQueueMaxPoints;
-    sensorMeasurementDownsamplingCounter_++;
-        
-    if(sensorMeasurementDownsamplingCounter_ % sensorMeasurementDownsampling_ == 0){
-      sensorMeasurementDownsamplingCounter_ = 0;
-      if (submapConfig_.lidarSpoolEnabled) {
-        return lidarMeasurements_.PushBlockingIfFull(lidarMeasurement, lidarQueueSize);
-      }
-      bool droppedNewest = false;
-      const bool stored = lidarMeasurements_.PushNonBlockingDroppingNewestIfFull(
-          lidarMeasurement, &droppedNewest);
-      if (droppedNewest && !lidarQueueOverflowReported_) {
-        LOG(WARNING) << "Bounded RAM LiDAR queue reached " << lidarQueueSize
-                     << " rays; dropping incoming rays to keep camera and IMU callbacks live";
-        lidarQueueOverflowReported_ = true;
-      }
-      return stored || droppedNewest;
+  bool SubmappingInterface::addLidarMeasurements(const LidarMeasurementBatch& measurements) {
+    if (measurements.empty()) return true;
+    std::lock_guard inputLock(lidarInputMutex_);
+    if (sensorMeasurementDownsampling_ <= 0) {
+      throw std::runtime_error("sensor_measurement_downsampling must be positive");
     }
-
-    return true;
-
+    LidarMeasurementBatch sampled;
+    const LidarMeasurementBatch* selected = &measurements;
+    // The downstream map already rejects these ranges after pose lookup. RAM
+    // input can reject them before propagation; explicit raw spools retain them.
+    const bool filterRange = !submapConfig_.lidarSpoolEnabled && bool(lidarSensors_);
+    if (sensorMeasurementDownsampling_ > 1 || filterRange) {
+      sampled.reserve(measurements.size() / sensorMeasurementDownsampling_ + 1);
+      size_t rangeFiltered = 0;
+      for (const auto& measurement : measurements) {
+        // Advance sampling for every input point, including rejected ranges.
+        if (++sensorMeasurementDownsamplingCounter_ == sensorMeasurementDownsampling_) {
+          sensorMeasurementDownsamplingCounter_ = 0;
+          if (filterRange) {
+            // Match updateLidarAlignBlock's float endpoint/range calculation.
+            const double range = measurement.measurement.rayMeasurement.cast<float>().norm();
+            if (!std::isfinite(range) || range < lidarSensors_->second.near_plane
+                || range > lidarSensors_->second.far_plane) {
+              ++rangeFiltered;
+              continue;
+            }
+          }
+          sampled.push_back(measurement);
+        }
+      }
+      lidarRangeFilteredPoints_.fetch_add(rangeFiltered, std::memory_order_relaxed);
+      selected = &sampled;
+    }
+    const auto result = lidarMeasurements_.PushBatch(*selected);
+    if (result.dropped && !lidarQueueOverflowReported_) {
+      LOG(WARNING) << "Bounded RAM LiDAR queue reached " << submapConfig_.lidarQueueMaxPoints
+                   << " rays; dropped " << result.dropped
+                   << " incoming rays in this batch to keep camera and IMU callbacks live";
+      lidarQueueOverflowReported_ = true;
+    }
+    return !result.stopped;
   }
 
     bool SubmappingInterface::addDepthMeasurement(std::map<size_t, std::vector<okvis::CameraMeasurement>>& frames){
@@ -658,6 +807,7 @@ namespace okvis {
             success = true;
           }
         }
+        if (!imuMeasurements_.empty()) ++trajectoryVersion_;
         imuMeasurements_.clear();
 
         if(success && anchoredTrajectoryUpdateCallback_ && (state.timestamp - lastTime_).toSec()
@@ -727,13 +877,17 @@ namespace okvis {
         if (queued) return false;
         frame_.reset(); // state-only metadata without any posed measurements
         if (!lidarMeasurements_.Empty() && !finalTailReported_) {
-          LOG(WARNING) << "No pose-supported LiDAR map was created; pending raw rays remain in the input "
-                       << (submapConfig_.lidarSpoolEnabled ? "archive" : "buffer");
+          LOG(WARNING) << "No pose-supported LiDAR map was created; " << lidarMeasurements_.Size()
+                       << " pending rays remain in the input "
+                       << (submapConfig_.lidarSpoolEnabled ? "archive" : "buffer")
+                       << "; reason=" << lidarPoseLookupStatusName(lidarWaitStatus_);
           finalTailReported_ = true;
         }
+        reportLidarQueueStatistics(true);
         return true;
       }
       if (numMessages == 0 && seSubmapLookup_.empty() && !isProcessingSeFrame_ && !frame_) {
+        reportLidarQueueStatistics(true);
         return true;
       }
       if(numMessages == 0 && seSubmapLookup_.size() > 0 && !isProcessingSeFrame_){
@@ -746,8 +900,9 @@ namespace okvis {
             supereightFrames_.PushBlockingIfFull(std::move(*pendingFrame), submapConfig_.mappingQueueMaxFrames);
             return false;
           }
+          const uint64_t anchorId = prevKeyframeId_;
           mappingLock.unlock();
-          const bool queued = enqueueLidarBacklog(prevKeyframeId_);
+          const bool queued = enqueueLidarBacklog(anchorId);
           mappingLock.lock();
           if (queued) return false;
           if (submapConfig_.useMap2MapFactors) lidarMap2MapFactors();
@@ -757,13 +912,14 @@ namespace okvis {
           }
 
           if (!lidarMeasurements_.Empty() && !finalTailReported_) {
-            LOG(WARNING) << lidarMeasurements_.Size() << " trailing LiDAR rays are newer than the last state; "
-                            "they remain in the input "
+            LOG(WARNING) << lidarMeasurements_.Size() << " unconsumed LiDAR rays remain in the input "
                          << (submapConfig_.lidarSpoolEnabled ? "archive" : "buffer")
-                         << " and are not inserted without a valid pose";
+                         << "; reason=" << lidarPoseLookupStatusName(lidarWaitStatus_)
+                         << "; they are not inserted without a valid propagated pose";
             finalTailReported_ = true;
           }
 
+          reportLidarQueueStatistics(true);
           return true;
         }
         else {
@@ -1589,6 +1745,7 @@ namespace okvis {
 
     bool SubmappingInterface::checkForAvailableData() {
       std::lock_guard integrationLock(integrationInputMutex_);
+      reportLidarQueueStatistics();
       std::map<size_t, std::vector<okvis::CameraMeasurement>> depthMeasurement;
       LidarMeasurement oldestLidarMeasurement;
       bool integrateLidar = true;
@@ -1649,6 +1806,7 @@ namespace okvis {
           {
             std::lock_guard trajectoryLock(trajectoryMutex_);
             propagatedStates.update(popState.trackingState, popState.updatedStates, popState.affectedStates);
+            ++trajectoryVersion_;
             lastTrajectoryUpdateTimestamp_ = popState.timestamp;
           }
 
@@ -1687,6 +1845,7 @@ namespace okvis {
         {
           std::lock_guard trajectoryLock(trajectoryMutex_);
           propagatedStates.update(currentStateUpdate.trackingState, currentStateUpdate.updatedStates, currentStateUpdate.affectedStates);
+          ++trajectoryVersion_;
           lastTrajectoryUpdateTimestamp_ = currentStateUpdate.timestamp;
         }
         
@@ -1721,14 +1880,6 @@ namespace okvis {
 
       // Motion de-skewed LiDAR Measurements
       std::vector<Eigen::Matrix4d, Eigen::aligned_allocator<Eigen::Matrix4d>> statePoses;
-      std::vector<okvis::Time> times;
-      LidarMeasurementBuffer::Batch candidates;
-      if (integrateLidar) {
-        copyLidarAfterTrajectoryStart(
-            currentStateUpdate.timestamp, maxLidarBatchPoints, &candidates);
-        times.reserve(candidates.size());
-        for (const auto& measurement : candidates) times.push_back(measurement.timeStamp);
-      }
 
       while(keepLooping){
         bool depthImageExisting = integrateDepthImage;
@@ -1820,39 +1971,11 @@ namespace okvis {
 
         if(!keepLoopingDepth && !keepLoopingLidar ) {
           keepLooping = false;
-          if(integrateLidar && !candidates.empty()){
-            statePoses.reserve(times.size());
-            bool getStatesSuccessfully;
-            {
-              std::lock_guard trajectoryLock(trajectoryMutex_);
-              getStatesSuccessfully = propagatedStates.getStatePoses(times, statePoses);
-              if (!getStatesSuccessfully || statePoses.size() != times.size()) {
-                // The batch propagator supports one camera interval. Repeated
-                // timestamps or delayed input can span intervals; scalar lookup
-                // preserves the correct interval and cannot yield a short array.
-                statePoses.clear();
-                for (const auto& time : times) {
-                  State state;
-                  if (!propagatedStates.getState(time, state)) break;
-                  const Eigen::Matrix4d pose = state.T_WS.T();
-                  if (!pose.allFinite()) break;
-                  statePoses.push_back(pose);
-                }
-                getStatesSuccessfully = true;
-              }
-            }
-            size_t supported = getStatesSuccessfully ? statePoses.size() : 0;
-            for (size_t i = 0; i < supported; ++i) {
-              if (!statePoses[i].allFinite()) {
-                supported = i;
-                break;
-              }
-            }
+          if(integrateLidar){
+            LidarMeasurementBuffer::Batch measurements;
+            const size_t supported = consumePosedLidar(
+                currentStateUpdate.timestamp, maxLidarBatchPoints, &measurements, &statePoses);
             if (supported) {
-              LidarMeasurementBuffer::Batch measurements;
-              if (lidarMeasurements_.PopCount(supported, &measurements) != supported) {
-                throw std::runtime_error("LiDAR input changed while consuming a posed batch");
-              }
               if (!frame_) {
                 throw std::runtime_error("About to add LiDAR measurements without an active mapping frame");
               }
@@ -1863,22 +1986,33 @@ namespace okvis {
                                                       measurements[i].measurement.rayMeasurement.template cast<float>()});
               }
             }
-            if (supported < candidates.size()) {
-              LOG(WARNING) << (candidates.size() - supported)
-                           << " LiDAR rays are waiting for a valid propagated pose";
-            }
           }
 
           // Push SupereightFrame for every state
           frameUpdater(currentStateUpdate);
 
           if(frame_){
+            const uint64_t packetAnchor = frame_->keyFrameId;
+            bool packetQueued = true;
             if(blocking_ || submapConfig_.memoryBounded){
-              supereightFrames_.PushBlockingIfFull(std::move(*frame_), submapConfig_.memoryBounded ? supereightQueueSize : 1);
+              packetQueued = supereightFrames_.PushBlockingIfFull(std::move(*frame_), submapConfig_.memoryBounded ? supereightQueueSize : 1);
             } else if(supereightFrames_.PushNonBlockingDroppingIfFull(std::move(*frame_), supereightQueueSize)){
               LOG(WARNING) << "Oldest Supereight frame dropped";
             }
             frame_.reset();
+            if (integrateLidar && packetQueued) {
+              uint64_t anchorId;
+              {
+                std::lock_guard mappingLock(mappingDataMutex_);
+                anchorId = prevKeyframeId_;
+              }
+              // This metadata packet precedes every tail packet in the FIFO;
+              // even the first submap is initialized before its tail is read.
+              if (anchorId == UNINITIALIZED_ID) anchorId = packetAnchor;
+              // Drain at least one ready batch, then yield to newly queued
+              // state updates so their bounded queue and IMU support advance.
+              enqueueLidarBacklog(anchorId, true);
+            }
           }
         }
       }

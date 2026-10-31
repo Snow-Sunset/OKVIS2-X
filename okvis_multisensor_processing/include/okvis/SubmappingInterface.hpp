@@ -16,6 +16,7 @@
 #include <okvis/LidarPointCloudMap.hpp>
 #include <okvis/LidarMeasurementBuffer.hpp>
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <filesystem>
@@ -331,6 +332,7 @@ namespace okvis {
 
           LOG(INFO) << "Finished submap integration thread";
           stopPointCloudPublisher();
+          reportLidarQueueStatistics(true);
           try { flushMemoryStorage(); }
           catch (const std::exception& error) { LOG(ERROR) << "Final LiDAR archive flush failed: " << error.what(); }
 
@@ -345,6 +347,8 @@ namespace okvis {
          *            discards the incoming ray without blocking other sensors.
          */
         bool addLidarMeasurement(const okvis::Time &stamp, const Eigen::Vector3d &ray);
+        /// Enqueue one parsed LiDAR message without per-point queue locking.
+        bool addLidarMeasurements(const LidarMeasurementBatch& measurements);
 
         /**
          * @brief Adds a depth image to the measurement Queue
@@ -844,13 +848,36 @@ namespace okvis {
         std::vector<ImuMeasurement> imuMeasurements_; ///< Buffered IMU measurements (realtime pub.).
         std::mutex trajectoryMutex_;
         std::mutex integrationInputMutex_;
+        std::mutex lidarInputMutex_; ///< Serializes producer sampling and overflow reporting.
+        std::atomic<uint64_t> lidarRangeFilteredPoints_{0};
+        uint64_t trajectoryVersion_ = 0; ///< Protected by trajectoryMutex_.
+        // Consumer-only retry state, protected by integrationInputMutex_.
+        bool lidarWaiting_ = false;
+        bool lidarWaitForInput_ = false;
+        uint64_t lidarWaitVersion_ = 0;
+        uint64_t lidarWaitStoredPoints_ = 0;
+        Time lidarWaitMaxTime_;
+        Trajectory::PoseLookupStatus lidarWaitStatus_ = Trajectory::PoseLookupStatus::Complete;
+        uint64_t lidarPosedPoints_ = 0;
+        uint64_t lidarExpiredPoints_ = 0;
+        uint64_t lidarPreinitializationPoints_ = 0;
+        uint64_t lidarWaitingForState_ = 0;
+        uint64_t lidarWaitingForImu_ = 0;
+        uint64_t lidarInvalidPoses_ = 0;
+        uint64_t lidarInvalidPoints_ = 0;
+        std::chrono::steady_clock::time_point lastLidarStatisticsReport_{};
+        bool lidarFinalStatisticsReported_ = false;
         bool finalTailReported_ = false;
         bool preinitializationLidarReported_ = false;
         bool lidarQueueOverflowReported_ = false;
         Time lastTrajectoryUpdateTimestamp_;
         size_t copyLidarAfterTrajectoryStart(
             const Time& maxTime, size_t maxCount, LidarMeasurementBuffer::Batch* candidates);
-        bool enqueueLidarBacklog(uint64_t anchorId);
+        size_t consumePosedLidar(
+            const Time& maxTime, size_t maxCount, LidarMeasurementBuffer::Batch* measurements,
+            std::vector<Eigen::Matrix4d, Eigen::aligned_allocator<Eigen::Matrix4d>>* poses);
+        void reportLidarQueueStatistics(bool force = false);
+        bool enqueueLidarBacklog(uint64_t anchorId, bool yieldToStateUpdates = true);
         realTimePublishingCallback realTimePublishCallback_;
         double odometryPublishingRate_ = 40.0; ///< Publishing rate for realtime propagation.
         okvis::Time lastTime_ = okvis::Time(0); ///< Keep track of last publishing (to maintain rate).

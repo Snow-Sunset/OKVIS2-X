@@ -1,6 +1,9 @@
 // SPDX-License-Identifier: BSD-3-Clause
 #include <okvis/SubmappingInterface.hpp>
+#include <algorithm>
+#include <array>
 #include <cmath>
+#include <cstdint>
 #include <future>
 #include <condition_variable>
 #include <okvis/LidarMotionUndistortion.hpp>
@@ -10,6 +13,8 @@
 #include <iostream>
 #include <limits>
 #include <stdexcept>
+#include <set>
+#include <utility>
 
 namespace {
 void check(bool condition, const char* message) {
@@ -267,6 +272,170 @@ void runCandidateSampling() {
   check(invalid, "Invalid candidate sampling resolution accepted");
   points.clear();
   check(!scan.voxelDownsample(0.1), "Empty candidate cloud sampling reported success");
+
+  // Occupied cells cover all octants, including negative voxel coordinates.
+  for (int x = -4; x < 4; ++x)
+    for (int y = -4; y < 4; ++y)
+      for (int z = -4; z < 4; ++z)
+        points.emplace_back(float(x) + 0.25f, float(y) + 0.25f, float(z) + 0.25f);
+  check(scan.voxelDownsample(0.5) && points.size() == 512,
+        "Spatial candidate sampling lost distinct positive/negative cells");
+  const auto allCandidates = points;
+  scan.selectPlaneCandidates(0, 0.5);
+  check(points.size() == allCandidates.size(), "Zero plane candidate budget must be unlimited");
+  for (size_t i = 0; i < points.size(); ++i)
+    check((points[i] - allCandidates[i]).squaredNorm() == 0.0f,
+          "Unlimited plane candidate selection changed point order");
+
+  scan.selectPlaneCandidates(128, 0.5);
+  const auto smallSelection = points;
+  check(smallSelection.size() == 128, "Plane candidate budget was not enforced");
+  std::array<bool, 8> octants{};
+  for (const auto& point : smallSelection) {
+    const size_t octant = (point.x() >= 0.0f ? 4 : 0)
+        + (point.y() >= 0.0f ? 2 : 0) + (point.z() >= 0.0f ? 1 : 0);
+    octants[octant] = true;
+  }
+  check(std::all_of(octants.begin(), octants.end(), [](bool covered) { return covered; }),
+        "Bounded plane candidates failed to cover spatial octants");
+  points = allCandidates;
+  scan.selectPlaneCandidates(128, 0.5);
+  check(points.size() == smallSelection.size(), "Repeated candidate selection changed its size");
+  for (size_t i = 0; i < points.size(); ++i)
+    check((points[i] - smallSelection[i]).squaredNorm() == 0.0f,
+          "Plane candidate selection is not deterministic");
+  points = allCandidates;
+  scan.selectPlaneCandidates(256, 0.5);
+  check(points.size() == 256, "Expanded plane candidate budget was not enforced");
+  std::set<std::array<float, 3>> largerSelection;
+  for (const auto& point : points) largerSelection.insert({point.x(), point.y(), point.z()});
+  for (const auto& point : smallSelection)
+    check(largerSelection.count({point.x(), point.y(), point.z()}) == 1,
+          "Expanding plane candidate budget discarded an earlier candidate");
+
+  for (const double resolution : {0.0, -0.5, std::numeric_limits<double>::quiet_NaN()}) {
+    bool rejected = false;
+    try { scan.selectPlaneCandidates(128, resolution); }
+    catch (const std::invalid_argument&) { rejected = true; }
+    check(rejected, "Invalid plane candidate resolution accepted");
+  }
+  points = allCandidates;
+  scan.selectPlaneCandidates(allCandidates.size() + 1, 0.5);
+  check(points.size() == allCandidates.size(), "Candidate budget larger than scan changed its size");
+  points.clear();
+  scan.selectPlaneCandidates(128, 0.5);
+  check(points.empty(), "Empty plane candidate pool did not stay empty");
+}
+
+okvis::State stationaryMotionState() {
+  okvis::State state{};
+  state.id = okvis::StateId(1);
+  state.timestamp = okvis::Time(10, 0);
+  state.T_WS = okvis::kinematics::Transformation::Identity();
+  state.v_W.setZero();
+  state.b_g.setZero();
+  state.b_a.setZero();
+  state.omega_S.setZero();
+  return state;
+}
+
+okvis::LidarMeasurementDeque motionRays() {
+  okvis::LidarMeasurementDeque rays;
+  const std::array<uint32_t, 5> times = {0, 0, 50000000, 50000000, 100000000};
+  for (size_t i = 0; i < times.size(); ++i) {
+    okvis::LidarMeasurement ray;
+    ray.timeStamp = okvis::Time(10, times[i]);
+    ray.measurement.rayMeasurement = Eigen::Vector3d(1.0 + double(i), -0.5, 2.0);
+    rays.push_back(ray);
+  }
+  return rays;
+}
+
+okvis::ImuMeasurementDeque stationaryMotionImu() {
+  okvis::ImuMeasurementDeque imu;
+  for (const uint32_t nsec : {0u, 100000000u, 200000000u}) {
+    okvis::ImuMeasurement measurement;
+    measurement.timeStamp = okvis::Time(10, nsec);
+    measurement.measurement.gyroscopes.setZero();
+    measurement.measurement.accelerometers = Eigen::Vector3d(0, 0, 9.81);
+    imu.push_back(measurement);
+  }
+  return imu;
+}
+
+void checkStationaryDeskew(okvis::LidarMotionUndistortion& scan,
+    const okvis::LidarMeasurementDeque& expectedRays, const Eigen::Vector3d& offset) {
+  check(scan.deskew(), "Supported stationary LiDAR scan failed deskew");
+  const auto& points = scan.deskewedDownsampledPointCloud();
+  check(points.size() == expectedRays.size(), "Deskew lost or duplicated a timestamp group");
+  for (size_t i = 0; i < points.size(); ++i)
+    check((points[i].cast<double>() - expectedRays[i].measurement.rayMeasurement - offset).norm() < 1e-5,
+          "Deskew used an incorrect pose for stationary/duplicate-timestamp points");
+}
+
+void runMotionUndistortion() {
+  const auto state = stationaryMotionState();
+  const auto identity = okvis::kinematics::Transformation::Identity();
+  auto rays = motionRays();
+  auto imu = stationaryMotionImu();
+  okvis::LidarMotionUndistortion scan(state, identity, identity, rays, imu);
+  checkStationaryDeskew(scan, rays, Eigen::Vector3d::Zero());
+  checkStationaryDeskew(scan, rays, Eigen::Vector3d::Zero());
+
+  // At the initial time no IMU propagation is needed, even for multiple rays.
+  auto initialRays = rays;
+  initialRays.resize(2);
+  auto singleImu = imu;
+  singleImu.resize(1);
+  const okvis::kinematics::Transformation live(Eigen::Vector3d(1, 2, 3), Eigen::Quaterniond::Identity());
+  const okvis::kinematics::Transformation extrinsics(Eigen::Vector3d(0.25, -0.5, 1), Eigen::Quaterniond::Identity());
+  okvis::LidarMotionUndistortion initialGroup(state, live, extrinsics, initialRays, singleImu);
+  checkStationaryDeskew(initialGroup, initialRays, extrinsics.r() - live.r());
+
+  const auto expectUnsupported = [&](const okvis::LidarMeasurementDeque& inputRays,
+      const okvis::ImuMeasurementDeque& inputImu) {
+    okvis::LidarMotionUndistortion unsupported(state, identity, identity, inputRays, inputImu);
+    unsupported.deskewedDownsampledPointCloud().push_back(Eigen::Vector3f::Ones());
+    check(!unsupported.deskew() && unsupported.deskewedDownsampledPointCloud().empty(),
+          "Unsupported deskew returned success or left stale/partial output");
+  };
+  expectUnsupported(rays, {});
+  auto shortImu = imu;
+  shortImu.resize(1);
+  expectUnsupported(rays, shortImu);
+  auto lateImu = imu;
+  lateImu.pop_front();
+  expectUnsupported(rays, lateImu);
+  auto unorderedImu = imu;
+  std::swap(unorderedImu[1], unorderedImu[2]);
+  expectUnsupported(rays, unorderedImu);
+  auto duplicateImu = imu;
+  duplicateImu.insert(duplicateImu.begin() + 1, duplicateImu.front());
+  expectUnsupported(rays, duplicateImu);
+  auto unorderedRays = rays;
+  std::swap(unorderedRays[2], unorderedRays[4]);
+  expectUnsupported(unorderedRays, imu);
+
+  // Borrowed input can become unavailable between calls; successful old output
+  // must disappear rather than being reused as this frame's LiDAR factors.
+  imu.clear();
+  check(!scan.deskew() && scan.deskewedDownsampledPointCloud().empty(),
+        "Failed repeated deskew retained output from an earlier successful call");
+
+  const auto expected = motionRays();
+  const auto stableImu = stationaryMotionImu();
+  okvis::LidarMotionUndistortion owned(state, identity, identity, motionRays(), stationaryMotionImu());
+  checkStationaryDeskew(owned, expected, Eigen::Vector3d::Zero());
+  okvis::LidarMotionUndistortion ownedRays(state, identity, identity, motionRays(), stableImu);
+  checkStationaryDeskew(ownedRays, expected, Eigen::Vector3d::Zero());
+  okvis::LidarMotionUndistortion ownedImu(state, identity, identity, expected, stationaryMotionImu());
+  checkStationaryDeskew(ownedImu, expected, Eigen::Vector3d::Zero());
+  auto transferred = [&] {
+    okvis::LidarMotionUndistortion original(state, identity, identity, motionRays(), stationaryMotionImu());
+    auto copied = original;
+    return okvis::LidarMotionUndistortion(std::move(copied));
+  }();
+  checkStationaryDeskew(transferred, expected, Eigen::Vector3d::Zero());
 }
 
 } // namespace
@@ -283,7 +452,8 @@ int main() {
     run(false);
     runAsyncPublication();
     runCandidateSampling();
-    std::cout << "Plane-only allocation, overlap, handoff, output and shutdown checks passed\n";
+    runMotionUndistortion();
+    std::cout << "Plane-only allocation, overlap, handoff, candidate/deskew, output and shutdown checks passed\n";
     return 0;
   } catch (const std::exception& error) {
     std::cerr << error.what() << '\n';

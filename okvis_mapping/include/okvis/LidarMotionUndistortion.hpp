@@ -19,6 +19,7 @@
 #include <okvis/mapTypedefs.hpp>
 #include <se/map/map.hpp>
 #include <okvis/VoxelGridFilter.hpp>
+#include <memory>
 
 namespace okvis{
     class LidarMotionUndistortion{
@@ -33,13 +34,28 @@ namespace okvis{
         /// \brief Default copy Constructor.
         LidarMotionUndistortion(const LidarMotionUndistortion & ) = default;
 
-        /// \brief Constructor
+        /// \brief Borrow input measurements; lvalues must outlive this object.
         LidarMotionUndistortion(const State& initialState, const kinematics::Transformation& T_WS_live,
                                 const kinematics::Transformation& T_SL,
                                 const LidarMeasurementDeque& lidarMeasurementDeque,
                                 const ImuMeasurementDeque& imuMeasurementDeque);
 
-        /// \brief Function doing motion undistortion based on latest state and imu measurements
+        /// \brief Own temporary inputs while continuing to borrow any lvalue input.
+        LidarMotionUndistortion(const State& initialState, const kinematics::Transformation& T_WS_live,
+                                const kinematics::Transformation& T_SL,
+                                LidarMeasurementDeque&& lidarMeasurementDeque,
+                                const ImuMeasurementDeque& imuMeasurementDeque);
+        LidarMotionUndistortion(const State& initialState, const kinematics::Transformation& T_WS_live,
+                                const kinematics::Transformation& T_SL,
+                                const LidarMeasurementDeque& lidarMeasurementDeque,
+                                ImuMeasurementDeque&& imuMeasurementDeque);
+        LidarMotionUndistortion(const State& initialState, const kinematics::Transformation& T_WS_live,
+                                const kinematics::Transformation& T_SL,
+                                LidarMeasurementDeque&& lidarMeasurementDeque,
+                                ImuMeasurementDeque&& imuMeasurementDeque);
+
+        /// \brief Motion undistortion based on the latest state and IMU measurements.
+        /// Clears prior output; unsupported propagation returns false with empty output.
         bool deskew();
 
         /// \brief Function doing voxel hash grid based downsampling
@@ -48,6 +64,12 @@ namespace okvis{
         /// \brief Spatially sample candidates without imposing a random point limit.
         /// Invalid resolutions throw; nonfinite or unindexable points are removed.
         bool voxelDownsample(double voxel_grid_resolution=0.1);
+
+        /// \brief Limit spatially sampled plane candidates using deterministic voxel priorities.
+        /// Call after voxelDownsample(). Zero keeps all candidates. Increasing the
+        /// budget on the same original cloud retains the previously selected set.
+        /// This does not query the map or change occupancy-path sampling.
+        void selectPlaneCandidates(size_t maxCandidates, double voxelResolution=0.1);
 
         /// \brief Return reference to downsampled, deskewed point cloud
         std::vector<Eigen::Vector3f, Eigen::aligned_allocator<Eigen::Vector3f>>& deskewedDownsampledPointCloud(){
@@ -70,9 +92,11 @@ namespace okvis{
         kinematics::Transformation T_WS_live_; ///< Pose of the frame propagated to
         kinematics::Transformation T_SW_live_; ///< Inverse
         kinematics::Transformation T_SL_; ///< Extrinsics IMU (S) <-> Lidar (L)
-        LidarMeasurementDeque lidarScan_;
+        std::shared_ptr<const LidarMeasurementDeque> ownedLidarScan_;
+        std::shared_ptr<const ImuMeasurementDeque> ownedImuMeasurements_;
+        const LidarMeasurementDeque* lidarScan_;
         Point3Cloud<float> lidarScanPostProcessed_;
-        ImuMeasurementDeque imuMeasurementDeque_;
+        const ImuMeasurementDeque* imuMeasurementDeque_;
 
     };
 }

@@ -217,14 +217,19 @@ void runDelayedInput(const std::filesystem::path& directory) {
     std::this_thread::sleep_for(std::chrono::milliseconds(1));
   check(processedStates.load() == 2, "Input worker did not consume both pose updates");
   // No additional state updates arrive. The delayed cloud must bootstrap the
-  // first map from trajectory history and drain more than one 8192-ray batch.
+  // first map from trajectory history and drain many bounded read-cache batches.
   constexpr size_t numberOfRays = 10000;
+  okvis::LidarMeasurementBatch delayed;
+  delayed.reserve(numberOfRays);
   for (size_t i = 0; i < numberOfRays; ++i) {
-    const Eigen::Vector3d ray(0.1 + 0.02 * double(i % 100),
-                              0.1 + 0.02 * double(i / 100), 2.2);
-    check(mapping.addLidarMeasurement(okvis::Time(1, 500000000), ray),
-          "Delayed input silently rejected a pose-supported ray");
+    okvis::LidarMeasurement measurement;
+    measurement.timeStamp = okvis::Time(1, 500000000);
+    measurement.measurement.rayMeasurement = Eigen::Vector3d(
+        0.1 + 0.02 * double(i % 100), 0.1 + 0.02 * double(i / 100), 2.2);
+    measurement.measurement.intensity = 0;
+    delayed.push_back(measurement);
   }
+  check(mapping.addLidarMeasurements(delayed), "Delayed LiDAR batch was rejected");
   const Eigen::Vector3d futureRay(9, 0, 2);
   check(mapping.addLidarMeasurement(okvis::Time(3, 0), futureRay), "Future raw ray was rejected");
   { std::lock_guard lock(inputMutex); releaseInput = true; }
@@ -257,6 +262,87 @@ void runDelayedInput(const std::filesystem::path& directory) {
       && (Eigen::Vector3d(xyz[0], xyz[1], xyz[2]) - futureRay).norm() == 0.0,
       "The unposed final ray was not preserved in the input archive");
 }
+
+void runExpiredInput(const std::filesystem::path& directory) {
+  okvis::ViParameters parameters{};
+  parameters.lidar.emplace();
+  parameters.lidar->T_SL = okvis::kinematics::Transformation::Identity();
+  parameters.lidar->elevation_resolution_angle = 1.0f;
+  parameters.lidar->azimuth_resolution_angle = 1.0f;
+  se::SubMapConfig config;
+  config.memoryBounded = true;
+  config.memoryArchiveDirectory = (directory / "expired").string();
+  config.lidarSpoolEnabled = false;
+  config.useMap2LiveFactors = true;
+  config.useMap2MapFactors = false;
+  config.lidarQueueMaxPoints = 256;
+  config.sensorMeasurementDownsampling = 1;
+  config.voxelGridResolution = 0.01f;
+  config.pointCloudMapVoxelSize = 0.01;
+  config.near_plane = 0.1f;
+  config.far_plane = 20.0f;
+  okvis::SupereightMapType::Config mapConfig;
+  okvis::SupereightMapType::DataConfigType dataConfig;
+  okvis::SubmappingInterface mapping(mapConfig, dataConfig, config, parameters);
+  mapping.setT_BS(okvis::kinematics::Transformation::Identity());
+  // Populate and actually prune the rolling IMU window before pose updates are
+  // consumed. The interval beginning at state t=1 is now permanently expired.
+  for (uint32_t tick = 10; tick <= 110; ++tick) {
+    mapping.realtimePredict(okvis::Time(tick / 10, (tick % 10) * 100000000),
+                            Eigen::Vector3d(0, 0, 9.81), Eigen::Vector3d::Zero());
+  }
+  const uint32_t times[] = {1, 2, 10, 11};
+  for (uint64_t index = 0; index < 4; ++index) {
+    okvis::State state{};
+    state.id = okvis::StateId(index + 1);
+    state.timestamp = okvis::Time(times[index], 0);
+    state.T_WS = okvis::kinematics::Transformation::Identity();
+    state.T_GW = okvis::kinematics::Transformation::Identity();
+    state.v_W.setZero();
+    state.b_g.setZero();
+    state.b_a.setZero();
+    state.omega_S.setZero();
+    state.isKeyframe = true;
+    state.stateChanged = true;
+    okvis::TrackingState tracking{};
+    tracking.id = state.id;
+    tracking.currentKeyframeId = state.id;
+    tracking.isKeyframe = true;
+    tracking.trackingQuality = okvis::TrackingQuality::Good;
+    auto states = std::make_shared<okvis::AlignedMap<okvis::StateId, okvis::State>>();
+    states->emplace(state.id, state);
+    check(mapping.stateUpdateCallback(state, tracking, states), "Expired-input state update was rejected");
+  }
+  okvis::LidarMeasurementBatch input;
+  for (size_t i = 0; i < 128; ++i) {
+    okvis::LidarMeasurement measurement;
+    measurement.timeStamp = okvis::Time(1, 500000000);
+    measurement.measurement.rayMeasurement = Eigen::Vector3d(8, 0, 2);
+    measurement.measurement.intensity = 0;
+    input.push_back(measurement);
+  }
+  okvis::LidarMeasurement current;
+  current.timeStamp = okvis::Time(10, 0); // exact estimated state needs no old IMU samples
+  current.measurement.rayMeasurement = Eigen::Vector3d(1, 0, 2);
+  current.measurement.intensity = 0;
+  input.push_back(current);
+  current.timeStamp = okvis::Time(12, 0); // future input must remain unposed
+  current.measurement.rayMeasurement = Eigen::Vector3d(9, 0, 2);
+  input.push_back(current);
+  check(mapping.addLidarMeasurements(input), "Expired/current/future input batch was rejected");
+  mapping.start();
+  bool finished = false;
+  const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+  while (std::chrono::steady_clock::now() < deadline) {
+    if (mapping.finishedIntegrating()) { finished = true; break; }
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+  check(finished, "Expired IMU prefix blocked current LiDAR input or final shutdown");
+  mapping.setFinished();
+  const auto cloud = mapping.lidarPointCloudMap();
+  check(cloud.size() == 1 && (cloud.front() - Eigen::Vector3f(1, 0, 2)).norm() < 1e-5f,
+        "Expired/future input was inserted, or the supported current point was lost");
+}
 } // namespace
 
 int main() {
@@ -266,6 +352,7 @@ int main() {
     std::filesystem::create_directory(directory);
     run(directory);
     runDelayedInput(directory);
+    runExpiredInput(directory);
     std::filesystem::remove_all(directory);
     std::cout << "Plane cache eviction, cold revisit matching and final history flush checks passed\n";
     return 0;
