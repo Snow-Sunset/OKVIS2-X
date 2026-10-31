@@ -41,9 +41,17 @@ void logImageTransform(cv::Mat& frame) {
 }
 
 void Trajectory::pruneImuMeasurements(const Time& newest) {
+  bool pruned = false;
   while (!imuMeasurements_.empty()
       && newest - imuMeasurements_.front().timeStamp > Duration(5.0)) {
     imuMeasurements_.pop_front();
+    pruned = true;
+  }
+  if (pruned || imuHistoryStart_) {
+    // A late sample before this boundary is immediately pruned again. Merely
+    // seeing a newer front sample does not prove an earlier gap is permanent.
+    const Time boundary = newest - Duration(5.0);
+    if (!imuHistoryStart_ || *imuHistoryStart_ < boundary) imuHistoryStart_ = boundary;
   }
 }
 
@@ -256,7 +264,7 @@ bool Trajectory::getState(const Time & timestamp, State& state) {
         // A non-empty rolling stream means IMU is enabled but the requested
         // interval has already expired or contains a gap. Do not silently
         // deskew old sensor data with a constant-velocity approximation.
-        if (!imuMeasurements_.empty()) return false;
+        if (!imuMeasurements_.empty() || imuHistoryStart_) return false;
         ConstantVelocityPropagator propagator(state0, state1);
         if (!propagator.getState(timestamp,
                             T_WS_1, speedAndBias_1, state.omega_S)) return false;
@@ -294,64 +302,181 @@ bool Trajectory::getState(const Time & timestamp, State& state) {
   return true;
 }
 
-bool Trajectory::getStatePoses(const std::vector<Time>& timestamps,
+Trajectory::PoseLookupResult Trajectory::getStatePosePrefix(
+    const std::vector<Time>& timestamps,
     std::vector<Eigen::Matrix4d, Eigen::aligned_allocator<Eigen::Matrix4d>>& statePoses) {
-  if (timestamps.empty()) return false;
-  std::vector<Eigen::Matrix4d, Eigen::aligned_allocator<Eigen::Matrix4d>> poses;
-  poses.reserve(timestamps.size());
-  const auto upper = statesByTimestampNs_.lower_bound(timestamps.front().toNSec());
-  // Batched IMU integration has one fixed start state and monotonic cursor. It
-  // is valid only inside one open state interval. Boundaries, multiple intervals
-  // and unsorted requests use ordinary timestamp queries, preserving duplicates.
-  const bool oneOpenInterval = upper != statesByTimestampNs_.end()
-      && upper != statesByTimestampNs_.begin()
-      && timestamps.front().toNSec() < upper->first
-      && timestamps.back().toNSec() < upper->first
-      && std::is_sorted(timestamps.begin(), timestamps.end());
-  if (!oneOpenInterval) {
-    for (const auto& timestamp : timestamps) {
-      State state;
-      if (!getState(timestamp, state)) return false;
-      poses.push_back(state.T_WS.T());
+  statePoses.clear();
+  statePoses.reserve(timestamps.size());
+
+  const auto failureStatus = [&](const Time& timestamp) {
+    const auto upper = statesByTimestampNs_.lower_bound(timestamp.toNSec());
+    if (upper == statesByTimestampNs_.end()) return PoseLookupStatus::WaitingForState;
+    if (upper->first == timestamp.toNSec() || upper == statesByTimestampNs_.begin())
+      return PoseLookupStatus::Invalid;
+    State start;
+    if (!getState(std::prev(upper)->second, start)) return PoseLookupStatus::Invalid;
+    if (imuHistoryStart_ && start.timestamp < *imuHistoryStart_
+        && (imuMeasurements_.empty() || imuMeasurements_.front().timeStamp > start.timestamp))
+      return PoseLookupStatus::ExpiredImu;
+    if (!imuMeasurements_.empty()) {
+      if (imuMeasurements_.front().timeStamp > start.timestamp) {
+        return PoseLookupStatus::WaitingForImu;
+      }
+      if (imuMeasurements_.size() < 2 || imuMeasurements_.back().timeStamp < timestamp)
+        return PoseLookupStatus::WaitingForImu;
     }
-  } else {
+    return imuHistoryStart_ && imuMeasurements_.empty()
+        ? PoseLookupStatus::WaitingForImu : PoseLookupStatus::Invalid;
+  };
+
+  const auto finish = [&](PoseLookupStatus status) {
+    PoseLookupResult result{statePoses.size(), status, 0};
+    if (status != PoseLookupStatus::ExpiredImu || !imuHistoryStart_) return result;
+    // Count a whole expired run so a FIFO consumer can discard it in one pop.
+    // Never skip a state boundary or a timestamp that still has cached IMU
+    // propagation: both remain queryable without the rolling IMU samples.
+    size_t i = result.supportedCount;
+    while (i < timestamps.size()) {
+      const auto upper = statesByTimestampNs_.lower_bound(timestamps[i].toNSec());
+      if (upper == statesByTimestampNs_.end() || upper == statesByTimestampNs_.begin()
+          || upper->first == timestamps[i].toNSec()) break;
+      const auto lower = std::prev(upper);
+      State start;
+      if (!getState(lower->second, start) || start.timestamp >= *imuHistoryStart_
+          || (!imuMeasurements_.empty() && start.timestamp >= imuMeasurements_.front().timeStamp)) break;
+      const auto cached = propagatorsByKeyframeIdAndEndTimeNs_.find(lower->second);
+      do {
+        const uint64_t timeNs = timestamps[i].toNSec();
+        if (timeNs <= lower->first || timeNs >= upper->first) break;
+        if (cached != propagatorsByKeyframeIdAndEndTimeNs_.end()
+            && cached->second.count(timeNs)) return result;
+        // A cloud can contain thousands of copies of the same timestamp.
+        do {
+          ++result.expiredCount;
+          ++i;
+        } while (i < timestamps.size() && timestamps[i].toNSec() == timeNs);
+      } while (i < timestamps.size());
+    }
+    return result;
+  };
+
+  Time previous;
+  Eigen::Matrix4d previousPose;
+  bool havePrevious = false;
+  const auto appendPose = [&](const Time& timestamp, const Eigen::Matrix4d& pose) {
+    if (!pose.allFinite()) return false;
+    statePoses.push_back(pose);
+    previous = timestamp;
+    previousPose = pose;
+    havePrevious = true;
+    return true;
+  };
+
+  if (!std::is_sorted(timestamps.begin(), timestamps.end())) {
+    // Preserve the legacy arbitrary-order API without giving a non-monotonic
+    // sequence to the forward-only batched IMU cursor.
+    for (const auto& timestamp : timestamps) {
+      if (havePrevious && timestamp == previous) {
+        statePoses.push_back(previousPose);
+        continue;
+      }
+      State state;
+      if (!getState(timestamp, state)) return finish(failureStatus(timestamp));
+      if (!appendPose(timestamp, state.T_WS.T())) return finish(PoseLookupStatus::Invalid);
+    }
+    return finish(PoseLookupStatus::Complete);
+  }
+
+  auto upper = timestamps.empty() ? statesByTimestampNs_.end()
+      : statesByTimestampNs_.lower_bound(timestamps.front().toNSec());
+  size_t i = 0;
+  while (i < timestamps.size()) {
+    const auto& timestamp = timestamps[i];
+    if (havePrevious && timestamp == previous) {
+      statePoses.push_back(previousPose);
+      ++i;
+      continue;
+    }
+    while (upper != statesByTimestampNs_.end() && upper->first < timestamp.toNSec()) ++upper;
+    if (upper == statesByTimestampNs_.end()) return finish(PoseLookupStatus::WaitingForState);
+    if (upper->first == timestamp.toNSec()) {
+      State state;
+      if (!getState(upper->second, state) || !appendPose(timestamp, state.T_WS.T()))
+        return finish(PoseLookupStatus::Invalid);
+      ++i;
+      continue;
+    }
+    if (upper == statesByTimestampNs_.begin()) return finish(PoseLookupStatus::Invalid);
+
     State state0, state1;
-    if (!getState(std::prev(upper)->second, state0) || !getState(upper->second, state1)) return false;
-    const auto measurements = imuMeasurementsForInterval(state0.timestamp, timestamps.back());
+    if (!getState(std::prev(upper)->second, state0) || !getState(upper->second, state1))
+      return finish(PoseLookupStatus::Invalid);
+    size_t intervalEnd = i;
+    while (intervalEnd < timestamps.size() && timestamps[intervalEnd].toNSec() < upper->first)
+      ++intervalEnd;
+
     SpeedAndBias sb0, sb1;
     sb0.head<3>() = state0.v_W;
     sb0.segment<3>(3) = state0.b_g;
     sb0.tail<3>() = state0.b_a;
     kinematics::Transformation pose;
     Eigen::Vector3d omega;
-    Time previous;
-    bool first = true;
-    if (measurements.empty()) {
-      if (!imuMeasurements_.empty()) return false;
+    if (imuMeasurements_.empty() && !imuHistoryStart_) {
       ConstantVelocityPropagator propagator(state0, state1);
-      for (const auto& timestamp : timestamps) {
-        if (first || timestamp != previous) {
-          if (!propagator.getState(timestamp, pose, sb1, omega)) return false;
-          previous = timestamp;
-          first = false;
+      for (; i < intervalEnd; ++i) {
+        if (havePrevious && timestamps[i] == previous) {
+          statePoses.push_back(previousPose);
+          continue;
         }
-        poses.push_back(pose.T());
+        if (!propagator.getState(timestamps[i], pose, sb1, omega)
+            || !appendPose(timestamps[i], pose.T())) return finish(PoseLookupStatus::Invalid);
       }
-    } else {
-      if (measurements.size() < 2 || measurements.front().timeStamp > state0.timestamp
-          || measurements.back().timeStamp < timestamps.back()) return false;
-      BatchedLidarPropagator propagator(state0.timestamp, measurements);
-      for (const auto& timestamp : timestamps) {
-        if (first || timestamp != previous) {
-          if (!propagator.appendTo(measurements, state0.T_WS, sb0, timestamp)
-              || !propagator.getState(state0.T_WS, sb0, pose, sb1, omega)) return false;
-          previous = timestamp;
-          first = false;
-        }
-        poses.push_back(pose.T());
-      }
+      continue;
     }
+
+    if (imuMeasurements_.empty() || imuMeasurements_.size() < 2
+        || imuMeasurements_.front().timeStamp > state0.timestamp) {
+      // An old point can still have cached propagation after its IMU samples
+      // expire. Honor that cache before classifying the first unsupported point.
+      for (; i < intervalEnd; ++i) {
+        if (havePrevious && timestamps[i] == previous) {
+          statePoses.push_back(previousPose);
+          continue;
+        }
+        State state;
+        if (!getState(timestamps[i], state)) return finish(failureStatus(timestamps[i]));
+        if (!appendPose(timestamps[i], state.T_WS.T())) return finish(PoseLookupStatus::Invalid);
+      }
+      continue;
+    }
+
+    size_t supportedEnd = i;
+    while (supportedEnd < intervalEnd
+        && timestamps[supportedEnd] <= imuMeasurements_.back().timeStamp) ++supportedEnd;
+    if (supportedEnd == i) return finish(PoseLookupStatus::WaitingForImu);
+    const auto measurements = imuMeasurementsForInterval(state0.timestamp, timestamps[supportedEnd - 1]);
+    if (measurements.empty()) return finish(PoseLookupStatus::WaitingForImu);
+    BatchedLidarPropagator propagator(state0.timestamp, measurements);
+    for (; i < supportedEnd; ++i) {
+      if (havePrevious && timestamps[i] == previous) {
+        statePoses.push_back(previousPose);
+        continue;
+      }
+      if (!propagator.appendTo(measurements, state0.T_WS, sb0, timestamps[i])
+          || !propagator.getState(state0.T_WS, sb0, pose, sb1, omega)
+          || !appendPose(timestamps[i], pose.T())) return finish(PoseLookupStatus::Invalid);
+    }
+    if (supportedEnd < intervalEnd) return finish(PoseLookupStatus::WaitingForImu);
   }
+  return finish(PoseLookupStatus::Complete);
+}
+
+bool Trajectory::getStatePoses(const std::vector<Time>& timestamps,
+    std::vector<Eigen::Matrix4d, Eigen::aligned_allocator<Eigen::Matrix4d>>& statePoses) {
+  if (timestamps.empty()) return false;
+  std::vector<Eigen::Matrix4d, Eigen::aligned_allocator<Eigen::Matrix4d>> poses;
+  const auto result = getStatePosePrefix(timestamps, poses);
+  if (result.status != PoseLookupStatus::Complete || result.supportedCount != timestamps.size()) return false;
   // A failed query leaves the caller's output untouched; success always returns
   // exactly one pose per timestamp, including duplicates at the last state.
   if (statePoses.empty()) statePoses.swap(poses);
@@ -657,7 +782,12 @@ double Propagator::sinc(double x) {
 
 BatchedLidarPropagator::BatchedLidarPropagator(const okvis::Time &t_start,
                                                const okvis::ImuMeasurementDeque &imuMeasurements) :
-                                               Propagator(t_start), imu_iterator_(imuMeasurements.begin()) {}
+                                               Propagator(t_start), imuMeasurements_(&imuMeasurements),
+                                               imu_iterator_(imuMeasurements.begin()),
+                                               inputOrdered_(std::is_sorted(imuMeasurements.begin(), imuMeasurements.end(),
+                                                   [](const ImuMeasurement& a, const ImuMeasurement& b) {
+                                                     return a.timeStamp < b.timeStamp;
+                                                   })) {}
 
 
 bool BatchedLidarPropagator::appendTo(const ImuMeasurementDeque & imuMeasurements,
@@ -665,33 +795,31 @@ bool BatchedLidarPropagator::appendTo(const ImuMeasurementDeque & imuMeasurement
                           const SpeedAndBias & speedAndBiases,
                           const Time & t_end) {
 
+  // The cursor belongs to the immutable deque supplied at construction. Reject
+  // bad coverage and backward requests before touching it or the accumulated
+  // integrals. A query exactly at the starting state is handled by the caller.
+  if (&imuMeasurements != imuMeasurements_ || !inputOrdered_ || imuMeasurements.size() < 2
+      || imuMeasurements.front().timeStamp > t_end_
+      || imuMeasurements.back().timeStamp < t_end || t_end <= t_start_
+      || (lastRequested_ && t_end < *lastRequested_)) return false;
+
   // now the propagation
   okvis::Time time = t_end_; // re-start from previous end; in the beginning: t_start_.
   okvis::Time end = t_end;
-
-  // sanity check:
-  OKVIS_ASSERT_TRUE_DBG(std::runtime_error, imuMeasurements.front().timeStamp<=time,
-                        imuMeasurements.front().timeStamp << " !<= " << time);
-
-  if (!(imuMeasurements.back().timeStamp >= end))
-    return false;  // nothing to do...
 
   sb_ref_ = speedAndBiases; // remember linearisation point
 
   bool hasStarted = false;
   for (; imu_iterator_ != imuMeasurements.end(); ++imu_iterator_) {
+    const auto nextImu = std::next(imu_iterator_);
+    if (nextImu == imuMeasurements.end()) break;
     Eigen::Vector3d omega_S_0 = imu_iterator_->measurement.gyroscopes;
     Eigen::Vector3d acc_S_0 = imu_iterator_->measurement.accelerometers;
-    Eigen::Vector3d omega_S_1 = (imu_iterator_ + 1)->measurement.gyroscopes;
-    Eigen::Vector3d acc_S_1 = (imu_iterator_ + 1)->measurement.accelerometers;
+    Eigen::Vector3d omega_S_1 = nextImu->measurement.gyroscopes;
+    Eigen::Vector3d acc_S_1 = nextImu->measurement.accelerometers;
 
     // time delta
-    okvis::Time nexttime;
-    if ((imu_iterator_ + 1) == imuMeasurements.end()) {
-      nexttime = t_end;
-    } else {
-      nexttime = (imu_iterator_ + 1)->timeStamp;
-    }
+    okvis::Time nexttime = nextImu->timeStamp;
 
     double dt = (nexttime - time).toSec(); /// checking delta between next imu measurement and current propagator end timestamp
     if (end < nexttime) { /// if (query time < next IMU measurement)
@@ -751,7 +879,9 @@ bool BatchedLidarPropagator::appendTo(const ImuMeasurementDeque & imuMeasurement
       acc_integral_interp_ = acc_integral_1;
       cross_interp_ = cross_1;
       dv_db_g_interp_ = dv_db_g_1;
-      break;
+      Delta_t_ = (t_end - t_start_).toSec();
+      lastRequested_ = t_end;
+      return true;
     }
 
     /// Overwrite preintegration results using interpolated values
@@ -778,14 +908,15 @@ bool BatchedLidarPropagator::appendTo(const ImuMeasurementDeque & imuMeasurement
     t_end_ = nexttime;
   }
 
-  Delta_t_ = (t_end-t_start_).toSec();
-  return true;
+  return false;
 }
 
 bool BatchedLidarPropagator::getState(
         const kinematics::Transformation & T_WS_0, const SpeedAndBias & sb_0,
         kinematics::Transformation & T_WS_1, SpeedAndBias & sb_1,
         Eigen::Vector3d & omega_S) {
+
+  if (!lastRequested_) return false;
 
   // actual propagation output: TODO should get the 9.81 from parameters..
   const Eigen::Vector3d g_W = 9.81 * Eigen::Vector3d(0, 0, 6371009).normalized();

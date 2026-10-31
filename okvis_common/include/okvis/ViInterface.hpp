@@ -127,6 +127,7 @@ public:
 
   /// \brief Constructor.
   /// \param t_start Start time.
+  /// \param imuMeasurements Immutable input; it must outlive this propagator.
   BatchedLidarPropagator(const Time & t_start, const ImuMeasurementDeque & imuMeasurements);
 
   bool appendTo(
@@ -141,8 +142,11 @@ public:
 
 private:
 
+  const ImuMeasurementDeque* imuMeasurements_;
   ImuMeasurementDeque::const_iterator imu_iterator_;
-  bool hasStarted_ = false;
+  bool inputOrdered_;
+  /// t_end_ tracks the last complete IMU boundary, not the last query time.
+  std::optional<Time> lastRequested_;
 
   // Interpolated Updates
   // increments (initialise with identity)
@@ -239,6 +243,24 @@ private:
 class Trajectory {
  public:
   EIGEN_MAKE_ALIGNED_OPERATOR_NEW
+
+  /// Outcome at the first timestamp not included in a pose prefix.
+  enum class PoseLookupStatus {
+    Complete,
+    WaitingForState,
+    WaitingForImu,
+    ExpiredImu,
+    Invalid
+  };
+
+  struct PoseLookupResult {
+    size_t supportedCount = 0;
+    PoseLookupStatus status = PoseLookupStatus::Complete;
+    /// Consecutive, provably expired timestamps after the supported prefix.
+    /// Exact state timestamps and cached propagations are never included.
+    size_t expiredCount = 0;
+  };
+
   /// \name Setters
   /// \{
 
@@ -277,14 +299,18 @@ class Trajectory {
   /// \return True on success.
   bool getState(const Time & timestamp, State& state);
 
-  /// \brief Obtain the (extrapolated) state at a certain timestamp for a given batch of states.
-  ///        Ordered timestamps strictly inside one camera interval use batched
-  ///        propagation; boundaries, multiple intervals and unsorted requests
-  ///        fall back to individual timestamp queries without losing duplicates.
-  ///        Note that this may access non-keyframe states (relative pose computations)
-  ///        and may need to propagate to the precise timestamp. Therefore this is not a
-  ///        trivial operation. Returns false, if no states/IMU measurements available for
-  ///        the desired timestamp.
+  /// \brief Replace statePoses with the valid continuous prefix of timestamps.
+  /// Sorted input is propagated in linear batches across camera intervals;
+  /// repeated timestamps reuse a pose and exact state boundaries use that state.
+  /// Unsorted input retains its order and uses individual timestamp queries.
+  /// ExpiredImu means the required starting state's IMU support has actually
+  /// passed the retention horizon, rather than merely not having arrived yet.
+  /// The caller must synchronize this query with trajectory/IMU updates.
+  PoseLookupResult getStatePosePrefix(const std::vector<Time>& timestamps,
+      std::vector<Eigen::Matrix4d, Eigen::aligned_allocator<Eigen::Matrix4d>>& statePoses);
+
+  /// \brief Obtain every requested pose, appending only on complete success.
+  /// A failed query leaves statePoses unchanged. Empty requests return false.
   /// @param[in] timestamps The requested timestamps.
   /// @param[out] statePoses The respective states' poses.
   /// \return True on success.
@@ -349,6 +375,9 @@ class Trajectory {
   /// \brief Propagate to the live state (if addImuMeasurement is called).
   std::unique_ptr<Propagator> livePropagator_;
   ImuMeasurementDeque imuMeasurements_; ///< Short rolling IMU window for propagation.
+  /// Strict lower time bound for IMU samples once pruning has occurred.
+  /// Missing samples at/after this boundary can still arrive out of order.
+  std::optional<Time> imuHistoryStart_;
   void mergeImuMeasurement(const ImuMeasurement& measurement);
   void mergeImuMeasurements(const ImuMeasurementDeque& measurements);
   void pruneImuMeasurements(const Time& newest);
@@ -441,6 +470,15 @@ class ViInterface
    */
   virtual bool addLidarMeasurement(const okvis::Time & stamp,
                                    const Eigen::Vector3d & rayMeasurement) = 0;
+  /// Submit a scan without forcing implementations to lock once per point.
+  virtual bool addLidarMeasurements(const LidarMeasurementBatch& measurements) {
+    bool accepted = true;
+    for (const auto& measurement : measurements) {
+      if (!addLidarMeasurement(measurement.timeStamp,
+                               measurement.measurement.rayMeasurement)) accepted = false;
+    }
+    return accepted;
+  }
   /// \}
   /// \name Setters
   /// \{

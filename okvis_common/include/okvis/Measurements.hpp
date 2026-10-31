@@ -31,6 +31,7 @@
 #pragma GCC diagnostic pop
 #pragma GCC diagnostic pop
 #include <map>
+#include <vector>
 #include <Eigen/Dense>
 #include <okvis/Time.hpp>
 #include <okvis/kinematics/Transformation.hpp>
@@ -161,6 +162,10 @@ typedef Measurement<LidarSensorReadings> LidarMeasurement;
 
 /// \brief Lidar measurement queue.
 typedef std::deque<LidarMeasurement, Eigen::aligned_allocator<LidarMeasurement> > LidarMeasurementDeque;
+
+/// A transport batch; individual point timestamps remain authoritative.
+using LidarMeasurementBatch = std::vector<LidarMeasurement,
+    Eigen::aligned_allocator<LidarMeasurement>>;
 
 /// \brief Camera measurement struct.
 typedef Measurement<CameraData> CameraMeasurement;
