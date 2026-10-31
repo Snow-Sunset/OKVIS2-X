@@ -608,6 +608,9 @@ if(BUILD_ROS2)
     target_link_libraries(okvis_lidar_map_publisher_test PRIVATE okvis::Ros2)
     add_test(NAME okvis_lidar_map_publisher COMMAND okvis_lidar_map_publisher_test)
     set_tests_properties(okvis_lidar_map_publisher PROPERTIES TIMEOUT 15 ENVIRONMENT "ROS_DOMAIN_ID=191")
+    add_executable(okvis_lidar_input_test okvis_ros2/test/TestLidarInput.cpp)
+    target_link_libraries(okvis_lidar_input_test PRIVATE okvis::Ros2)
+    add_test(NAME okvis_lidar_input COMMAND okvis_lidar_input_test)
   endif()
 
   # OKVIS2X nodes - Wo/ Deep Learning

@@ -18,14 +18,18 @@
  * @author Simon Boche
  */
 
+#include <atomic>
+#include <exception>
 #include <functional>
 #include <iostream>
 #include <fstream>
 #include <stdlib.h>
 #include <iostream>
 #include <signal.h>
+#include <thread>
 
 #include <glog/logging.h>
+#include <rclcpp/executors/single_threaded_executor.hpp>
 
 #include <okvis/DatasetWriter.hpp>
 #include <okvis/ViParametersReader.hpp>
@@ -266,6 +270,22 @@ int main(int argc, char **argv) {
     }
   #endif
 
+  rclcpp::executors::SingleThreadedExecutor executor;
+  std::thread executorThread;
+  std::exception_ptr executorException;
+  const bool useAsynchronousSensorExecutor =
+      parameters.lidar && parameters.output.enable_submapping;
+  const auto stopExecutor = [&]() {
+    if (!executorThread.joinable()) return;
+    executor.cancel();
+    executorThread.join();
+  };
+  const auto stopPublishers = [&]() {
+    threadedOdometryPublisher->shutdown();
+    threadedImagePublisher->shutdown();
+    threadedPublisher->shutdown();
+  };
+
   try {
 
     // output publishing
@@ -346,18 +366,33 @@ int main(int argc, char **argv) {
     threadedImagePublisher->startThread();
     threadedPublisher->startThread();
 
+    // Sensor callbacks must remain responsive while processFrame() is busy.
+    // LiDAR decoding is further isolated by Subscriber's dedicated worker.
+    if (useAsynchronousSensorExecutor) {
+      executor.add_node(node);
+      executorThread = std::thread([&]() {
+        try {
+          executor.spin();
+        } catch (...) {
+          executorException = std::current_exception();
+          shtdown.store(true, std::memory_order_relaxed);
+        }
+      });
+    }
+
     // Main loop
-    while (true) {
-      rclcpp::spin_some(node);
+    while (!shtdown.load(std::memory_order_relaxed) && rclcpp::ok()) {
+      if (!useAsynchronousSensorExecutor) rclcpp::spin_some(node);
       const bool processed = estimator.processFrame();
       if (!processed) std::this_thread::sleep_for(std::chrono::milliseconds(1));
       std::map<std::string, cv::Mat> images;
       estimator.display(images);
       publisher.publishImages(images);
-      if(shtdown) {
-        break;
-      }
     }
+
+    // No callback may race Subscriber shutdown or the final estimator drain.
+    stopExecutor();
+    if (executorException) std::rethrow_exception(executorException);
 
     #ifdef SRL_NAV_USE_REALSENSE
       // Stop the pipeline
@@ -409,9 +444,28 @@ int main(int argc, char **argv) {
 
   catch (const std::exception& e)
   {
+    stopExecutor();
+    #ifndef SRL_NAV_USE_REALSENSE
+      if (subscriber) subscriber->shutdown();
+    #endif
     std::cerr << e.what() << std::endl;
+    stopPublishers();
+    rclcpp::shutdown();
+    return EXIT_FAILURE;
+  }
+  catch (...)
+  {
+    stopExecutor();
+    #ifndef SRL_NAV_USE_REALSENSE
+      if (subscriber) subscriber->shutdown();
+    #endif
+    stopPublishers();
+    rclcpp::shutdown();
+    std::cerr << "Unknown exception" << std::endl;
     return EXIT_FAILURE;
   }
 
+  stopPublishers();
+  rclcpp::shutdown();
   return EXIT_SUCCESS;
 }

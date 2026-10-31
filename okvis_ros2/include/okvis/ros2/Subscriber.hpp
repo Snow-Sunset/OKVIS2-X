@@ -20,10 +20,16 @@
 #ifndef INCLUDE_OKVIS_SUBSCRIBER_HPP_
 #define INCLUDE_OKVIS_SUBSCRIBER_HPP_
 
+#include <atomic>
+#include <condition_variable>
+#include <deque>
 #include <memory>
 #include <mutex>
+#include <thread>
 
 #include <boost/shared_ptr.hpp>
+#include <chrono>
+#include <optional>
 #include <rclcpp/rclcpp.hpp>
 #include <image_transport/image_transport.hpp>
 #if __has_include(<cv_bridge/cv_bridge.hpp>) // requires GCC >= 5
@@ -33,6 +39,7 @@
 #endif
 #include <sensor_msgs/msg/image.hpp>
 #include <sensor_msgs/msg/imu.hpp>
+#include <sensor_msgs/msg/point_cloud2.hpp>
 #include <std_msgs/msg/bool.hpp>
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Woverloaded-virtual"
@@ -85,7 +92,9 @@ class Subscriber
   /// @brief Set the node handle. This sets up the callbacks. This is called in the constructor.
   void setNodeHandle(std::shared_ptr<rclcpp::Node> node, bool isDepthCamera = false, bool isLiDAR = false);
     
-  /// @brief stop callbacks.
+  /// @brief Stop subscriptions and join the LiDAR worker.
+  /// The owning ROS executor must be stopped first so no image/IMU callback is
+  /// still using the interfaces while this object is being torn down.
   void shutdown();
 
  protected:
@@ -106,7 +115,10 @@ class Subscriber
 
   /// @brief The lidar sensor callback
   /// @param msg the lidar sensor ROS message
-  void lidarCallback(const sensor_msgs::msg::PointCloud2& msg);
+  void lidarCallback(sensor_msgs::msg::PointCloud2::ConstSharedPtr msg);
+
+  /// @brief Decode and submit queued LiDAR scans outside the ROS executor.
+  void lidarWorkerLoop();
 
   /// @brief function that performs the synchronization of the different ir and depth images for the slam system
   void synchronizeData();
@@ -138,6 +150,24 @@ class Subscriber
   std::vector<std::map<uint64_t, cv::Mat>> imagesReceived_; ///< Images obtained&buffered (to sync).
   std::vector<std::map<uint64_t, cv::Mat>> depthImagesReceived_; ///> The depth images obtained and buffered (to sync)
   bool syncDepthImages_ = false;
+  std::string lidarPointTimeReference_ = "scan_start";
+  std::deque<sensor_msgs::msg::PointCloud2::ConstSharedPtr> lidarScanQueue_;
+  std::mutex lidarScanMutex_;
+  std::condition_variable lidarScanCv_;
+  std::thread lidarWorker_;
+  size_t lidarWorkerQueueDepth_ = 3;
+  bool lidarWorkerStop_ = false; ///< Guarded by lidarScanMutex_.
+  std::atomic_bool shutdownRequested_{false};
+  std::atomic<uint64_t> lidarScansReceived_{0};
+  std::atomic<uint64_t> lidarScansProcessed_{0};
+  std::atomic<uint64_t> lidarScansDropped_{0};
+  std::atomic<uint64_t> lidarPointsReceived_{0};
+  std::atomic<uint64_t> lidarInvalidPoints_{0};
+  std::atomic<uint64_t> lidarRegressingPoints_{0};
+  std::atomic<uint64_t> lidarEstimatorRejectedBatches_{0};
+  std::atomic<uint64_t> lidarSubmappingRejectedBatches_{0};
+  double lidarCallbackMaxMs_ = 0.0;
+  std::chrono::steady_clock::time_point lidarLastReport_ = std::chrono::steady_clock::now();
 };
 }
 

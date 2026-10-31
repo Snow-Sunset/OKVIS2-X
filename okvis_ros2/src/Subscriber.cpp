@@ -16,11 +16,14 @@
  * @author Stefan Leutenegger
  * @author Andreas Forster
  */
- 
+
+#include <algorithm>
+#include <iterator>
+#include <stdexcept>
+
 #include <glog/logging.h>
 #include <okvis/ros2/Subscriber.hpp>
 #include <okvis/ros2/PointCloudUtilities.hpp>
-#include <pcl_conversions/pcl_conversions.h>
 
 #ifdef OKVIS_USE_NN
 #include <okvis/Processor.hpp>
@@ -33,6 +36,7 @@ namespace okvis {
 
 Subscriber::~Subscriber()
 {
+  shutdown();
   if (imgTransport_ != nullptr)
     imgTransport_.reset();
 }
@@ -92,18 +96,50 @@ void Subscriber::setNodeHandle(std::shared_ptr<rclcpp::Node> node,
   }
 
   if(isLiDAR){
+    if (!node_->has_parameter("lidar_ouster_time_reference"))
+      node_->declare_parameter<std::string>("lidar_ouster_time_reference", "scan_start");
+    lidarPointTimeReference_ = node_->get_parameter("lidar_ouster_time_reference").as_string();
+    if (lidarPointTimeReference_ != "scan_start" && lidarPointTimeReference_ != "scan_end"
+        && lidarPointTimeReference_ != "header")
+      throw std::invalid_argument("lidar_ouster_time_reference must be scan_start, scan_end or header");
+    if (!node_->has_parameter("lidar_subscription_queue_depth"))
+      node_->declare_parameter<int64_t>("lidar_subscription_queue_depth", 3);
+    const auto queueDepth = node_->get_parameter("lidar_subscription_queue_depth").as_int();
+    if (queueDepth <= 0) throw std::invalid_argument("LiDAR subscription queue depth must be positive");
+    if (!node_->has_parameter("lidar_worker_queue_depth"))
+      node_->declare_parameter<int64_t>("lidar_worker_queue_depth", 3);
+    const auto workerQueueDepth = node_->get_parameter("lidar_worker_queue_depth").as_int();
+    if (workerQueueDepth <= 0) throw std::invalid_argument("LiDAR worker queue depth must be positive");
+    lidarWorkerQueueDepth_ = size_t(workerQueueDepth);
+    auto lidarQos = rclcpp::SensorDataQoS();
+    lidarQos.keep_last(size_t(queueDepth));
     subLiDAR_ = node_->create_subscription<sensor_msgs::msg::PointCloud2>(
-      "/okvis/lidar", 100000,
+      "/okvis/lidar", lidarQos,
       std::bind(&Subscriber::lidarCallback, this, std::placeholders::_1));
+    lidarWorker_ = std::thread(&Subscriber::lidarWorkerLoop, this);
+    LOG(INFO) << "LiDAR asynchronous batch input: DDS depth " << queueDepth
+              << " scans, worker depth " << workerQueueDepth
+              << " scans; Ouster UINT32 t in ns, header reference " << lidarPointTimeReference_;
   }
 }
 
 void Subscriber::shutdown() {
+  if (shutdownRequested_.exchange(true)) return;
+
   // stop callbacks
   for (size_t i = 0; i < parameters_.nCameraSystem.numCameras(); ++i) {
     imageSubscribers_[i].shutdown();
+    depthImageSubscribers_[i].shutdown();
   }
   subImu_.reset();
+  subLiDAR_.reset();
+
+  {
+    std::lock_guard<std::mutex> lock(lidarScanMutex_);
+    lidarWorkerStop_ = true;
+  }
+  lidarScanCv_.notify_all();
+  if (lidarWorker_.joinable()) lidarWorker_.join();
 }
 
 void Subscriber::imageCallback(const sensor_msgs::msg::Image::ConstSharedPtr& msg,
@@ -187,42 +223,141 @@ void Subscriber::depthCallback(const sensor_msgs::msg::Image::ConstSharedPtr& ms
   synchronizeData();
 }
 
-void Subscriber::lidarCallback(const sensor_msgs::msg::PointCloud2& msg){
+void Subscriber::lidarCallback(sensor_msgs::msg::PointCloud2::ConstSharedPtr msg){
+  const auto begin = std::chrono::steady_clock::now();
+  lidarScansReceived_.fetch_add(1, std::memory_order_relaxed);
+  lidarPointsReceived_.fetch_add(uint64_t(msg->width) * msg->height,
+                                std::memory_order_relaxed);
 
-  // Check which type of LiDAR Point Cloud it is
-  bool is_blk = (okvis::pointcloud_ros::has_field(msg, "stamp_high") && okvis::pointcloud_ros::has_field(msg, "stamp_low"));
-  bool is_hesai = okvis::pointcloud_ros::has_field(msg, "timestamp");
-
-  if(!(is_blk || is_hesai)){ // Default; use header timestamp
-    Eigen::Vector3d ray;
-    okvis::Time t(msg.header.stamp.sec, msg.header.stamp.nanosec);
-
-    pcl::PCLPointCloud2 pcl_pc2;
-    pcl_conversions::toPCL(msg, pcl_pc2);
-    pcl::PointCloud<pcl::PointXYZ>::Ptr temp_cloud(new pcl::PointCloud<pcl::PointXYZ>);
-    pcl::fromPCLPointCloud2(pcl_pc2,*temp_cloud);
-    pcl::PointCloud<pcl::PointXYZ>::iterator it = temp_cloud->begin();
-
-    for (/*it*/; it != temp_cloud->end(); it++){
-      ray << it->x, it->y, it->z;
-      if(!seInterface_->addLidarMeasurement(t, ray)) LOG(WARNING) << "Dropped last lidar measurement from SubmappingInterface.";
-      viInterface_->addLidarMeasurement(t, ray);
+  size_t pending = 0;
+  {
+    std::lock_guard<std::mutex> lock(lidarScanMutex_);
+    if (lidarWorkerStop_) return;
+    if (lidarScanQueue_.size() >= lidarWorkerQueueDepth_) {
+      lidarScanQueue_.pop_front();
+      lidarScansDropped_.fetch_add(1, std::memory_order_relaxed);
     }
+    lidarScanQueue_.push_back(std::move(msg));
+    pending = lidarScanQueue_.size();
   }
-  else{
-    std::vector<okvis::Time, Eigen::aligned_allocator<okvis::Time>> timestamps;
-    std::vector<Eigen::Vector3d, Eigen::aligned_allocator<Eigen::Vector3d>> rays;
+  lidarScanCv_.notify_one();
 
-    if(is_hesai){
-      okvis::pointcloud_ros::hesai_lidar2points(msg, timestamps, rays);
-    }
-    else if(is_blk){
-      okvis::pointcloud_ros::blk_lidar2points(msg, timestamps, rays);
+  const auto now = std::chrono::steady_clock::now();
+  lidarCallbackMaxMs_ = std::max(lidarCallbackMaxMs_,
+      std::chrono::duration<double, std::milli>(now - begin).count());
+  if (now - lidarLastReport_ >= std::chrono::seconds(1)) {
+    LOG(INFO) << "LiDAR callback totals: received "
+              << lidarScansReceived_.load(std::memory_order_relaxed)
+              << ", processed " << lidarScansProcessed_.load(std::memory_order_relaxed)
+              << ", dropped scans " << lidarScansDropped_.load(std::memory_order_relaxed)
+              << ", pending " << pending << "; callback max "
+              << lidarCallbackMaxMs_ << " ms in reporting interval";
+    lidarCallbackMaxMs_ = 0.0;
+    lidarLastReport_ = now;
+  }
+}
+
+void Subscriber::lidarWorkerLoop() {
+  LidarMeasurementBatch lidarBatch;
+  std::optional<Time> lastLidarPointTime;
+  auto lastReport = std::chrono::steady_clock::now();
+  double decodeMaxMs = 0.0;
+
+  while (true) {
+    sensor_msgs::msg::PointCloud2::ConstSharedPtr msg;
+    {
+      std::unique_lock<std::mutex> lock(lidarScanMutex_);
+      lidarScanCv_.wait(lock, [&] { return lidarWorkerStop_ || !lidarScanQueue_.empty(); });
+      if (lidarScanQueue_.empty()) {
+        if (lidarWorkerStop_) break;
+        continue;
+      }
+      msg = std::move(lidarScanQueue_.front());
+      lidarScanQueue_.pop_front();
     }
 
-    for(size_t i = 0; i < timestamps.size(); i++){
-      if(!seInterface_->addLidarMeasurement(timestamps[i], rays[i])) LOG(WARNING) << "Dropped last lidar measurement from SubmappingInterface.";
-      viInterface_->addLidarMeasurement(timestamps[i], rays[i]);
+    try {
+      const auto begin = std::chrono::steady_clock::now();
+      auto reference = pointcloud_ros::OusterTimeReference::ScanStart;
+      if (lidarPointTimeReference_ == "scan_end") reference = pointcloud_ros::OusterTimeReference::ScanEnd;
+      if (lidarPointTimeReference_ == "header") reference = pointcloud_ros::OusterTimeReference::Header;
+      lidarInvalidPoints_.fetch_add(pointcloud_ros::lidar2batch(*msg, lidarBatch, reference),
+                                    std::memory_order_relaxed);
+
+      // Both consumers require a monotonic FIFO. Account for overlapping/replayed
+      // timestamps explicitly instead of hiding an older point behind a newer one.
+      if (lastLidarPointTime) {
+        const auto first = std::lower_bound(lidarBatch.begin(), lidarBatch.end(), *lastLidarPointTime,
+            [](const LidarMeasurement& measurement, const Time& time) {
+              return measurement.timeStamp < time;
+            });
+        const auto count = size_t(std::distance(lidarBatch.begin(), first));
+        lidarRegressingPoints_.fetch_add(count, std::memory_order_relaxed);
+        if (count) {
+          LOG_EVERY_N(WARNING, 40) << "Discarded " << count
+                                 << " LiDAR points with timestamps preceding the previous scan tail";
+          lidarBatch.erase(lidarBatch.begin(), first);
+        }
+      }
+      if (!lidarBatch.empty()) {
+        const Time scanTail = lidarBatch.back().timeStamp;
+        // A decoded scan is never retried. Advance the input watermark before
+        // submitting so an exception in one consumer cannot make the other
+        // consumer receive an overlapping prefix again on the next scan.
+        lastLidarPointTime = scanTail;
+
+        if (seInterface_) {
+          try {
+            if (!seInterface_->addLidarMeasurements(lidarBatch))
+              lidarSubmappingRejectedBatches_.fetch_add(1, std::memory_order_relaxed);
+          } catch (const std::exception& error) {
+            lidarSubmappingRejectedBatches_.fetch_add(1, std::memory_order_relaxed);
+            LOG(ERROR) << "Submapping rejected LiDAR scan with exception: " << error.what();
+          } catch (...) {
+            lidarSubmappingRejectedBatches_.fetch_add(1, std::memory_order_relaxed);
+            LOG(ERROR) << "Submapping rejected LiDAR scan with unknown exception";
+          }
+        }
+        try {
+          if (!viInterface_->addLidarMeasurements(lidarBatch))
+            lidarEstimatorRejectedBatches_.fetch_add(1, std::memory_order_relaxed);
+        } catch (const std::exception& error) {
+          lidarEstimatorRejectedBatches_.fetch_add(1, std::memory_order_relaxed);
+          LOG(ERROR) << "Estimator rejected LiDAR scan with exception: " << error.what();
+        } catch (...) {
+          lidarEstimatorRejectedBatches_.fetch_add(1, std::memory_order_relaxed);
+          LOG(ERROR) << "Estimator rejected LiDAR scan with unknown exception";
+        }
+      }
+      lidarScansProcessed_.fetch_add(1, std::memory_order_relaxed);
+
+      const auto now = std::chrono::steady_clock::now();
+      decodeMaxMs = std::max(decodeMaxMs,
+          std::chrono::duration<double, std::milli>(now - begin).count());
+      if (now - lastReport >= std::chrono::seconds(1)) {
+        size_t pending = 0;
+        {
+          std::lock_guard<std::mutex> lock(lidarScanMutex_);
+          pending = lidarScanQueue_.size();
+        }
+        LOG(INFO) << "LiDAR worker totals: scans "
+                  << lidarScansProcessed_.load(std::memory_order_relaxed)
+                  << ", points " << lidarPointsReceived_.load(std::memory_order_relaxed)
+                  << ", invalid " << lidarInvalidPoints_.load(std::memory_order_relaxed)
+                  << ", time-regressing " << lidarRegressingPoints_.load(std::memory_order_relaxed)
+                  << ", estimator rejected batches "
+                  << lidarEstimatorRejectedBatches_.load(std::memory_order_relaxed)
+                  << ", submapping rejected batches "
+                  << lidarSubmappingRejectedBatches_.load(std::memory_order_relaxed)
+                  << ", pending " << pending << "; decode/submit max "
+                  << decodeMaxMs << " ms in reporting interval";
+        decodeMaxMs = 0.0;
+        lastReport = now;
+      }
+    } catch (const std::exception& error) {
+      LOG(ERROR) << "Failed to process LiDAR scan: " << error.what();
+    } catch (...) {
+      LOG(ERROR) << "Failed to process LiDAR scan with unknown exception";
     }
   }
 }
