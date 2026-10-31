@@ -18,7 +18,9 @@
  * @author Andreas Forster
  */
 
+#include <algorithm>
 #include <fstream>
+#include <iterator>
 #include <okvis/FrameTypedefs.hpp>
 #include <okvis/Measurements.hpp>
 #include <okvis/Parameters.hpp>
@@ -38,6 +40,57 @@ void logImageTransform(cv::Mat& frame) {
   frame = (-10.f / std::log(2)) * frame;
 }
 
+void Trajectory::pruneImuMeasurements(const Time& newest) {
+  while (!imuMeasurements_.empty()
+      && newest - imuMeasurements_.front().timeStamp > Duration(5.0)) {
+    imuMeasurements_.pop_front();
+  }
+}
+
+void Trajectory::mergeImuMeasurement(const ImuMeasurement& measurement) {
+  if (imuMeasurements_.empty() || imuMeasurements_.back().timeStamp < measurement.timeStamp) {
+    imuMeasurements_.push_back(measurement);
+    pruneImuMeasurements(measurement.timeStamp);
+    return;
+  }
+  auto it = std::lower_bound(imuMeasurements_.begin(), imuMeasurements_.end(),
+      measurement.timeStamp, [](const ImuMeasurement& candidate, const Time& timestamp) {
+        return candidate.timeStamp < timestamp;
+      });
+  while (it != imuMeasurements_.end() && it->timeStamp == measurement.timeStamp) {
+    if (it->sensorId == measurement.sensorId) {
+      *it = measurement;
+      return;
+    }
+    ++it;
+  }
+  imuMeasurements_.insert(it, measurement);
+  pruneImuMeasurements(imuMeasurements_.back().timeStamp);
+}
+
+void Trajectory::mergeImuMeasurements(const ImuMeasurementDeque& measurements) {
+  for (const auto& measurement : measurements) mergeImuMeasurement(measurement);
+}
+
+ImuMeasurementDeque Trajectory::imuMeasurementsForInterval(
+    const Time& start, const Time& end) const {
+  ImuMeasurementDeque result;
+  if (imuMeasurements_.empty() || end < start) return result;
+  auto firstAfterStart = std::upper_bound(imuMeasurements_.begin(), imuMeasurements_.end(), start,
+      [](const Time& timestamp, const ImuMeasurement& candidate) {
+        return timestamp < candidate.timeStamp;
+      });
+  if (firstAfterStart == imuMeasurements_.begin()) return result;
+  auto it = std::prev(firstAfterStart);
+  for (; it != imuMeasurements_.end(); ++it) {
+    result.push_back(*it);
+    if (it->timeStamp >= end) break;
+  }
+  if (result.size() < 2 || result.front().timeStamp > start || result.back().timeStamp < end)
+    result.clear();
+  return result;
+}
+
 void Trajectory::update(const TrackingState & trackingState,
                         std::shared_ptr<const AlignedMap<StateId,State> > updatedStates,
                         std::set<StateId>& affectedStateIds) {
@@ -46,12 +99,17 @@ void Trajectory::update(const TrackingState & trackingState,
   }
   //std::lock_guard<std::mutex> lock(stateMutex_);
   allStateIds_.insert(trackingState.id);
-  const State & currentState = updatedStates->at(trackingState.id);
+  const State & incomingCurrentState = updatedStates->at(trackingState.id);
+  mergeImuMeasurements(incomingCurrentState.previousImuMeasurements);
+  State currentState = incomingCurrentState;
+  currentState.previousImuMeasurements.clear();
   // important: need to update keyframes in the past *first* so relative poses will be correct.
   for(const auto & state : *updatedStates) {
     affectedStateIds.insert(state.second.id);
     if(keyframeStates_.count(state.second.id)) {
-      keyframeStates_.at(state.second.id) = state.second; // update
+      State storedState = state.second;
+      storedState.previousImuMeasurements.clear();
+      keyframeStates_.at(state.second.id) = std::move(storedState); // update
       if(nonKeyframeStatesByKeyframeId_.count(state.second.id)) {
         for(const auto & nonKeyframeState : nonKeyframeStatesByKeyframeId_.at(state.second.id)) {
           affectedStateIds.insert(nonKeyframeState.first);
@@ -74,7 +132,6 @@ void Trajectory::update(const TrackingState & trackingState,
       nonKeyframeState.timestamp = currentState.timestamp;
       nonKeyframeState.keyframeId = trackingState.currentKeyframeId;
       nonKeyframeState.id = currentState.id;
-      nonKeyframeState.previousImuMeasurements = currentState.previousImuMeasurements;
       nonKeyframeStatesByKeyframeId_[trackingState.currentKeyframeId][currentState.id] =
           nonKeyframeState;
       keyframeIdByStateId_[currentState.id] = trackingState.currentKeyframeId;
@@ -84,23 +141,20 @@ void Trajectory::update(const TrackingState & trackingState,
 
   // prepare new propagator
   livePropagator_.reset(new Propagator(currentState.timestamp));
-  while (!imuMeasurements_.empty()) {
-    if (currentState.timestamp - imuMeasurements_.front().timeStamp < Duration(0.1)) {
-      break;
-    }
-    imuMeasurements_.pop_front();
-  }
   if (imuMeasurements_.empty()) {
     return; // happens, if addImuMeasurement is not called on this Trajectory object
   }
+  const auto liveMeasurements = imuMeasurementsForInterval(
+      currentState.timestamp, imuMeasurements_.back().timeStamp);
+  if (liveMeasurements.empty()) return;
   SpeedAndBias sb;
   sb.head<3>() = currentState.v_W;
   sb.segment<3>(3) = currentState.b_g;
   sb.tail<3>() = currentState.b_a;
-  livePropagator_->appendTo(imuMeasurements_,
+  livePropagator_->appendTo(liveMeasurements,
                             currentState.T_WS,
                             sb,
-                            imuMeasurements_.back().timeStamp);
+                            liveMeasurements.back().timeStamp);
 }
 
 bool Trajectory::addImuMeasurement(const Time &stamp,
@@ -110,7 +164,7 @@ bool Trajectory::addImuMeasurement(const Time &stamp,
 {
   // store IMU measurement
   ImuMeasurement imuMeasurement(stamp, ImuSensorReadings(omega, alpha));
-  imuMeasurements_.push_back(imuMeasurement);
+  mergeImuMeasurement(imuMeasurement);
   if (allStateIds_.empty() || !livePropagator_) {
     return false;
   }
@@ -132,7 +186,10 @@ bool Trajectory::addImuMeasurement(const Time &stamp,
   sb_0.head<3>() = unpropagatedState.v_W;
   sb_0.segment<3>(3) = unpropagatedState.b_g;
   sb_0.tail<3>() = unpropagatedState.b_a;
-  livePropagator_->appendTo(imuMeasurements_,
+  const auto liveMeasurements = imuMeasurementsForInterval(
+      unpropagatedState.timestamp, imuMeasurement.timeStamp);
+  if (liveMeasurements.empty()) return false;
+  livePropagator_->appendTo(liveMeasurements,
                             unpropagatedState.T_WS,
                             sb_0,
                             imuMeasurement.timeStamp);
@@ -194,27 +251,34 @@ bool Trajectory::getState(const Time & timestamp, State& state) {
     if(!found) {
       // do the propagation...
       // (smartly keep propagating doesn't seem to help with speed)
-      if(state1.previousImuMeasurements.empty()) { //No IMU data, constant velocity model
+      const auto previousImuMeasurements = imuMeasurementsForInterval(state0.timestamp, timestamp);
+      if(previousImuMeasurements.empty()) {
+        // A non-empty rolling stream means IMU is enabled but the requested
+        // interval has already expired or contains a gap. Do not silently
+        // deskew old sensor data with a constant-velocity approximation.
+        if (!imuMeasurements_.empty()) return false;
         ConstantVelocityPropagator propagator(state0, state1);
-        propagator.getState(timestamp,
-                            T_WS_1, speedAndBias_1, state.omega_S);
+        if (!propagator.getState(timestamp,
+                            T_WS_1, speedAndBias_1, state.omega_S)) return false;
 
 
       } else {
+        if (previousImuMeasurements.size() < 2
+            || previousImuMeasurements.front().timeStamp > state0.timestamp
+            || previousImuMeasurements.back().timeStamp < timestamp) return false;
         Propagator propagator(state0.timestamp);
-        propagator.appendTo(state1.previousImuMeasurements,
-                            T_WS_0, speedAndBias_0, timestamp);
-        propagator.getState(T_WS_0, speedAndBias_0,
-                            T_WS_1, speedAndBias_1, state.omega_S);
+        if (!propagator.appendTo(previousImuMeasurements,
+                            T_WS_0, speedAndBias_0, timestamp)
+            || !propagator.getState(T_WS_0, speedAndBias_0,
+                            T_WS_1, speedAndBias_1, state.omega_S)) return false;
 
         // cache...!
-        if(propagators_iter == propagatorsByKeyframeIdAndEndTimeNs_.end()) {
-          propagatorsByKeyframeIdAndEndTimeNs_[iter->second]
-              .emplace(timestamp.toNSec(), propagator);
-        } else {
-          propagatorsByKeyframeIdAndEndTimeNs_.at(iter->second)
-              .emplace(timestamp.toNSec(), propagator);
-        }
+        // Interpolation can be requested at arbitrarily many sensor timestamps.
+        // Keep at most 256 cached propagators; evicting does not lose history.
+        size_t cached = 0;
+        for (const auto& entry : propagatorsByKeyframeIdAndEndTimeNs_) cached += entry.second.size();
+        if (cached >= 256) propagatorsByKeyframeIdAndEndTimeNs_.clear();
+        propagatorsByKeyframeIdAndEndTimeNs_[iter->second].emplace(timestamp.toNSec(), propagator);
       }
     }
 
@@ -224,119 +288,74 @@ bool Trajectory::getState(const Time & timestamp, State& state) {
     state.b_a = speedAndBias_1.tail<3>(); // Accelerometer bias [m/s^2].
     state.timestamp = timestamp; // Timestamp corresponding to this state.
     state.id = StateId(); // set invalid.
-    state.previousImuMeasurements = state0.previousImuMeasurements;
+    state.previousImuMeasurements.clear();
     state.isKeyframe = false;
   }
   return true;
 }
 
-bool Trajectory::getStatePoses(const std::vector<Time> & timestamps, 
-                           std::vector<Eigen::Matrix4d, Eigen::aligned_allocator<Eigen::Matrix4d>>& statePoses) {
-  // Use first timestamp to obtain closest timestamp
-  if(timestamps.size() == 0){
-    return false;
-  }
-  // find closest timestamp
-  auto iter = statesByTimestampNs_.lower_bound(timestamps[0].toNSec());
-
-  if(iter == statesByTimestampNs_.end()) {
-    return false;
-  }
-  if(iter == statesByTimestampNs_.begin()) {
-    return false;
-  }
-  State state0, state1;
-  if(!getState(iter->second, state1)) {
-    return false;
-  }
-  iter--; // now pointing to the timestamp before...
-  if(!getState(iter->second, state0)) {
-    return false;
-  }
-
-  if(timestamps.front().toNSec() < state0.timestamp.toNSec())
-  {
-    if(!getState(iter->second, state1)) {
-      return false;
-    }
-    iter--;
-    if(!getState(iter->second, state0)) {
-      return false;
-    }
-  }
-
-  if(timestamps.back().toNSec() > state1.timestamp.toNSec())
-  {
-    state0 = state1;
-    iter++; iter++;
-    if(!getState(iter->second, state1)) {
-      return false;
-    }
-  }
-
-
-  // do the propagation...
-  kinematics::Transformation T_WS_0 = state0.T_WS;
-  SpeedAndBias speedAndBias_0;
-  speedAndBias_0.head<3>() = state0.v_W;
-  speedAndBias_0.segment<3>(3) = state0.b_g;
-  speedAndBias_0.tail<3>() = state0.b_a;
-  kinematics::Transformation T_WS_1;
-  SpeedAndBias speedAndBias_1;
-
-  auto nextiter = iter;
-  State state;
-  nextiter ++;
-  okvis::Time prevTime(0);
-
-  if(!state1.previousImuMeasurements.empty()) {
-    BatchedLidarPropagator propagator(state0.timestamp, state1.previousImuMeasurements);
-    // Iterate measurements
-    for(size_t i = 0; i < timestamps.size(); i++){
-      if(timestamps[i] != prevTime) {
-        if(nextiter->first == timestamps[i].toNSec()) {
-          const StateId stateId = nextiter->second;
-          getState(stateId, state);
-          statePoses.push_back(state.T_WS.T());
-          nextiter++;
-          if(nextiter == statesByTimestampNs_.end()) {
-            break;
-          }
-          continue;
-        }
-        propagator.appendTo(state1.previousImuMeasurements,
-                            T_WS_0, speedAndBias_0, timestamps[i]);
-        propagator.getState(T_WS_0, speedAndBias_0,
-                            T_WS_1, speedAndBias_1, state.omega_S);
-        prevTime = timestamps[i];
-      }
-      // Intentional: duplicate timestamps reuse the previously propagated T_WS_1
-      statePoses.push_back(T_WS_1.T());
+bool Trajectory::getStatePoses(const std::vector<Time>& timestamps,
+    std::vector<Eigen::Matrix4d, Eigen::aligned_allocator<Eigen::Matrix4d>>& statePoses) {
+  if (timestamps.empty()) return false;
+  std::vector<Eigen::Matrix4d, Eigen::aligned_allocator<Eigen::Matrix4d>> poses;
+  poses.reserve(timestamps.size());
+  const auto upper = statesByTimestampNs_.lower_bound(timestamps.front().toNSec());
+  // Batched IMU integration has one fixed start state and monotonic cursor. It
+  // is valid only inside one open state interval. Boundaries, multiple intervals
+  // and unsorted requests use ordinary timestamp queries, preserving duplicates.
+  const bool oneOpenInterval = upper != statesByTimestampNs_.end()
+      && upper != statesByTimestampNs_.begin()
+      && timestamps.front().toNSec() < upper->first
+      && timestamps.back().toNSec() < upper->first
+      && std::is_sorted(timestamps.begin(), timestamps.end());
+  if (!oneOpenInterval) {
+    for (const auto& timestamp : timestamps) {
+      State state;
+      if (!getState(timestamp, state)) return false;
+      poses.push_back(state.T_WS.T());
     }
   } else {
-    ConstantVelocityPropagator propagator(state0, state1);
-    //Assume that we are in the no IMU case and then we perform a constant velocity model
-    for(size_t i = 0; i < timestamps.size(); i++){
-      if(timestamps[i] != prevTime) {
-        if(nextiter->first == timestamps[i].toNSec()) {
-          const StateId stateId = nextiter->second;
-          getState(stateId, state);
-          statePoses.push_back(state.T_WS.T());
-          nextiter++;
-          if(nextiter == statesByTimestampNs_.end()) {
-            break;
-          }
-          continue;
+    State state0, state1;
+    if (!getState(std::prev(upper)->second, state0) || !getState(upper->second, state1)) return false;
+    const auto measurements = imuMeasurementsForInterval(state0.timestamp, timestamps.back());
+    SpeedAndBias sb0, sb1;
+    sb0.head<3>() = state0.v_W;
+    sb0.segment<3>(3) = state0.b_g;
+    sb0.tail<3>() = state0.b_a;
+    kinematics::Transformation pose;
+    Eigen::Vector3d omega;
+    Time previous;
+    bool first = true;
+    if (measurements.empty()) {
+      if (!imuMeasurements_.empty()) return false;
+      ConstantVelocityPropagator propagator(state0, state1);
+      for (const auto& timestamp : timestamps) {
+        if (first || timestamp != previous) {
+          if (!propagator.getState(timestamp, pose, sb1, omega)) return false;
+          previous = timestamp;
+          first = false;
         }
-        propagator.getState(timestamps[i],
-                          T_WS_1, speedAndBias_1, state.omega_S);
-        prevTime = timestamps[i];
+        poses.push_back(pose.T());
       }
-      statePoses.push_back(T_WS_1.T());
+    } else {
+      if (measurements.size() < 2 || measurements.front().timeStamp > state0.timestamp
+          || measurements.back().timeStamp < timestamps.back()) return false;
+      BatchedLidarPropagator propagator(state0.timestamp, measurements);
+      for (const auto& timestamp : timestamps) {
+        if (first || timestamp != previous) {
+          if (!propagator.appendTo(measurements, state0.T_WS, sb0, timestamp)
+              || !propagator.getState(state0.T_WS, sb0, pose, sb1, omega)) return false;
+          previous = timestamp;
+          first = false;
+        }
+        poses.push_back(pose.T());
+      }
     }
-
   }
-
+  // A failed query leaves the caller's output untouched; success always returns
+  // exactly one pose per timestamp, including duplicates at the last state.
+  if (statePoses.empty()) statePoses.swap(poses);
+  else statePoses.insert(statePoses.end(), poses.begin(), poses.end());
   return true;
 }
 
@@ -356,8 +375,19 @@ bool Trajectory::getState(const StateId & stateId, State& state) const {
     state.b_a = keyframeState.b_a;
     state.omega_S = nonKeyframeState.omega_S_raw - keyframeState.b_g;
     state.timestamp = nonKeyframeState.timestamp;
-    state.previousImuMeasurements = nonKeyframeState.previousImuMeasurements;
+    state.id = stateId;
+    state.previousImuMeasurements.clear();
     state.isKeyframe = false;
+    return true;
+  }
+  return false;
+}
+
+bool Trajectory::earliestPoseTimestamp(Time& timestamp) const {
+  State state;
+  for (const auto& timestampAndId : statesByTimestampNs_) {
+    if (!getState(timestampAndId.second, state)) continue;
+    timestamp.fromNSec(timestampAndId.first);
     return true;
   }
   return false;

@@ -123,6 +123,7 @@ struct FrontendParameters {
  * @brief Parameters regarding the estimator.
  */
 struct EstimatorParameters {
+  bool memory_bounded = true; ///< Release cold images and bound transient sensor working sets; no history disk archive.
   int num_keyframes; ///< Number of keyframes in optimisation window.
   int num_loop_closure_frames; ///< Number of loop closure frames in optimisation window.
   int num_imu_frames; ///< Number of frames linked by most recent nonlinear IMU error terms.

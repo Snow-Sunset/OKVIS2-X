@@ -24,6 +24,7 @@
 #include <pthread.h>
 #include <queue>
 #include <sys/time.h>
+#include <utility>
 
 #include <glog/logging.h>
 
@@ -82,12 +83,51 @@ class Queue {
     PushNonBlocking(value);
   }
 
+  /// \brief Move-push non-blocking to the queue.
+  void Push(QueueType&& value) {
+    PushNonBlocking(std::move(value));
+  }
+
   /// \brief Push to the queue.
   void PushNonBlocking(const QueueType& value) {
     pthread_mutex_lock(&mutex_);
     queue_.push(value);
     pthread_cond_signal(&condition_empty_);  // Signal that data is available.
     pthread_mutex_unlock(&mutex_);
+  }
+
+  /// \brief Move-push to the queue.
+  void PushNonBlocking(QueueType&& value) {
+    pthread_mutex_lock(&mutex_);
+    queue_.push(std::move(value));
+    pthread_cond_signal(&condition_empty_);  // Signal that data is available.
+    pthread_mutex_unlock(&mutex_);
+  }
+
+  /// Push without waiting or discarding an older item. False means full/shutdown.
+  bool PushNonBlockingIfNotFull(const QueueType& value, size_t max_queue_size) {
+    pthread_mutex_lock(&mutex_);
+    if (shutdown_ || queue_.size() >= max_queue_size) {
+      pthread_mutex_unlock(&mutex_);
+      return false;
+    }
+    queue_.push(value);
+    pthread_cond_signal(&condition_empty_);
+    pthread_mutex_unlock(&mutex_);
+    return true;
+  }
+
+  /// Move-push without waiting or discarding an older item. False means full/shutdown.
+  bool PushNonBlockingIfNotFull(QueueType&& value, size_t max_queue_size) {
+    pthread_mutex_lock(&mutex_);
+    if (shutdown_ || queue_.size() >= max_queue_size) {
+      pthread_mutex_unlock(&mutex_);
+      return false;
+    }
+    queue_.push(std::move(value));
+    pthread_cond_signal(&condition_empty_);
+    pthread_mutex_unlock(&mutex_);
+    return true;
   }
 
   /// \brief Return the size of the queue.
@@ -106,27 +146,51 @@ class Queue {
     return empty;
   }
 
+  /// \brief Block until data is available without removing it.
+  /// \return False if shutdown is requested.
+  bool WaitForData() {
+    pthread_mutex_lock(&mutex_);
+    while (queue_.empty() && !shutdown_) {
+      pthread_cond_wait(&condition_empty_, &mutex_);
+    }
+    const bool available = !shutdown_ && !queue_.empty();
+    pthread_mutex_unlock(&mutex_);
+    return available;
+  }
+
   /// \brief Push to the queue if the size is less than max_queue_size, else block.
   /// \param[in] value New entry in queue.
   /// \param[in] max_queue_size Maximum queue size.
   /// \return False if shutdown is requested.
   bool PushBlockingIfFull(const QueueType& value, size_t max_queue_size) {
-    while (!shutdown_) {
-      pthread_mutex_lock(&mutex_);
-      size_t size = queue_.size();
-      if (size >= max_queue_size) {
-        pthread_cond_wait(&condition_full_, &mutex_);
-      }
-      if (size >= max_queue_size) {
-        pthread_mutex_unlock(&mutex_);
-        continue;
-      }
-      queue_.push(value);
-      pthread_cond_signal(&condition_empty_);  // Signal that data is available.
-      pthread_mutex_unlock(&mutex_);
-      return true;
+    pthread_mutex_lock(&mutex_);
+    while (!shutdown_ && queue_.size() >= max_queue_size) {
+      pthread_cond_wait(&condition_full_, &mutex_);
     }
-    return false;
+    if (shutdown_) {
+      pthread_mutex_unlock(&mutex_);
+      return false;
+    }
+    queue_.push(value);
+    pthread_cond_signal(&condition_empty_);  // Signal that data is available.
+    pthread_mutex_unlock(&mutex_);
+    return true;
+  }
+
+  /// \brief Move-push to the queue if it has space, otherwise wait.
+  bool PushBlockingIfFull(QueueType&& value, size_t max_queue_size) {
+    pthread_mutex_lock(&mutex_);
+    while (!shutdown_ && queue_.size() >= max_queue_size) {
+      pthread_cond_wait(&condition_full_, &mutex_);
+    }
+    if (shutdown_) {
+      pthread_mutex_unlock(&mutex_);
+      return false;
+    }
+    queue_.push(std::move(value));
+    pthread_cond_signal(&condition_empty_);  // Signal that data is available.
+    pthread_mutex_unlock(&mutex_);
+    return true;
   }
 
   /// \brief Push to the queue. If full, drop the oldest entry.
@@ -142,6 +206,21 @@ class Queue {
       result = true;
     }
     queue_.push(value);
+    pthread_cond_signal(&condition_empty_);  // Signal that data is available.
+    pthread_mutex_unlock(&mutex_);
+    return result;
+  }
+
+  /// \brief Move-push to the queue. If full, drop the oldest entry.
+  bool PushNonBlockingDroppingIfFull(QueueType&& value,
+                                     size_t max_queue_size) {
+    pthread_mutex_lock(&mutex_);
+    bool result = false;
+    if (queue_.size() >= max_queue_size) {
+      queue_.pop();
+      result = true;
+    }
+    queue_.push(std::move(value));
     pthread_cond_signal(&condition_empty_);  // Signal that data is available.
     pthread_mutex_unlock(&mutex_);
     return result;
@@ -172,11 +251,10 @@ class Queue {
         pthread_mutex_unlock(&mutex_);
         continue;
       }
-      QueueType _value = queue_.front();
+      *value = std::move(queue_.front());
       queue_.pop();
       pthread_cond_signal(&condition_full_);  // Notify that space is available.
       pthread_mutex_unlock(&mutex_);
-      *value = _value;
       return true;
     }
     return false;
@@ -194,8 +272,9 @@ class Queue {
       pthread_mutex_unlock(&mutex_);
       return false;
     }
-    *value = queue_.front();
+    *value = std::move(queue_.front());
     queue_.pop();
+    pthread_cond_signal(&condition_full_);
     pthread_mutex_unlock(&mutex_);
     return true;
   }
@@ -224,11 +303,10 @@ class Queue {
       pthread_mutex_unlock(&mutex_);
       return false;
     }
-    QueueType _value = queue_.front();
+    *value = std::move(queue_.front());
     queue_.pop();
     pthread_cond_signal(&condition_full_);  // Notify that space is available.
     pthread_mutex_unlock(&mutex_);
-    *value = _value;
     return true;
   }
 

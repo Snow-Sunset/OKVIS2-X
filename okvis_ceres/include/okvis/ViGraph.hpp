@@ -728,6 +728,12 @@ class ViGraph
   /// \param csvFilePrefix File Prefix vor csv files
   void writeLidarDebugStatisticsCsv(const std::string& csvFilePrefix);
 
+  /// Enable paging of frozen visual pose-graph recovery data.
+  void configureObservationArchive(const std::string& directory);
+  void archiveTwoPoseObservations(StateId stateId);
+  /// Remove laser factors from Ceres and both endpoint ownership lists.
+  void removeSubmapAlignmentConstraints(StateId stateId);
+
 protected:
 
   /// \brief Check observation consistency.
@@ -781,7 +787,7 @@ protected:
   using GpsFactor = GraphEdge<ceres::GpsErrorAsynchronous>;
 
   /// \brief
-  using SubmapAlignmentFactor = GraphEdge<::ceres::CostFunction>;
+  using SubmapAlignmentFactor = TwoStateGraphEdge<::ceres::CostFunction>;
 
 
 
@@ -825,6 +831,9 @@ protected:
     int classification = -1; ///< It's classification (if used / classified by the CNN already).
   };
 
+
+  std::string observationArchiveDirectory_;
+  uint64_t observationArchiveSequence_ = 0;
 
   // parameters
   std::vector<okvis::CameraParameters,

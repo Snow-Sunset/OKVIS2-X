@@ -278,7 +278,9 @@ class Trajectory {
   bool getState(const Time & timestamp, State& state);
 
   /// \brief Obtain the (extrapolated) state at a certain timestamp for a given batch of states.
-  ///        Note that we have to make sure that all lie between two camera frames
+  ///        Ordered timestamps strictly inside one camera interval use batched
+  ///        propagation; boundaries, multiple intervals and unsorted requests
+  ///        fall back to individual timestamp queries without losing duplicates.
   ///        Note that this may access non-keyframe states (relative pose computations)
   ///        and may need to propagate to the precise timestamp. Therefore this is not a
   ///        trivial operation. Returns false, if no states/IMU measurements available for
@@ -295,6 +297,12 @@ class Trajectory {
   /// \return True on success.
   bool getState(const StateId & stateId, State& state) const;
 
+  /// \brief Get the timestamp of the oldest retrievable estimated pose.
+  /// The caller must synchronize this query with trajectory updates.
+  /// @param[out] timestamp Timestamp of the oldest retrievable pose.
+  /// \return False while the trajectory has no retrievable pose.
+  bool earliestPoseTimestamp(Time& timestamp) const;
+
   /// \brief Get all the stateIds (estimated states).
   /// \return All the stateIds (estimated states).
   const std::set<StateId>& stateIds() const {return allStateIds_;}
@@ -302,6 +310,9 @@ class Trajectory {
   /// \brief Get the keyframe states.
   /// \return An std::map from keyframe state IDs to keyframe states.
   const AlignedMap<StateId, State>& keyframeStates() const;
+
+  /// \brief Number of measurements retained for short-horizon propagation.
+  size_t bufferedImuMeasurementCount() const { return imuMeasurements_.size(); }
 
   /// \brief Clears the cached propagators by StateId (save memory)
   /// @param[in] keyframeStateId The requested state ID (must be keyframe).
@@ -323,7 +334,6 @@ class Trajectory {
     Time timestamp; ///< Timestamp corresponding to this state.
     StateId keyframeId; ///< Frame Id.
     StateId id; ///< Frame Id.
-    ImuMeasurementDeque previousImuMeasurements; ///< IMU measurements up to this state's time.
   };
 
   /// \brief Stores the non-keyframe State information by State ID.
@@ -338,7 +348,11 @@ class Trajectory {
 
   /// \brief Propagate to the live state (if addImuMeasurement is called).
   std::unique_ptr<Propagator> livePropagator_;
-  ImuMeasurementDeque imuMeasurements_; ///< IMU measurements received.
+  ImuMeasurementDeque imuMeasurements_; ///< Short rolling IMU window for propagation.
+  void mergeImuMeasurement(const ImuMeasurement& measurement);
+  void mergeImuMeasurements(const ImuMeasurementDeque& measurements);
+  void pruneImuMeasurements(const Time& newest);
+  ImuMeasurementDeque imuMeasurementsForInterval(const Time& start, const Time& end) const;
 };
 
 /**

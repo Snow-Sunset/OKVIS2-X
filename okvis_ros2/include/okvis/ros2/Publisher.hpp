@@ -211,6 +211,8 @@ class Publisher
 
   private:
   bool meshPublishingEnabled_ = true;
+  size_t pathMaxPoints_ = 10000; ///< Display sampling only; trajectory export retains all poses.
+  size_t landmarkMaxPoints_ = 100000; ///< Display sampling only.
   okvis::ThreadedPublisher::PublisherHandle<sensor_msgs::msg::PointCloud2> pubLidarMap_;
 
   /// @name Node and subscriber related

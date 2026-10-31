@@ -858,6 +858,8 @@ bool Frontend::dataAssociationAndInitialization(
     // nonmax suppression
     size_t attempts = 0;
     for(const auto & id : stateIds) {
+      // Previous candidate references have expired; bound reloaded historical payloads.
+      estimator.trimFramePayloadCache();
       // start with oldest keyframe match
       const double p = id.second;
       // get old multiframe
@@ -1187,8 +1189,8 @@ bool Frontend::doWeNeedANewKeyframe(const Estimator &estimator,
   // go through all the frames and try to match the initialized keypoints
   std::set<uint64_t> lmIds;
   for (size_t im = 0; im < currentFrame->numFrames(); ++im) {
-    const int rows = currentFrame->image(im).rows/10;
-    const int cols = currentFrame->image(im).cols/10;
+    const int rows = currentFrame->imageSize(im).height/10;
+    const int cols = currentFrame->imageSize(im).width/10;
 
     cv::Mat matches = cv::Mat::zeros(rows, cols, CV_8UC1);
     cv::Mat detections = cv::Mat::zeros(rows, cols, CV_8UC1);
@@ -1236,8 +1238,8 @@ bool Frontend::doWeNeedANewKeyframe(const Estimator &estimator,
     // go through all the frames and try to match the initialized keypoints
     auto otherFrame = estimator.multiFrame(frame);
     for (size_t im = 0; im < otherFrame->numFrames(); ++im) {
-      const int rows = otherFrame->image(im).rows/10;
-      const int cols = otherFrame->image(im).cols/10;
+      const int rows = otherFrame->imageSize(im).height/10;
+      const int cols = otherFrame->imageSize(im).width/10;
 
       cv::Mat matches = cv::Mat::zeros(rows, cols, CV_8UC1);
       cv::Mat detections = cv::Mat::zeros(rows, cols, CV_8UC1);

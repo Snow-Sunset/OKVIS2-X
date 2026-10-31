@@ -280,6 +280,38 @@ class MultiFrame
 
   /// @}
 
+  cv::Size imageSize(size_t cameraIdx) const { return frames_.at(cameraIdx).imageSize(); }
+  bool releaseImages() {
+    bool complete = true;
+    for (auto& frame : frames_) complete = frame.releaseImages() && complete;
+    return complete;
+  }
+
+  /// Archive/release camera payloads; immutable camera calibration and frame IDs stay resident.
+  bool archivePayload(const std::string& directory, bool release = true) {
+    bool complete = true;
+    for (size_t c = 0; c < frames_.size(); ++c) {
+      complete = frames_[c].archivePayload(directory + "/" + std::to_string(id_) +
+          "_" + std::to_string(c) + ".frame", release) && complete;
+    }
+    return complete;
+  }
+  /// Restore the previous resident working set after a streaming export of cold frames.
+  /// As with archivePayload(), call only after all descriptor/image references are finished.
+  void releaseArchivedPayload() {
+    for (auto& frame : frames_) {
+      if (!frame.payloadArchivePath().empty()) frame.archivePayload(frame.payloadArchivePath());
+    }
+  }
+  void setPayloadLoadedCallback(const std::function<void()>& callback) {
+    for (auto& frame : frames_) frame.setPayloadLoadedCallback(callback);
+  }
+  size_t residentPayloadBytes() const {
+    size_t bytes = 0;
+    for (const auto& frame : frames_) bytes += frame.residentPayloadBytes();
+    return bytes;
+  }
+
   /// \brief Get the total number of keypoints in all frames.
   /// \return The total number of keypoints.
   inline size_t numKeypoints() const;

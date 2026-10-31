@@ -22,6 +22,9 @@
 
 #include <memory>
 #include <atomic>
+#include <mutex>
+#include <functional>
+#include <string>
 
 #include <Eigen/StdVector>
 #include <Eigen/Core>
@@ -74,11 +77,19 @@ class Frame
 
   /// \brief Copy constructor
   /// @param[in] other The other frame.
-  inline Frame(const Frame& other) : image_(other.image_), depthImage_(other.depthImage_),
-    cameraGeometry_(other.cameraGeometry_), detector_(other.detector_),
-    extractor_(other.extractor_), network_(other.network_),
-    isClassified_(other.isClassified_.load())
+  inline Frame(const Frame& other)
+      : cameraGeometry_(other.cameraGeometry_), detector_(other.detector_),
+        extractor_(other.extractor_), network_(other.network_),
+        isClassified_(other.isClassified_.load())
   {
+    other.ensurePayload();
+    image_ = other.image_; depthImage_ = other.depthImage_;
+    imageSize_ = other.imageSize_;
+    keypoints_ = other.keypoints_; backProjections_ = other.backProjections_;
+    backProjectionsValid_ = other.backProjectionsValid_;
+    descriptors_ = other.descriptors_; classifications_ = other.classifications_;
+    landmarkIds_ = other.landmarkIds_; landmarks_ = other.landmarks_;
+    landmarkInitialisations_ = other.landmarkInitialisations_;
   }
 
   /// \brief Default destructor
@@ -220,28 +231,49 @@ class Frame
   /// \return whether or not the operation was successful.
   inline bool resetDescriptors(const cv::Mat & descriptors);
 
+  /// Persist all image/feature payload before releasing it. Existing accessors reload lazily.
+  /// The caller must run this at a frontend safe point, with no outstanding descriptor pointers.
+  bool archivePayload(const std::string& filename, bool release = true);
+  /// Discard cold images without writing to disk; retain features for future loop closures.
+  /// Call only at a frontend safe point, with no outstanding image references.
+  bool releaseImages();
+  cv::Size imageSize() const { return imageSize_; }
+  void ensurePayload() const;
+  size_t residentPayloadBytes() const;
+  void setPayloadLoadedCallback(std::function<void()> callback) { payloadLoadedCallback_ = std::move(callback); }
+  bool payloadResident() const { return payloadResident_; }
+  const std::string& payloadArchivePath() const { return payloadArchivePath_; }
+
   /// \brief Get the number of keypoints.
   /// \return The number of keypoints.
   inline size_t numKeypoints() const;
 
  protected:
-  cv::Mat image_;  ///< the image as OpenCV's matrix
-  cv::Mat depthImage_;  ///< the depth image as OpenCV's matrix
+  mutable cv::Mat image_;  ///< the image as OpenCV's matrix
+  cv::Size imageSize_; ///< Original dimensions survive cold image release.
+  mutable cv::Mat depthImage_;  ///< the depth image as OpenCV's matrix
   std::shared_ptr<const cameras::CameraBase> cameraGeometry_;  ///< the camera geometry
   std::shared_ptr<cv::FeatureDetector> detector_;  ///< the detector
   std::shared_ptr<cv::DescriptorExtractor> extractor_;  ///< the extractor
   std::shared_ptr<Network> network_; ///< The segmentation network (if applicable, dummy otherwise).
-  std::vector<cv::KeyPoint> keypoints_;  ///< we store keypoints using OpenCV's struct
+  mutable std::vector<cv::KeyPoint> keypoints_;  ///< we store keypoints using OpenCV's struct
 
   /// \brief We cache backprojections.
-  std::vector<Eigen::Vector3d, Eigen::aligned_allocator<Eigen::Vector3d>> backProjections_;
+  mutable std::vector<Eigen::Vector3d, Eigen::aligned_allocator<Eigen::Vector3d>> backProjections_;
 
-  std::vector<bool> backProjectionsValid_; ///< Also need to chache if back-projections are valid.
-  cv::Mat descriptors_;  ///< we store the descriptors using OpenCV's matrices
-  cv::Mat classifications_; ///< per keypoint classification.
-  std::vector<uint64_t> landmarkIds_;  ///< landmark Id, if associated -- 0 otherwise
-  std::vector<Eigen::Vector4d, Eigen::aligned_allocator<Eigen::Vector4d>> landmarks_; ///< pos in C.
-  std::vector<bool> landmarkInitialisations_; ///< Store landmark initialisation stati.
+  mutable std::vector<bool> backProjectionsValid_; ///< Also need to chache if back-projections are valid.
+  mutable cv::Mat descriptors_;  ///< we store the descriptors using OpenCV's matrices
+  mutable cv::Mat classifications_; ///< per keypoint classification.
+  mutable std::vector<uint64_t> landmarkIds_;  ///< landmark Id, if associated -- 0 otherwise
+  mutable std::vector<Eigen::Vector4d, Eigen::aligned_allocator<Eigen::Vector4d>> landmarks_; ///< pos in C.
+  mutable std::vector<bool> landmarkInitialisations_; ///< Store landmark initialisation stati.
+  std::function<void()> payloadLoadedCallback_;
+  mutable std::mutex payloadMutex_;
+  mutable std::atomic_bool payloadResident_{true};
+  mutable bool payloadDirty_ = true;
+  mutable size_t archivedNumKeypoints_ = 0;
+  mutable std::string payloadArchivePath_;
+  std::atomic_bool classificationInProgress_{false};
   std::atomic_bool isClassified_; ///< Store if classified (yet).
 };
 

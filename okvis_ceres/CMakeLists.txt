@@ -56,6 +56,7 @@ add_library(${LIB_NAME}
   src/SubmapIcpError.cpp
   src/PointToPlaneError.cpp
   src/TwoPoseGraphError.cpp
+  src/TwoPoseGraphArchive.cpp
   src/TwoPoseExtrinsicsGraphError.cpp
   src/ViGraph.cpp
   src/ViGraphEstimator.cpp
@@ -107,6 +108,9 @@ install(TARGETS ${LIB_NAME} EXPORT okvisTargets
 install(DIRECTORY include/okvis DESTINATION ${CMAKE_INSTALL_INCLUDEDIR} FILES_MATCHING PATTERN "*.hpp")
 
 if(BUILD_TESTS OR BUILD_POINT_TO_PLANE_TESTS)
+  add_executable(okvis_frame_archive_test test/TestFrameArchive.cpp)
+  target_link_libraries(okvis_frame_archive_test PRIVATE okvis::Ceres)
+  add_test(NAME okvis_frame_archive COMMAND okvis_frame_archive_test)
   add_executable(okvis_point_to_plane_test test/TestPointToPlane.cpp)
   target_link_libraries(okvis_point_to_plane_test PRIVATE okvis::Ceres)
   add_test(NAME okvis_point_to_plane COMMAND okvis_point_to_plane_test)

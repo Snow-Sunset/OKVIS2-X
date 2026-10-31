@@ -418,6 +418,7 @@ bool Component::save(const std::string &path)
     // write frame
     // FRAME stateId cameraIdx extrId [3 values extr. pos] [4 value extr. quat] [nsec timestamp]
     MultiFramePtr multiFrame = multiFrames_.at(id);
+    const bool payloadWasCold = multiFrame->residentPayloadBytes() == 0;
     for (uint64_t i = 0; i < multiFrame->numFrames(); ++i) {
       kinematics::Transformation T_SC = state.extrinsics.at(i)->estimate();
       file << "FRAME " << id.value() << " " << i << " " << state.extrinsics.at(i)->id() << " "
@@ -439,6 +440,9 @@ bool Component::save(const std::string &path)
         file << std::endl;
       }
     }
+
+    // Cold frame payloads were paged in only for this record. Free before reading the next frame.
+    if (payloadWasCold) multiFrame->releaseArchivedPayload();
 
     // write imu error term
     if (state.previousImuLink.errorTerm) {

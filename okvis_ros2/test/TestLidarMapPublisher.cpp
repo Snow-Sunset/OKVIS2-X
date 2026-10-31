@@ -18,7 +18,12 @@ int main(int argc, char** argv) {
     okvis::Publisher publisher(node, odometry, images, general);
     publisher.setMeshPublishingEnabled(false);
     general->startThread();
-    publisher.publishLidarPointCloudMap(okvis::Time(12, 345), {{0.1, 0.2, 0.3}, {1.0, 2.0, 3.0}});
+    constexpr size_t pointCount = 200001;
+    okvis::LidarPointCloudMap::Points points;
+    points.reserve(pointCount);
+    for (size_t i = 0; i < pointCount; ++i)
+      points.emplace_back(0.1 + 0.25 * double(i), -0.2 - 0.125 * double(i), 0.3);
+    publisher.publishLidarPointCloudMap(okvis::Time(12, 345), points);
     // Subscribe after the only publication to verify transient-local durability.
     std::this_thread::sleep_for(std::chrono::milliseconds(100));
     sensor_msgs::msg::PointCloud2::ConstSharedPtr received;
@@ -31,18 +36,32 @@ int main(int argc, char** argv) {
       std::this_thread::sleep_for(std::chrono::milliseconds(5));
     }
     if (!received) throw std::runtime_error("Late subscriber did not receive accumulated map");
-    if (received->header.frame_id != "world" || received->width * received->height != 2
+    if (received->header.frame_id != "world" || received->width != pointCount || received->height != 1
         || received->header.stamp.sec != 12 || received->header.stamp.nanosec != 345) {
       throw std::runtime_error("Incorrect map frame, timestamp or point count");
+    }
+    if (received->point_step != 12 || received->row_step != 12 * pointCount ||
+        received->data.size() != 12 * pointCount || received->fields.size() != 3 || !received->is_dense) {
+      throw std::runtime_error("XYZ map payload is not packed at 12 bytes per point");
     }
     sensor_msgs::PointCloud2ConstIterator<float> x(*received, "x");
     sensor_msgs::PointCloud2ConstIterator<float> y(*received, "y");
     sensor_msgs::PointCloud2ConstIterator<float> z(*received, "z");
-    if (std::abs(*x - 0.1f) > 1e-6f || std::abs(*y - 0.2f) > 1e-6f || std::abs(*z - 0.3f) > 1e-6f) {
+    if (std::abs(*x - float(points.front().x())) > 1e-6f ||
+        std::abs(*y - float(points.front().y())) > 1e-6f ||
+        std::abs(*z - float(points.front().z())) > 1e-6f) {
       throw std::runtime_error("Incorrect PointCloud2 coordinates");
     }
+    x += static_cast<int>(pointCount - 1);
+    y += static_cast<int>(pointCount - 1);
+    z += static_cast<int>(pointCount - 1);
+    if (std::abs(*x - float(points.back().x())) > 1e-6f ||
+        std::abs(*y - float(points.back().y())) > 1e-6f ||
+        std::abs(*z - float(points.back().z())) > 1e-6f) {
+      throw std::runtime_error("Global map tail was truncated, sampled or transformed incorrectly");
+    }
     general->shutdown();
-    std::cout << "ROS2 XYZ map and late-subscriber checks passed\n";
+    std::cout << "ROS2 packed XYZ global map above 200000 points and late-subscriber checks passed\n";
   } catch (const std::exception& error) {
     std::cerr << error.what() << '\n';
     result = 1;

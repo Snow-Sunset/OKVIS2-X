@@ -84,7 +84,24 @@ struct SubMapConfig{
     bool buildLidarPointCloudMap = true;
     double pointCloudMapVoxelSize = 0.1;       ///< metres, independent of plane voxels
     double pointCloudMapPublishInterval = 1.0; ///< wall-clock seconds; zero disables throttling
-    size_t pointCloudMapMaxPublishPoints = 200000; ///< display budget; PCD remains complete
+    // Persistent history on disk, bounded local/cache payloads in RAM.
+    bool memoryBounded = true;
+    std::string memoryArchiveDirectory = "./okvis-history"; ///< used only for explicitly enabled LiDAR spool/chunks
+    size_t pointCloudMemoryMb = 96;
+    size_t planeCacheMemoryMb = 32;
+    size_t planeActiveMaxCells = 8192;
+    double planeWindowHalfExtent = 50.0; ///< metres in the current submap frame
+    size_t lidarQueueMaxPoints = 200000;
+    /// Persist every accepted raw LiDAR ray for delayed/restart recovery.
+    /// Disabled by default: bounded mode then relies on blocking backpressure
+    /// and retains only the in-memory FIFO.
+    bool lidarSpoolEnabled = false;
+    /// Persist completed voxel chunks for a full historical map. The realtime
+    /// default keeps only the local RAM voxel map and evicts old cells.
+    bool pointCloudPersistentChunks = false;
+    double pointCloudWindowHalfExtent = 50.0; ///< world-frame local map radius [m]
+    size_t mappingQueueMaxFrames = 4;
+    size_t stateQueueMaxUpdates = 32;
 
 
     /**
@@ -168,7 +185,18 @@ struct SubMapConfig{
       se::yaml::subnode_as_bool(node, "use_point_to_plane_factors", usePointToPlaneFactors);
       se::yaml::subnode_as_bool(node, "lidar_plane_only", lidarPlaneOnly);
       se::yaml::subnode_as_bool(node, "build_lidar_pointcloud_map", buildLidarPointCloudMap);
-      se::yaml::subnode_as_size_t(node, "pointcloud_map_max_publish_points", pointCloudMapMaxPublishPoints);
+      se::yaml::subnode_as_bool(node, "memory_bounded", memoryBounded);
+      se::yaml::subnode_as_string(node, "memory_archive_directory", memoryArchiveDirectory);
+      se::yaml::subnode_as_size_t(node, "pointcloud_memory_mb", pointCloudMemoryMb);
+      se::yaml::subnode_as_size_t(node, "plane_cache_memory_mb", planeCacheMemoryMb);
+      se::yaml::subnode_as_size_t(node, "plane_active_max_cells", planeActiveMaxCells);
+      if (!node["plane_window_half_extent"].empty()) node["plane_window_half_extent"] >> planeWindowHalfExtent;
+      se::yaml::subnode_as_size_t(node, "lidar_queue_max_points", lidarQueueMaxPoints);
+      se::yaml::subnode_as_bool(node, "lidar_spool_enabled", lidarSpoolEnabled);
+      se::yaml::subnode_as_bool(node, "pointcloud_persistent_chunks", pointCloudPersistentChunks);
+      if (!node["pointcloud_window_half_extent"].empty()) node["pointcloud_window_half_extent"] >> pointCloudWindowHalfExtent;
+      se::yaml::subnode_as_size_t(node, "mapping_queue_max_frames", mappingQueueMaxFrames);
+      se::yaml::subnode_as_size_t(node, "state_queue_max_updates", stateQueueMaxUpdates);
       if (!node["pointcloud_map_voxel_size"].empty()) node["pointcloud_map_voxel_size"] >> pointCloudMapVoxelSize;
       if (!node["pointcloud_map_publish_interval"].empty()) node["pointcloud_map_publish_interval"] >> pointCloudMapPublishInterval;
       if (!node["plane_voxel_size"].empty()) node["plane_voxel_size"] >> planeMapConfig.voxelSize;
@@ -202,7 +230,15 @@ struct SubMapConfig{
       os << str_utils::bool_to_pretty_str(c.usePointToPlaneFactors, "use_point_to_plane_factors") << " \n";
       os << str_utils::bool_to_pretty_str(c.lidarPlaneOnly, "lidar_plane_only") << " \n";
       os << str_utils::bool_to_pretty_str(c.buildLidarPointCloudMap, "build_lidar_pointcloud_map") << " \n";
-      os << str_utils::value_to_pretty_str(c.pointCloudMapMaxPublishPoints, "pointcloud_map_max_publish_points") << " \n";
+      os << str_utils::bool_to_pretty_str(c.memoryBounded, "memory_bounded") << " \n";
+      os << str_utils::value_to_pretty_str(c.memoryArchiveDirectory, "memory_archive_directory") << " \n";
+      os << str_utils::value_to_pretty_str(c.pointCloudMemoryMb, "pointcloud_memory_mb") << " \n";
+      os << str_utils::value_to_pretty_str(c.planeCacheMemoryMb, "plane_cache_memory_mb") << " \n";
+      os << str_utils::value_to_pretty_str(c.planeActiveMaxCells, "plane_active_max_cells") << " \n";
+      os << str_utils::value_to_pretty_str(c.planeWindowHalfExtent, "plane_window_half_extent") << " \n";
+      os << str_utils::bool_to_pretty_str(c.lidarSpoolEnabled, "lidar_spool_enabled") << " \n";
+      os << str_utils::bool_to_pretty_str(c.pointCloudPersistentChunks, "pointcloud_persistent_chunks") << " \n";
+      os << str_utils::value_to_pretty_str(c.pointCloudWindowHalfExtent, "pointcloud_window_half_extent") << " \n";
       os << str_utils::value_to_pretty_str(c.pointCloudMapVoxelSize, "pointcloud_map_voxel_size") << " \n";
       os << str_utils::value_to_pretty_str(c.pointCloudMapPublishInterval, "pointcloud_map_publish_interval") << " \n";
       os << str_utils::value_to_pretty_str(c.planeMapConfig.voxelSize, "plane_voxel_size") << " \n";

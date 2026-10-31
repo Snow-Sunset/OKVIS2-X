@@ -115,6 +115,8 @@ bool ViGraphEstimator::eliminateStateByImuMerge(StateId stateId, StateId refId)
 //  problem_->AddResidualBlock(state.GpsFactors.back().errorTerm.get(),nullptr,
 //                             previousState.pose->parameters(),previousState.speedAndBias->parameters(), previousState.T_GW->parameters());
 
+  removeSubmapAlignmentConstraints(stateId);
+
   // remove parameter blocks
   problem_->RemoveParameterBlock(state.pose->parameters());  // lose pose
   problem_->RemoveParameterBlock(state.speedAndBias->parameters());  // lose speed and bias
@@ -219,19 +221,23 @@ bool ViGraphEstimator::freezePosesUntil(StateId stateId, bool removeInCeres)
   bool first = true;
   for(auto iter = states_.find(stateId); ; --iter) {
     if(iter->second.pose->fixed()) {
+      archiveTwoPoseObservations(iter->first);
       if(removeInCeres) {
         if(problem_->HasParameterBlock(iter->second.pose->parameters())) {
+          removeSubmapAlignmentConstraints(iter->first);
           problem_->RemoveParameterBlock(iter->second.pose->parameters());
         }
       }
       break;
     }
     iter->second.pose->setFixed(true);
+    archiveTwoPoseObservations(iter->first);
     if(first || !removeInCeres) {
       problem_->SetParameterBlockConstant(iter->second.pose->parameters());
       first = false;
     } else {
       if(problem_->HasParameterBlock(iter->second.pose->parameters())) {
+        removeSubmapAlignmentConstraints(iter->first);
         problem_->RemoveParameterBlock(iter->second.pose->parameters());
       }
     }
@@ -589,6 +595,9 @@ bool ViGraphEstimator::convertToPoseGraphMst(
       // book-keeping
       referenceState.twoPoseLinks[otherStateId] = twoPoseLink;
       otherState.twoPoseLinks[referenceStateId] = twoPoseLink;
+      // New links can connect a current frontier to an already frozen historical state.
+      if (referenceState.pose->fixed()) archiveTwoPoseObservations(referenceStateId);
+      else if (otherState.pose->fixed()) archiveTwoPoseObservations(otherStateId);
 
       // also remember we got rid of one of the MST edges
       numEdges.at(referenceStateId.value())--;

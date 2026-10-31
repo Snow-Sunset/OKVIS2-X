@@ -69,7 +69,8 @@ int main(int argc, char **argv) {
   node->declare_parameter("imu_propagated_state_publishing_rate", 0.0);
   node->declare_parameter("mesh_cutoff_z", std::numeric_limits<float>::max());
   node->declare_parameter("save_submap_meshes", false);
-  node->declare_parameter("save_lidar_pointcloud_map", true);
+  // Export is an explicit operation; do not duplicate the resident map on shutdown.
+  node->declare_parameter("save_lidar_pointcloud_map", false);
   node->declare_parameter("lidar_pointcloud_map_filename", "");
   node->declare_parameter("csv_path", "/tmp/");
 
@@ -365,17 +366,24 @@ int main(int argc, char **argv) {
       subscriber->shutdown();
     #endif
 
-    // final BA if needed
-    if(parameters.estimator.do_final_ba) {
-      LOG(INFO) << "Final full BA...";
-      estimator.doFinalBa();
+    // Finish local optimisation/publication before the mapping tail, while
+    // keeping the estimator available to consume mapping alignment callbacks.
+    while (estimator.processFrame())
+      std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    estimator.flushPendingUpdates();
+    if (seInterface) {
+      while (!seInterface->finishedIntegrating()) {
+        estimator.processPendingSubmapAlignments();
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+      }
+      estimator.processPendingSubmapAlignments();
+      seInterface->setFinished();
     }
 
-    // Finish up
-    estimator.stopThreading();
-    if (seInterface) {
-      while(!seInterface->finishedIntegrating());
-      seInterface->setFinished();
+    if (parameters.estimator.do_final_ba) {
+      estimator.doFinalBa();
+    } else {
+      estimator.stopThreading();
     }
 
     // Write CSV
@@ -383,7 +391,10 @@ int main(int argc, char **argv) {
     estimator.writeFinalTrajectoryCsv();
 
     if (saveLidarMap && seInterface && parameters.lidar && submapConfig.buildLidarPointCloudMap) {
-      const std::string filename = lidarMapFilename.empty() ? csv_path + "/lidar_map.pcd" : lidarMapFilename;
+      const std::string defaultFilename = seInterface->memoryArchiveDirectory().empty()
+          ? csv_path + "/lidar_map.pcd"
+          : seInterface->memoryArchiveDirectory() + "/lidar_map.pcd";
+      const std::string filename = lidarMapFilename.empty() ? defaultFilename : lidarMapFilename;
       if (!seInterface->saveLidarPointCloudMap(filename)) LOG(WARNING) << "LiDAR map empty or could not be saved: " << filename;
     }
 

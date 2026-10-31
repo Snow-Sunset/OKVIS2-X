@@ -21,6 +21,7 @@
 #include <iostream>
 #include <iomanip>
 #include <algorithm>
+#include <filesystem>
 
 #include <opencv2/imgproc/imgproc.hpp>
 #include <opencv2/imgcodecs/imgcodecs.hpp>
@@ -36,6 +37,103 @@ namespace okvis {
 static const double minDeltaT = 2.0; // [sec]
 static int numRealtimePoseGraphFrames = 12;
 static const int numPoseGraphFrames = 12;
+
+void ViSlamBackend::configureFrameArchive(const std::string& directory, size_t cacheBytes)
+{
+  if (releaseHistoricalImages_) throw std::logic_error("RAM-only history is already configured");
+  if (directory.empty()) throw std::invalid_argument("Frame archive directory must not be empty");
+  std::filesystem::create_directories(directory);
+  frameArchiveDirectory_ = std::filesystem::absolute(directory).string();
+  frameArchiveCacheBytes_ = cacheBytes;
+  realtimeGraph_.configureObservationArchive(frameArchiveDirectory_ + "/two_pose");
+  frameArchiveTracker_ = std::make_shared<FrameArchiveTracker>();
+  for (const auto& frame : multiFrames_) trackFramePayload(frame.first, frame.second);
+}
+
+void ViSlamBackend::configureInMemoryHistory()
+{
+  if (!frameArchiveDirectory_.empty()) throw std::logic_error("Disk history is already configured");
+  releaseHistoricalImages_ = true;
+  frameArchiveTracker_ = std::make_shared<FrameArchiveTracker>();
+  for (const auto& frame : multiFrames_) trackFramePayload(frame.first, frame.second);
+}
+
+void ViSlamBackend::trackFramePayload(StateId id, const MultiFramePtr& frame)
+{
+  if (!frameArchiveTracker_) return;
+  const std::weak_ptr<FrameArchiveTracker> weak = frameArchiveTracker_;
+  frame->setPayloadLoadedCallback([weak, id]() {
+    if (const auto tracker = weak.lock()) {
+      std::lock_guard<std::mutex> lock(tracker->mutex);
+      tracker->residentAccess[id] = ++tracker->clock;
+    }
+  });
+  recordFrameAccess(id);
+}
+
+void ViSlamBackend::recordFrameAccess(StateId id) const
+{
+  if (!frameArchiveTracker_) return;
+  std::lock_guard<std::mutex> lock(frameArchiveTracker_->mutex);
+  frameArchiveTracker_->residentAccess[id] = ++frameArchiveTracker_->clock;
+}
+
+ViSlamBackend::FrameArchiveStatistics ViSlamBackend::frameArchiveStatistics() const
+{
+  FrameArchiveStatistics result;
+  result.frameCount = multiFrames_.size();
+  for (const auto& frame : multiFrames_) {
+    const auto bytes = frame.second->residentPayloadBytes();
+    result.residentPayloadBytes += bytes;
+    if (bytes) ++result.residentFrameCount;
+    const auto state = auxiliaryStates_.find(frame.first);
+    if (state != auxiliaryStates_.end() && state->second.isPoseGraphFrame)
+      result.coldResidentPayloadBytes += bytes;
+  }
+  return result;
+}
+
+void ViSlamBackend::trimFramePayloadCache()
+{
+  if (!frameArchiveTracker_) return;
+  std::vector<std::pair<StateId, uint64_t>> resident;
+  {
+    std::lock_guard<std::mutex> lock(frameArchiveTracker_->mutex);
+    resident.assign(frameArchiveTracker_->residentAccess.begin(), frameArchiveTracker_->residentAccess.end());
+  }
+  std::vector<std::pair<StateId, uint64_t>> cold;
+  size_t coldBytes = 0;
+  for (const auto& entry : resident) {
+    const auto frame = multiFrames_.find(entry.first);
+    if (frame == multiFrames_.end() || !frame->second->residentPayloadBytes()) {
+      std::lock_guard<std::mutex> lock(frameArchiveTracker_->mutex);
+      frameArchiveTracker_->residentAccess.erase(entry.first);
+      continue;
+    }
+    const auto state = auxiliaryStates_.find(entry.first);
+    if (state != auxiliaryStates_.end() && state->second.isPoseGraphFrame &&
+        !imuFrames_.count(entry.first) && !keyFrames_.count(entry.first) &&
+        !loopClosureFrames_.count(entry.first)) {
+      cold.push_back(entry);
+      coldBytes += frame->second->residentPayloadBytes();
+    }
+  }
+  std::sort(cold.begin(), cold.end(), [](const auto& a, const auto& b) { return a.second < b.second; });
+  for (const auto& entry : cold) {
+    if (!releaseHistoricalImages_ && coldBytes <= frameArchiveCacheBytes_) break;
+    auto& frame = multiFrames_.at(entry.first);
+    // Raw image/descriptor references may be borrowed by frontend/visualisation code.
+    // An external shared owner pins the entire payload until a later safe-point sweep.
+    if (frame.use_count() != 1) continue;
+    const size_t before = frame->residentPayloadBytes();
+    if (releaseHistoricalImages_) {
+      if (!frame->releaseImages()) continue;
+    } else if (!frame->archivePayload(frameArchiveDirectory_)) continue;
+    coldBytes -= before;
+    std::lock_guard<std::mutex> lock(frameArchiveTracker_->mutex);
+    frameArchiveTracker_->residentAccess.erase(entry.first);
+  }
+}
 
 int ViSlamBackend::addCamera(const CameraParameters &cameraParameters)
 {
@@ -187,6 +285,7 @@ bool ViSlamBackend::addStates(MultiFramePtr multiFrame, const ImuMeasurementDequ
     fullGraph_.addStatesInitialise(multiFrame->timestamp(), imuMeasurements,
                                               multiFrame->cameraSystem());
     multiFrames_[id] = multiFrame;
+    trackFramePayload(id, multiFrame);
     auxiliaryState.loopId = id;
     auxiliaryStates_[id] = auxiliaryState; // for internal book-keeping
     imuFrames_.insert(id);
@@ -213,6 +312,7 @@ bool ViSlamBackend::addStates(MultiFramePtr multiFrame, const ImuMeasurementDequ
     }
 
     multiFrames_[id] = multiFrame;
+    trackFramePayload(id, multiFrame);
     auxiliaryState.loopId = id;
     auxiliaryStates_[id] = auxiliaryState; // for internal book-keeping
     imuFrames_.insert(id);
@@ -270,8 +370,8 @@ double ViSlamBackend::trackingQuality(StateId id) const
   int unionCount = 0;
   int matchedPoints = 0;
   for (size_t im = 0; im < numFrames; ++im) {
-    const int rows = frame->image(im).rows/10;
-    const int cols = frame->image(im).cols/10;
+    const int rows = frame->imageSize(im).height/10;
+    const int cols = frame->imageSize(im).width/10;
     const double radius = double(std::min(rows,cols))*kptradius_;
     matchesImg.at(im) = cv::Mat::zeros(rows, cols, CV_8UC1);
     const size_t num = frame->numKeypoints(im);
@@ -805,6 +905,7 @@ bool ViSlamBackend::applyStrategy(size_t numKeyframes,
     t6.stop();
   }
 
+  trimFramePayloadCache();
   return true;
 }
 
@@ -2168,11 +2269,13 @@ bool ViSlamBackend::saveMap(std::string path)
 {
   // save in g2o format
   std::string g2oPath = path.substr(0, path.size() - 4) + ".g2o";
+  {
   Component component(fullGraph_.imuParametersVec_[0],
                       multiFrames_.at(StateId(1))->cameraSystem(),
                       fullGraph_,
                       multiFrames_);
   component.save(g2oPath);
+  }
 
   // ... and as own format
   std::ofstream file(path);
@@ -2233,6 +2336,7 @@ bool ViSlamBackend::saveMap(std::string path)
         file << std::endl;
       }
     }
+    trimFramePayloadCache();
   }
 
   return true;
@@ -2878,6 +2982,10 @@ void ViSlamBackend::clear()
   fullGraph_.clear();
 
   multiFrames_.clear();
+  if (frameArchiveTracker_) {
+    std::lock_guard<std::mutex> lock(frameArchiveTracker_->mutex);
+    frameArchiveTracker_->residentAccess.clear();
+  }
 
   auxiliaryStates_.clear(); // Store information about states.
   currentComponentIdx_ = 0; // The index of the current component.
@@ -2921,9 +3029,9 @@ double ViSlamBackend::overlapFraction(const MultiFramePtr frameA,
   // paint detection images and remember matched points
   for(size_t f=0; f<2; ++f) {
     for (size_t im = 0; im < frames[f]->numFrames(); ++im) {
-      if(frames[f]->image(im).empty()) continue;
-      const int rows = frames[f]->image(im).rows/10;
-      const int cols = frames[f]->image(im).cols/10;
+      if(frames[f]->imageSize(im).empty()) continue;
+      const int rows = frames[f]->imageSize(im).height/10;
+      const int cols = frames[f]->imageSize(im).width/10;
       const double radius = double(std::min(rows,cols))*kptradius_;
       detectionsImg[f].at(im) = cv::Mat::zeros(rows, cols, CV_8UC1);
       matchesImg[f].at(im) = cv::Mat::zeros(rows, cols, CV_8UC1);
@@ -2955,11 +3063,11 @@ double ViSlamBackend::overlapFraction(const MultiFramePtr frameA,
   // draw match images
   for(size_t f=0; f<2; ++f) {
     for (size_t im = 0; im < frames[f]->numFrames(); ++im) {
-      if(frames[f]->image(im).empty()) continue;
+      if(frames[f]->imageSize(im).empty()) continue;
       cv::KeyPoint keypoint;
       const size_t num = frames[f]->numKeypoints(im);
-      const int rows = frames[f]->image(im).rows/10;
-      const int cols = frames[f]->image(im).cols/10;
+      const int rows = frames[f]->imageSize(im).height/10;
+      const int cols = frames[f]->imageSize(im).width/10;
       const double radius = double(std::min(rows,cols))*kptradius_;
       for (size_t k = 0; k < num; ++k) {
         frames[f]->getCvKeypoint(im, k, keypoint);
@@ -2977,7 +3085,7 @@ double ViSlamBackend::overlapFraction(const MultiFramePtr frameA,
     int intersectionCount = 0;
     int unionCount = 0;
     for (size_t im = 0; im < frames[f]->numFrames(); ++im) {
-      if(frames[f]->image(im).empty()) continue;
+      if(frames[f]->imageSize(im).empty()) continue;
       cv::Mat intersectionMask, unionMask;
       cv::bitwise_and(matchesImg[f].at(im), detectionsImg[f].at(im), intersectionMask);
       cv::bitwise_or(matchesImg[f].at(im), detectionsImg[f].at(im), unionMask);

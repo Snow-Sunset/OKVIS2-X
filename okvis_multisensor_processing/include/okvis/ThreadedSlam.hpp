@@ -180,6 +180,12 @@ class ThreadedSlam : public ViInterface {
 
   /// \brief Runs main processing iteration, call in your main loop.
   bool processFrame();
+  /// Drain mapping constraints on the same application thread as processFrame().
+  /// Joins an outstanding local optimisation before mutating the estimator.
+  bool processPendingSubmapAlignments();
+  /// Join local optimisation and wait for all queued publication callbacks.
+  /// Stop sensor input before using this to begin final mapping drainage.
+  void flushPendingUpdates();
 
   /// \brief Trigger display (needed because OSX won't allow threaded display).
   void display(std::map<std::string, cv::Mat> & images) override final;
@@ -252,7 +258,8 @@ private:
   bool getNextFrame(MultiFramePtr &multiFrame);
 
   /// \brief Performs the optimisation, publishing&visualisation preps, and marginalisation.
-  void optimisePublishMarginalise(MultiFramePtr multiFrame, const Eigen::Vector3d& gyroReading);
+  void optimisePublishMarginalise(MultiFramePtr multiFrame, const Eigen::Vector3d& gyroReading,
+                                  ImuMeasurementDeque frameImuMeasurements);
 
   /// \brief Performs visualisation in the background.
   void visualisationLoop();
@@ -355,6 +362,8 @@ private:
   };
   threadsafe::Queue<PublicationData> lastOptimisedQueue_; ///< Queue of last optimised results.
   threadsafe::Queue<PublicationData> publicationQueue_; ///< Publication queue.
+  std::atomic<size_t> publicationPending_{0};
+  bool hasAlignmentUpdates_ = false;
   std::set<StateId> affectedStates_; ///< Affected states (changed pose graph edges) since pub.
 
   // realtime publishing:
@@ -366,9 +375,6 @@ private:
   GpsMeasurementDeque gpsMeasurementDeque_;  ///< Stored GPS Measurements to be used next.
   LidarMeasurementDeque lidarMeasurementDeque_;  ///< Stored lidar Measurements to be used next.
   DepthMeasurementDeque depthMeasurementDeque_; ///< Stored depth Measurements to be used next.
-
-  /// \brief Stored IMU measurements by frame.
-  AlignedMap<StateId, ImuMeasurementDeque> imuMeasurementsByFrame_;
 
   /// @name Algorithm objects.
   /// @{

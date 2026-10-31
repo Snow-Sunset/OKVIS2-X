@@ -24,6 +24,10 @@
 #include <tf2_eigen/tf2_eigen.hpp>
 #include <tf2_geometry_msgs/tf2_geometry_msgs.hpp>
 #include <pcl_conversions/pcl_conversions.h>
+#include <cmath>
+#include <cstring>
+#include <limits>
+#include <stdexcept>
 
 #include <okvis/FrameTypedefs.hpp>
 
@@ -50,6 +54,12 @@ void Publisher::setupNode(std::shared_ptr<rclcpp::Node> node)
 {
   // set up node
   node_ = node;
+  const auto pathLimit = node_->declare_parameter<int64_t>("path_max_points", 10000);
+  const auto landmarkLimit = node_->declare_parameter<int64_t>("landmark_max_points", 100000);
+  if (pathLimit < 0 || landmarkLimit < 0)
+    throw std::invalid_argument("Path and landmark display point limits must be nonnegative");
+  pathMaxPoints_ = static_cast<size_t>(pathLimit);
+  landmarkMaxPoints_ = static_cast<size_t>(landmarkLimit);
 
   // set up publishers
   slice_pub_ =              threadedPublisher_->registerPublisher<visualization_msgs::msg::Marker>("se_map_slice");
@@ -294,14 +304,22 @@ void Publisher::publishEstimatorUpdate(
   trajectory_.update(trackingState, updatedStates, affectedStateIds);
   trajectoryLocked_ = false;
 
-  // Publish the complete trajectory as nav_msgs/Path. Styling is deliberately
-  // left to RViz so users can change colour, alpha, and line width at runtime.
+  // Bound display message memory independently of the complete trajectory.
   auto path = std::make_shared<nav_msgs::msg::Path>();
   path->header.stamp = t;
   path->header.frame_id = "world";
   const auto& stateIds = trajectory_.stateIds();
-  path->poses.reserve(stateIds.size());
+  const size_t pathLimit = pathMaxPoints_ ? std::min(pathMaxPoints_, stateIds.size()) : stateIds.size();
+  path->poses.reserve(pathLimit);
+  size_t pathIndex = 0;
+  size_t nextPathIndex = pathLimit == 1 ? stateIds.size() - 1 : 0;
   for(const auto& stateId : stateIds) {
+    if (pathIndex++ != nextPathIndex) continue;
+    // Include both endpoints when at least two poses fit in the display budget.
+    if (pathLimit > 1)
+      nextPathIndex = (path->poses.size() + 1) * (stateIds.size() - 1) / (pathLimit - 1);
+    else
+      nextPathIndex = stateIds.size();
     okvis::State state;
     if(!trajectory_.getState(stateId, state)) {
       continue;
@@ -327,11 +345,15 @@ void Publisher::publishEstimatorUpdate(
 
   // finally the landmarks
   pcl::PointCloud<pcl::PointXYZRGB> pointsMatched; // Point cloud for matched points.
-  pointsMatched.reserve(landmarks->size());
+  const size_t landmarkLimit = landmarkMaxPoints_ ? std::min(landmarkMaxPoints_, landmarks->size()) : landmarks->size();
+  pointsMatched.reserve(landmarkLimit);
+  const size_t landmarkStride = landmarkLimit ? (landmarks->size() + landmarkLimit - 1) / landmarkLimit : 1;
+  size_t landmarkIndex = 0;
 
   // transform points into custom world frame:
   /// \todo properly from ros params -- also landmark thresholds below
   for (const auto & lm : *landmarks) {
+    if (landmarkIndex++ % landmarkStride != 0) continue;
     // check infinity
     if (fabs((double) (lm.point[3])) < 1.0e-8)
       continue;
@@ -702,15 +724,44 @@ void Publisher::publishFieldSliceAsCallback(
 }
 
 void Publisher::publishLidarPointCloudMap(const Time& timestamp, const LidarPointCloudMap::Points& points) {
-  pcl::PointCloud<pcl::PointXYZ> cloud;
-  cloud.reserve(points.size());
-  for (const auto& point : points) {
-    cloud.push_back(pcl::PointXYZ(float(point.x()), float(point.y()), float(point.z())));
-  }
+  // Write packed XYZ directly into the ROS payload. A full global map must not
+  // require an additional PCL point array or per-point alignment padding.
+  static_assert(sizeof(float) == 4, "PointCloud2 FLOAT32 requires 4-byte floats");
+  constexpr uint32_t pointStep = 3 * sizeof(float);
+  // An unorganised cloud has height 1, so this also bounds width and prevents
+  // the uint32 row_step multiplication from overflowing.
+  if (points.size() > std::numeric_limits<uint32_t>::max() / pointStep)
+    throw std::length_error("LiDAR PointCloud2 row exceeds the ROS message size limit");
   auto message = std::make_shared<sensor_msgs::msg::PointCloud2>();
-  pcl::toROSMsg(cloud, *message);
+  if (points.size() > message->data.max_size() / pointStep)
+    throw std::length_error("LiDAR PointCloud2 payload exceeds vector capacity");
   message->header.frame_id = "world";
   message->header.stamp = rclcpp::Time(timestamp.sec, timestamp.nsec);
+  message->height = 1;
+  message->width = static_cast<uint32_t>(points.size());
+  message->point_step = pointStep;
+  message->row_step = message->width * pointStep;
+  const uint16_t byteOrder = 1;
+  message->is_bigendian = *reinterpret_cast<const uint8_t*>(&byteOrder) == 0;
+  message->is_dense = true;
+  message->fields.resize(3);
+  const char* names[] = {"x", "y", "z"};
+  for (size_t axis = 0; axis < 3; ++axis) {
+    auto& field = message->fields[axis];
+    field.name = names[axis];
+    field.offset = static_cast<uint32_t>(axis * sizeof(float));
+    field.datatype = sensor_msgs::msg::PointField::FLOAT32;
+    field.count = 1;
+  }
+  message->data.resize(points.size() * pointStep);
+  size_t offset = 0;
+  for (const auto& point : points) {
+    const float xyz[] = {float(point.x()), float(point.y()), float(point.z())};
+    std::memcpy(message->data.data() + offset, xyz, pointStep);
+    message->is_dense = message->is_dense && std::isfinite(xyz[0]) &&
+        std::isfinite(xyz[1]) && std::isfinite(xyz[2]);
+    offset += pointStep;
+  }
   pubLidarMap_.publish(message);
 }
 

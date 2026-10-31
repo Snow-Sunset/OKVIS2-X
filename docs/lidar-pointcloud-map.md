@@ -1,10 +1,10 @@
-# 激光累计点云地图
+# 全局可视化体素地图
 
-在纯平面模式下新增独立的 XYZ 点云地图。它接收优化状态对应的去畸变激光端点，保留未匹配到平面的有效点；不会启用占据地图、占据场残差或 mesh。
+LiDAR 平面配准之外维护独立的全局可视化地图。默认保留整个运行历史，统一到
+世界坐标，在固定分辨率体素中融合重叠点，再完整发布到 `/okvis/okvis_lidar_map`。
+不使用粗全局预览、自动增大体素、20 万点上限或显示抽点，不自动写历史文件。
 
-参考 [FAST-LIVO2 的 `handleLIO()`](https://github.com/hku-mars/FAST-LIVO2/blob/main/src/LIVMapper.cpp) 中降采样、状态更新后变换入图、世界点云输出及 PCD 保存的流程。这里继续使用 OKVIS 的状态估计和子地图锚点，未移植 FAST-LIVO2 的滤波器。
-
-## 运行配置
+## 配置
 
 在使用的 `se2-lidar*.yaml` 的 `general` 下配置：
 
@@ -14,61 +14,84 @@ general:
   use_point_to_plane_factors: true
   write_mesh_output: false
   build_lidar_pointcloud_map: true
+  pointcloud_map_global: true
   pointcloud_map_voxel_size: 0.1
   pointcloud_map_publish_interval: 1.0
-  pointcloud_map_max_publish_points: 200000
+  memory_bounded: true
+  lidar_spool_enabled: false
+  pointcloud_persistent_chunks: false
+  pointcloud_memory_mb: 96
+  pointcloud_window_half_extent: 50.0
 ```
 
-- `pointcloud_map_voxel_size`：累计地图的采样体素宽度，单位米，与平面拟合的 `plane_voxel_size` 独立。每个体素保留距离体素中心最近的实测点，不平均跨表面的点。
-- `pointcloud_map_publish_interval`：两次累计地图发布的最小墙钟时间间隔，单位秒。`0` 表示每次地图变化都可发布；地图未变化时不重复组装。结束时强制发布最终快照。
-- `pointcloud_map_max_publish_points`：后台实时显示的采样点数预算，默认 20 万；`0` 表示不限制，完整 PCD 保存不受此预算影响。
-- `build_lidar_pointcloud_map: false`：关闭累计点云地图的存储、发布和保存，不关闭已有点面约束。
+- `pointcloud_map_global` 默认 `true`：保留全历史，融合成一张世界坐标体素图。
+  不因距离当前位置远或超过 `pointcloud_memory_mb` 而驱逐历史。
+- `pointcloud_map_voxel_size`：固定体素宽度，单位米；默认 0.1 m。每个占用体素
+  保留距离中心最近的实测点，不平均跨表面的点。跨子地图重叠体素也合并。
+- `pointcloud_map_publish_interval`：两次发布的最小墙钟间隔，单位秒。`0` 表示
+  每次变化都可发布；无变化不重复组装，正常退出强制发布最后快照。
+- `pointcloud_memory_mb`：只约束可选局部显示模式或显式持久化 chunks 的驻留缓存。
+  默认全局 RAM 历史不受该参数裁剪，内存随场景增长。
+- `pointcloud_window_half_extent`：仅在 `pointcloud_map_global: false`、有界且无
+  持久化 chunks 时使用，按世界坐标局部窗口释放历史。
+- `build_lidar_pointcloud_map: false`：关闭全局可视化地图的存储、发布和导出，
+  不关闭配准所用的局部平面地图。
 
-原有近远距离筛选、去畸变和批次降采样仍生效；累计地图接收映射线程处理的全部有效端点，不受 `n_factors_per_state` 配准点数限制。映射队列积压时仍沿用现有的批次跳过策略，所以不是逐个原始点的无损录制。
+`memory_bounded` 继续控制活动平面地图、平面热缓存和传感器队列；它不代表
+全局可视化历史的固定内存上限。所带 Hilti/VBR LiDAR 示例显式开启全局模式。
+旧 `pointcloud_map_max_publish_points` 参数不再生效。
 
-## ROS2 查看
+原有近远距离过滤、去畸变和配准前采样仍生效。可视化地图接收建图线程处理的
+有效端点，不受 `n_factors_per_state` 配准因子数限制；它不是原始雷达包的无损备份。
 
-默认节点命名空间下，新增话题为 `/okvis/okvis_lidar_map`，消息类型 `sensor_msgs/msg/PointCloud2`，坐标系为 `world`。实际前缀随启动的 namespace/remap 改变。
+## 回环与地图融合
 
-在 RViz 中设置：
+源几何在内部保留关键帧锚点关系，以便回环后分别修正历史片段。对外发布的是
+一张融合后的全局图，不按子地图分开发送，也不在重访区域重复发布同体素点。
 
-1. Fixed Frame：`world`。
-2. 添加 PointCloud2，Topic 选择 `/okvis/okvis_lidar_map`。
-3. Reliability：Reliable；Durability：Transient Local；Decay Time：`0`。
+每次需要发布时，获取不可变源快照及最新锚定位姿，在地图锁外变换到世界坐标，
+按固定体素重新融合。这样回环后的旧位置不会残留在一个只增不减的世界 hash 中。
+优化器位姿优先于延迟传感器包；首个扫描之前到达的优化锚点也会保留。
 
-每条消息是覆盖累计地图范围的显示快照，超过点数预算时进行均匀抽样，RViz 无需累计历史消息。发布器保留最后一条消息，因此节点还在运行时，后启动的 RViz 也能收到地图。
+局部平面配准地图仍可滑动和驱逐，与全局可视化历史的生命周期独立。
+全局图的“固定体素融合”定义了地图本身的分辨率，融合后发布全部占用体素，
+没有第二层显示抽样或自适应粗化。
 
-`/okvis/okvis_points_alignment` 仍是实时/子地图配准点的调试输出，与累计地图独立。
+## RViz 与内存
 
-## 保存 PCD
+默认话题 `/okvis/okvis_lidar_map` 为 `sensor_msgs/msg/PointCloud2`，坐标系 `world`。
+RViz 添加 PointCloud2，订阅该话题并将 Fixed Frame 设为 `world`。每条消息是
+完整全局快照，RViz 不需要累计旧消息。发布器保留最后一条消息，迟加入订阅者
+也能收到当前全图。
 
-标准 ROS2 节点和网络节点新增参数：
+ROS 消息直接写入紧凑 XYZ float，12 字节/点；不再先构建完整 PCL 副本。
+全局源几何、不可变快照、世界融合 hash、输出点数组、DDS 缓存、RViz 主存和
+显存仍有各自开销。固定分辨率、全历史、不落盘模式无法维持固定 96 MiB 上限。
+内部按锚点保留的重叠源几何也会占用内存，即使发布时已经融合成一个体素。
 
-```yaml
-save_lidar_pointcloud_map: true
-lidar_pointcloud_map_filename: ""
-```
+后台线程合并显示请求，不丢弃位姿更新。完整世界融合的工作量随保留源点增长，
+不能沿用旧 20 万显示预算的性能数字。可增大发布间隔降低频率，单次仍发布全图。
+目前没有真实长数据集的整进程峰值或实时性保证。
 
-正常退出时默认保存到 `<csv_path>/lidar_map.pcd`；未设置 `csv_path` 时为 `/tmp/lidar_map.pcd`。可通过 `lidar_pointcloud_map_filename` 指定完整路径，父目录会自动创建。设 `save_lidar_pointcloud_map: false` 可关闭文件保存。
+## 显式保存
 
-使用节点已有的 shutdown 服务正常退出，才会执行最终导出；强制结束进程不能保证保存。空地图不写文件。输出为二进制 PCD，仅包含 XYZ；目前的逐点输入接口没有提供强度和 RGB 信息。
+默认不写 raw spool、cloud chunks 或 PCD。显式启用 `save_lidar_pointcloud_map`
+或设置 `lidar_pointcloud_map_filename` 才导出 PCD；默认全局模式导出完整历史，
+采用最新锚点并按相同的世界体素规则去重。导出使用有界外部排序和原子重命名，
+临时文件放在目标 PCD 文件系统。正常运行不调用该导出路径。
 
-离线应用可调用 `SubmappingInterface::saveLidarPointCloudMap(filename)` 导出同一份地图。
-
-## 位姿修正与边界
-
-地图按子地图局部坐标保存采样端点，组装快照时使用最新锚定位姿，并在世界坐标系再做一次体素去重。回环/最终优化的位姿回调先合并待应用的锚定位姿，由建图/快照消费者应用，避免阻塞状态发布线程，即使没有下一帧激光，最终保存也会反映修正。优化器提供的位姿优先于队列中较旧的传感器包，避免把修正后的地图移回旧位置。
-
-状态回调只交接小量位姿，不获取点云存储锁。已完成子地图复用不可变点缓存，只有变化的子地图重建缓存；获取缓存引用和位姿后，全局变换、采样、去重与 ROS 消息转换在专用显示线程进行。显示请求可以合并，不丢弃位姿更新；退出时强制等待最终请求。完整 PCD 在锁外组装和写入。地图覆盖所有保留的子地图，当前未实现局部滑动窗口或全局内存上限。较长序列仍需关注存储规模；默认显示点数预算控制实时显示组装和传输的成本，完整 PCD 组装成本仍随全图增长。子地图内部没有逐点的非刚性重新建图。
+全局 RAM 地图进程结束后释放，已有历史目录不会自动删除，也没有重启续跑入口。
+`lidar_spool_enabled` 和 `pointcloud_persistent_chunks` 仍为显式离线选项，默认关闭。
 
 ## 验证
 
+组件回归覆盖跨 50 m 窗口历史保留、超过旧点云预算、重访全局体素融合、回环
+迁移后无旧位置残影、延迟位姿拒绝、首扫描前锚点修正、发布/查询/PCD 一致、
+无历史文件创建及局部模式对照。ROS 测试覆盖 200001 点完整发布、紧凑 XYZ
+布局、时间/坐标系及迟加入订阅者。
+
 ```bash
-cmake -S . -B <build-dir> -DBUILD_POINT_TO_PLANE_TESTS=ON
-cmake --build <build-dir> -j2
-ctest --test-dir <build-dir> -R '^okvis_(point_to_plane|plane_only_mapping|lidar_pointcloud_map|lidar_map_publisher)$' --output-on-failure
+ctest --test-dir <build-dir> -R '^okvis_(global_voxel_mapping|lidar_pointcloud_map|plane_only_mapping|bounded_submap_history|lidar_map_publisher)$' --output-on-failure
 ```
 
-新增检查覆盖：体素去重、负坐标、无效点、子地图重叠、锚点旋转平移、无新扫描时的位姿修正、过期扫描包、累计地图发布/节流/禁用、最终快照、PCD 写入及回读，以及 ROS2 的 XYZ/时间戳/坐标系和晚加入订阅者。合成测试不替代真实数据的地图质量与性能回放。
-
-卡顿排查、合成性能对比及验证边界见 [实时性能修复说明](lidar-map-realtime-performance.md)。
+后台发布线程及历史基准的边界见 [实时性能说明](lidar-map-realtime-performance.md)。

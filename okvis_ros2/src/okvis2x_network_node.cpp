@@ -83,7 +83,8 @@ int main(int argc, char **argv) {
   node->declare_parameter("imu_propagated_state_publishing_rate", 0.0);
   node->declare_parameter("mesh_cutoff_z", std::numeric_limits<float>::max());
   node->declare_parameter("save_submap_meshes", false);
-  node->declare_parameter("save_lidar_pointcloud_map", true);
+  // Export is an explicit operation; do not duplicate the resident map on shutdown.
+  node->declare_parameter("save_lidar_pointcloud_map", false);
   node->declare_parameter("lidar_pointcloud_map_filename", "");
   node->declare_parameter("csv_path", "/tmp/");
 
@@ -382,17 +383,17 @@ int main(int argc, char **argv) {
     subscriber->shutdown();
   #endif
     
-  // final BA if needed
+  processor.finish();
   if(parameters.estimator.do_final_ba) {
-    LOG(INFO) << "Final full BA...";
     processor.slam_.doFinalBa();
   }
-
-  processor.finish();
   processor.slam_.setFinalTrajectoryCsvFile(csv_path + "/okvis2-final_trajectory.csv", false);
   processor.slam_.writeFinalTrajectoryCsv();
   if (saveLidarMap && parameters.lidar && submapConfig.buildLidarPointCloudMap) {
-    const std::string filename = lidarMapFilename.empty() ? csv_path + "/lidar_map.pcd" : lidarMapFilename;
+    const std::string defaultFilename = processor.se_interface_.memoryArchiveDirectory().empty()
+        ? csv_path + "/lidar_map.pcd"
+        : processor.se_interface_.memoryArchiveDirectory() + "/lidar_map.pcd";
+    const std::string filename = lidarMapFilename.empty() ? defaultFilename : lidarMapFilename;
     if (!processor.se_interface_.saveLidarPointCloudMap(filename)) LOG(WARNING) << "LiDAR map empty or could not be saved: " << filename;
   }
   if(save_meshes && processor.se_interface_.meshEnabled()){

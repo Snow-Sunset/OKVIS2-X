@@ -24,6 +24,13 @@ namespace okvis {
 
 #ifdef OKVIS_USE_NN
   int Frame::computeClassifications(int sizeU, int sizeV, int numThreads) {
+  classificationInProgress_ = true;
+  struct Completion {
+    std::atomic_bool& busy;
+    ~Completion() { busy = false; }
+  } completion{classificationInProgress_};
+  ensurePayload();
+  payloadDirty_ = true;
   OKVIS_ASSERT_TRUE(Exception, network_, "network not set");
 #ifndef OKVIS_USE_GPU
   // make 100% sure multithreading on

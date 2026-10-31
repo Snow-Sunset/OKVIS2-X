@@ -49,6 +49,9 @@ install(TARGETS ${LIB_NAME} EXPORT okvisTargets
 install(DIRECTORY include/okvis TYPE INCLUDE COMPONENT dev FILES_MATCHING PATTERN "*.hpp")
 
 if(BUILD_TESTS OR BUILD_POINT_TO_PLANE_TESTS)
+  add_executable(okvis_bounded_plane_map_test test/TestBoundedPlaneMap.cpp)
+  target_link_libraries(okvis_bounded_plane_map_test PRIVATE okvis::Mapping)
+  add_test(NAME okvis_bounded_plane_map COMMAND okvis_bounded_plane_map_test)
   add_executable(okvis_lidar_pointcloud_map_test test/TestLidarPointCloudMap.cpp)
   target_link_libraries(okvis_lidar_pointcloud_map_test PRIVATE okvis::Mapping)
   add_test(NAME okvis_lidar_pointcloud_map COMMAND okvis_lidar_pointcloud_map_test)

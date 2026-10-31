@@ -19,6 +19,7 @@
 #ifndef INCLUDE_OKVIS_VISLAMBACKEND_HPP_
 #define INCLUDE_OKVIS_VISLAMBACKEND_HPP_
 
+#include <mutex>
 #include <atomic>
 
 #include <okvis/PlaneMap.hpp>
@@ -60,6 +61,21 @@ class ViSlamBackend //: public VioBackendInterface
    * @brief Destructor, does nothing.
    */
   virtual ~ViSlamBackend() {}
+
+  /// Enable persistent historical frame paging. cacheBytes bounds cold payloads, active VIO frames
+  /// and the sparse graph/place-recognition index are accounted separately.
+  void configureFrameArchive(const std::string& directory, size_t cacheBytes);
+  /// Release cold images, retain all loop-closure features/observations in RAM, and create no archive.
+  void configureInMemoryHistory();
+  struct FrameArchiveStatistics {
+    size_t residentPayloadBytes = 0;
+    size_t coldResidentPayloadBytes = 0;
+    size_t frameCount = 0;
+    size_t residentFrameCount = 0;
+  };
+  FrameArchiveStatistics frameArchiveStatistics() const;
+  /// Call only at frontend safe points. Candidate/shared frames remain pinned while borrowed.
+  void trimFramePayloadCache();
 
   /// \brief Helper function to check all observed landmarks are in front of respective cameras.
   /// \return True If all observations are correctly of landmarks in front of respective cameras.
@@ -285,6 +301,7 @@ class ViSlamBackend //: public VioBackendInterface
     if(!multiFrames_.count(stateId)) {
       return nullptr;
     }
+    recordFrameAccess(stateId);
     return multiFrames_.at(stateId);
   }
 
@@ -689,6 +706,18 @@ private:
   /// \brief Delete place recognition frames with much overlap from database.
   /// \return Number of pruned frames.
   int prunePlaceRecognitionFrames();
+
+  struct FrameArchiveTracker {
+    std::mutex mutex;
+    uint64_t clock = 0;
+    std::map<StateId, uint64_t> residentAccess;
+  };
+  std::string frameArchiveDirectory_;
+  size_t frameArchiveCacheBytes_ = 0;
+  bool releaseHistoricalImages_ = false;
+  std::shared_ptr<FrameArchiveTracker> frameArchiveTracker_;
+  void trackFramePayload(StateId id, const MultiFramePtr& frame);
+  void recordFrameAccess(StateId id) const;
 
   std::map<StateId, MultiFramePtr> multiFrames_; ///< All the multiframes added so far.
 

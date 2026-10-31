@@ -71,6 +71,7 @@ bool TwoPoseGraphError::addObservation(
   bool isDuplication,
   double weight)
 {
+  restoreObservations();
   errorComputationValid_ = false; // flag that the error computation is invalid
 
   // check poses
@@ -398,6 +399,7 @@ bool TwoPoseStandardGraphError::compute() {
 
 bool TwoPoseStandardGraphError::convertToReprojectionErrors(std::vector<Observation> & observations,
                                                  std::vector<KeypointIdentifier> & duplicates) {
+  restoreObservations();
   // obtain referene pose
   const okvis::kinematics::Transformation T_WS0 = std::static_pointer_cast<PoseParameterBlock>(
               poseParameterBlockInfos_[0].parameterBlock)->estimate();
@@ -437,6 +439,9 @@ bool TwoPoseStandardGraphError::convertToReprojectionErrors(std::vector<Observat
   landmarkParameterBlockInfos_.clear();
   observations_.clear();
   landmarks_.clear();
+  observationArchivePath_.clear();
+  observationPrototypes_.clear();
+  observationLossFunctions_.clear();
   for (size_t i = 0; i < extrinsicsParameterBlockInfos_.size(); ++i) {
     extrinsicsParameterBlockInfos_[i].parameterBlock.reset();
     linearisationPoints_T_SC_[i].reset();

@@ -17,6 +17,7 @@
  * @author Andreas Forster
  */
 
+#include <chrono>
 #include <map>
 
 #include <pthread.h>
@@ -43,7 +44,6 @@ static const int cameraInputQueueSize = 2;
 
 // overlap of imu data before and after two consecutive frames [seconds]:
 static const double imuTemporalOverlap = 0.02;
-
 
 // Constructor.
 ThreadedSlam::ThreadedSlam(ViParameters &parameters, std::string dBowDir, se::SubMapConfig subMapConfig) :
@@ -78,6 +78,12 @@ void ThreadedSlam::init()
   frontend_.setBriskMatchingThreshold(parameters_.frontend.matching_threshold);
   frontend_.setBriskDetectionMaximumKeypoints(size_t(parameters_.frontend.max_num_keypoints));
   frontend_.setKeyframeInsertionOverlapThreshold(float(parameters_.frontend.keyframe_overlap));
+
+  if (parameters_.estimator.memory_bounded) {
+    estimator_.configureInMemoryHistory();
+    LOG(INFO) << "SLAM history: RAM only; cold images are released, loop-closure features "
+                 "and graph observations remain in memory; disk archive disabled.";
+  }
 
   // setup estimator
   estimator_.addImu(parameters_.imu);
@@ -407,9 +413,19 @@ bool ThreadedSlam::addSubmapAlignmentConstraints(const SupereightMapType* submap
                                                  std::vector<float> sensorError,
                                                  PlaneMapPtr planeMapA, PlaneMapPtr planeMapB) {
 
-  submapAlignmentFactorsReceived_.PushNonBlocking(
-          AlignmentTerm(submap_A_ptr, submap_B_ptr,frame_A_id,frame_B_id, pointCloud, sensorError, planeMapA, planeMapB));
-
+  const AlignmentTerm term(submap_A_ptr, submap_B_ptr, frame_A_id, frame_B_id,
+                           pointCloud, sensorError, planeMapA, planeMapB);
+  if (parameters_.estimator.memory_bounded) {
+    if (shutdown_) return false;
+    if (!submapAlignmentFactorsReceived_.PushNonBlockingIfNotFull(term, 4)) {
+      if (submapAlignmentFactorsReceived_.shutdown_) return false;
+      LOG(ERROR) << "Submap alignment queue exceeded 4 batches. Stop processing and slow dataset replay; "
+                    "historical alignment factors have not been discarded.";
+      throw std::runtime_error("Bounded submap alignment queue overflow");
+    }
+  } else {
+    submapAlignmentFactorsReceived_.PushNonBlocking(term);
+  }
   return true;
 }
 
@@ -446,7 +462,70 @@ bool ThreadedSlam::getNextFrame(MultiFramePtr &multiFrame) {
   return success;
 }
 
+bool ThreadedSlam::processPendingSubmapAlignments() {
+  // The application processing thread owns estimator mutations. A mapping
+  // callback only enqueues work; it never waits on or modifies the estimator.
+  if (submapAlignmentFactorsReceived_.Empty()) return false;
+  if (optimisationThread_.joinable()) optimisationThread_.join();
+  // Map to Map Alignment Factors are added here...
+  AlignmentTerm alignmentTerm;
+  bool processed = false;
+  while (submapAlignmentFactorsReceived_.PopNonBlocking(&alignmentTerm)) {
+    processed = true;
+    hasAlignmentUpdates_ = true;
+
+    // Set reference submap for live constraints
+    // Prioritize the older submap
+    if(parameters_.lidar) {
+      // add submap alignment constraints between map keyframes A and B
+      if (alignmentTerm.submap_A_ptr || alignmentTerm.planeMapA) {
+        estimator_.addSubmapAlignmentConstraints(alignmentTerm.submap_A_ptr, alignmentTerm.frame_A_id,
+                                                 alignmentTerm.frame_B_id, alignmentTerm.pointCloud_B,
+                                                 alignmentTerm.sensorError, true, "Tukey", alignmentTerm.planeMapA,
+                                                 submapConfig_.usePointToPlaneFactors);
+      }
+
+      previousSubmap_ = alignmentTerm.submap_B_ptr;
+      previousPlaneMap_ = alignmentTerm.planeMapB;
+      previousSubmapId_ = alignmentTerm.frame_B_id;
+    }
+    else {
+      // add submap alignment constraints between map keyframes A and B
+      if (alignmentTerm.submap_A_ptr) {
+        estimator_.addSubmapAlignmentConstraints(alignmentTerm.submap_A_ptr, alignmentTerm.frame_A_id,
+                                                alignmentTerm.frame_B_id, alignmentTerm.pointCloud_B,
+                                                alignmentTerm.sensorError, false, "Tukey");
+        // saveAlignedPoints(alignmentTerm.frame_B_id, alignmentTerm.pointCloud_B,
+        //                 "map2map_"+std::to_string(alignmentTerm.frame_A_id));
+      }
+      if (alignmentTerm.frame_A_id != 0) {
+        previousSubmap_ = alignmentTerm.submap_A_ptr;
+        previousPlaneMap_ = alignmentTerm.planeMapA;
+        previousSubmapId_ = alignmentTerm.frame_A_id;
+      }
+      else {
+        previousSubmap_ = alignmentTerm.submap_B_ptr;
+        previousPlaneMap_ = alignmentTerm.planeMapB;
+        previousSubmapId_ = alignmentTerm.frame_B_id;
+      }
+    }
+    LOG(INFO) << "[ThreadedSlam] Registered new reference submap with ID " << previousSubmapId_;
+  }
+
+  return processed;
+}
+
+void ThreadedSlam::flushPendingUpdates() {
+  if (optimisationThread_.joinable()) optimisationThread_.join();
+  while (publicationPending_.load() != 0) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+  processPendingSubmapAlignments();
+}
+
 bool ThreadedSlam::processFrame() {
+  // Process completed submaps even while cameras are idle or have stopped.
+  processPendingSubmapAlignments();
   MultiFramePtr multiFrame;
   ImuMeasurement imuMeasurement;
   LidarMeasurement lidarMeasurement;
@@ -829,8 +908,6 @@ bool ThreadedSlam::processFrame() {
       tProcessLiveDepthLidar.stop();
     }
   }
-  imuMeasurementsByFrame_[StateId(multiFrame->id())] = imuMeasurementDeque_;
-
   // Check if we need new kf due to lidar overlap
   bool kfPrior = false;
   if(submapConfig_.useMap2LiveFactors && parameters_.lidar){
@@ -871,49 +948,7 @@ bool ThreadedSlam::processFrame() {
     depthMeasurementDeque_.pop_front();
   }
 
-  // Map to Map Alignment Factors are added here...
-  AlignmentTerm alignmentTerm;
-  while(!shutdown_ && !submapAlignmentFactorsReceived_.Empty())
-  {
-    submapAlignmentFactorsReceived_.PopNonBlocking(&alignmentTerm);
-
-    // Set reference submap for live constraints
-    // Prioritize the older submap
-    if(parameters_.lidar) {
-      // add submap alignment constraints between map keyframes A and B
-      if (alignmentTerm.submap_A_ptr || alignmentTerm.planeMapA) {
-        estimator_.addSubmapAlignmentConstraints(alignmentTerm.submap_A_ptr, alignmentTerm.frame_A_id,
-                                                 alignmentTerm.frame_B_id, alignmentTerm.pointCloud_B,
-                                                 alignmentTerm.sensorError, true, "Tukey", alignmentTerm.planeMapA,
-                                                 submapConfig_.usePointToPlaneFactors);
-      }
-      
-      previousSubmap_ = alignmentTerm.submap_B_ptr;
-      previousPlaneMap_ = alignmentTerm.planeMapB;
-      previousSubmapId_ = alignmentTerm.frame_B_id;
-    }
-    else {
-      // add submap alignment constraints between map keyframes A and B
-      if (alignmentTerm.submap_A_ptr) {
-        estimator_.addSubmapAlignmentConstraints(alignmentTerm.submap_A_ptr, alignmentTerm.frame_A_id,
-                                                alignmentTerm.frame_B_id, alignmentTerm.pointCloud_B,
-                                                alignmentTerm.sensorError, false, "Tukey");
-        // saveAlignedPoints(alignmentTerm.frame_B_id, alignmentTerm.pointCloud_B,
-        //                 "map2map_"+std::to_string(alignmentTerm.frame_A_id));
-      }
-      if (alignmentTerm.frame_A_id != 0) {
-        previousSubmap_ = alignmentTerm.submap_A_ptr;
-        previousPlaneMap_ = alignmentTerm.planeMapA;
-        previousSubmapId_ = alignmentTerm.frame_A_id;
-      }
-      else {
-        previousSubmap_ = alignmentTerm.submap_B_ptr;
-        previousPlaneMap_ = alignmentTerm.planeMapB;
-        previousSubmapId_ = alignmentTerm.frame_B_id;
-      }
-    }
-    LOG(INFO) << "[ThreadedSlam] Registered new reference submap with ID " << previousSubmapId_;
-  }
+  processPendingSubmapAlignments();
 
   // start optimise, publish&visualise, marginalise:
   Eigen::Vector3d gyr(0,0,0);
@@ -931,8 +966,12 @@ bool ThreadedSlam::processFrame() {
     estimator_.setOptimisationTimeLimit(dt,
           parameters_.estimator.realtime_min_iterations);
   }
+  // The publication/mapping pipeline may still need this frame interval for
+  // asynchronous sensor propagation. It is carried only with the in-flight
+  // update and released once all consumers finish; no per-frame history is kept.
+  ImuMeasurementDeque frameImuMeasurements = imuMeasurementDeque_;
   optimisationThread_ = std::thread(&ThreadedSlam::optimisePublishMarginalise,
-                                    this, multiFrame, gyr);
+                                    this, multiFrame, gyr, std::move(frameImuMeasurements));
 
   // kick off posegraph optimisation, if needed, too...
   if(estimator_.needsFullGraphOptimisation()) {
@@ -952,7 +991,8 @@ bool ThreadedSlam::processFrame() {
 }
 
 void ThreadedSlam::optimisePublishMarginalise(MultiFramePtr multiFrame,
-                                              const Eigen::Vector3d& gyroReading) {
+                                              const Eigen::Vector3d& gyroReading,
+                                              ImuMeasurementDeque frameImuMeasurements) {
   kinematics::Transformation T_WS;
   SpeedAndBias speedAndBiases;
   const size_t numCameras = parameters_.nCameraSystem.numCameras();
@@ -990,7 +1030,7 @@ void ThreadedSlam::optimisePublishMarginalise(MultiFramePtr multiFrame,
   state.b_a = speedAndBiases.tail<3>();
   state.omega_S = gyroReading - speedAndBiases.segment<3>(3);
   state.timestamp = multiFrame->timestamp();
-  state.previousImuMeasurements = imuMeasurementsByFrame_.at(id);
+  state.previousImuMeasurements = frameImuMeasurements;
   state.isKeyframe = estimator_.isKeyframe(id);
   state.isOnlineExtrinsics = parameters_.camera.online_calibration.do_extrinsics;
   if (state.isOnlineExtrinsics && depthCamera_) {
@@ -1059,15 +1099,9 @@ void ThreadedSlam::optimisePublishMarginalise(MultiFramePtr multiFrame,
       SpeedAndBias speedAndBias = estimator_.speedAndBias(id);
       Time timestamp = estimator_.timestamp(id);
       const bool isKeyframe = estimator_.isKeyframe(id);
-      ImuMeasurementDeque imuMeasurements = imuMeasurementsByFrame_.at(id);
-      Eigen::Vector3d omega_S(0.0, 0.0, 0.0); // get this for real now:
-      for(auto riter = imuMeasurements.rbegin(); riter!=imuMeasurements.rend(); ++riter) {
-        if(riter->timeStamp < timestamp) {
-          omega_S = riter->measurement.gyroscopes - speedAndBias.segment<3>(3);
-          break;
-        }
-      }
-
+      const bool isCurrentState = id == state.id;
+      ImuMeasurementDeque imuMeasurements = isCurrentState ? frameImuMeasurements : ImuMeasurementDeque{};
+      const Eigen::Vector3d omega_S = isCurrentState ? state.omega_S : Eigen::Vector3d::Zero();
       std::set<StateId> observedIds;
       estimator_.getObservedIds(id, observedIds);
       AlignedVector<Eigen::Vector3d> gpsPoints;
@@ -1084,14 +1118,9 @@ void ThreadedSlam::optimisePublishMarginalise(MultiFramePtr multiFrame,
       kinematics::Transformation T_WS = estimator_.pose(id);
       SpeedAndBias speedAndBias = estimator_.speedAndBias(id);
       Time timestamp = estimator_.timestamp(id);
-      ImuMeasurementDeque imuMeasurements = imuMeasurementsByFrame_.at(id);
-      Eigen::Vector3d omega_S(0.0, 0.0, 0.0); // get this for real now:
-      for (auto riter = imuMeasurements.rbegin(); riter != imuMeasurements.rend(); ++riter) {
-        if (riter->timeStamp < timestamp) {
-          omega_S = riter->measurement.gyroscopes - speedAndBias.segment<3>(3);
-          break;
-        }
-      }
+      const bool isCurrentState = id == state.id;
+      ImuMeasurementDeque imuMeasurements = isCurrentState ? frameImuMeasurements : ImuMeasurementDeque{};
+      const Eigen::Vector3d omega_S = isCurrentState ? state.omega_S : Eigen::Vector3d::Zero();
       std::set<StateId> observedIds;
       estimator_.getObservedIds(id, observedIds);
       AlignedVector<Eigen::Vector3d> gpsPoints;
@@ -1125,14 +1154,14 @@ void ThreadedSlam::optimisePublishMarginalise(MultiFramePtr multiFrame,
                      latestObservedFrameId.getFrameId()));
     }
 
-    // now publish in separate thread. queue size 3 to ensure nothing ever lost.
-    if(blocking_){
-      // in blocked processing, we also want to be able to block the okvis-estimator from outside
-      publicationQueue_.PushBlockingIfFull(publicationData,1);
-    }
-    else{
-      const bool overrun = publicationQueue_.PushNonBlockingDroppingIfFull(publicationData,3);
-      if(overrun) {
+    publicationPending_.fetch_add(1);
+    if (blocking_ || parameters_.estimator.memory_bounded) {
+      if (!publicationQueue_.PushBlockingIfFull(publicationData, blocking_ ? 1 : 3))
+        publicationPending_.fetch_sub(1);
+    } else {
+      const bool overrun = publicationQueue_.PushNonBlockingDroppingIfFull(publicationData, 3);
+      if (overrun) {
+        publicationPending_.fetch_sub(1); // account for the replaced queued update.
         LOG(ERROR) << "publication (full update) overrun: dropping";
       }
     }
@@ -1270,6 +1299,7 @@ void ThreadedSlam::publishingLoop()
         optimisedGraphCallback_(publicationData.state, publicationData.trackingState,
                                 publicationData.updatedStates, publicationData.landmarksPublish);
       }
+      publicationPending_.fetch_sub(1);
     } else {
       return;
     }
@@ -1315,6 +1345,8 @@ void ThreadedSlam::stopThreading() {
     std::this_thread::sleep_for(std::chrono::milliseconds(1));
   }
 
+  flushPendingUpdates();
+
   // stop CNN stuff
   frontend_.endCnnThreads();
 
@@ -1334,10 +1366,19 @@ void ThreadedSlam::stopThreading() {
   publicationQueue_.Shutdown();
   lastOptimisedQueue_.Shutdown();
 
-  // force background optimisation to finish
-  if(fullGraphOptimisationThread_.joinable()) {
+  // Force background optimisation to finish, including final mapping factors.
+  if(fullGraphOptimisationThread_.joinable() || hasAlignmentUpdates_) {
     LOG(INFO) << "wait for background optimisation to finish...";
-    fullGraphOptimisationThread_.join();
+    if (fullGraphOptimisationThread_.joinable()) fullGraphOptimisationThread_.join();
+    std::vector<StateId> precedingFinalSync;
+    if (hasAlignmentUpdates_ && estimator_.numFrames() > 0) {
+      if (estimator_.isLoopClosureAvailable())
+        estimator_.synchroniseRealtimeAndFullGraph(precedingFinalSync);
+      LOG(INFO) << "Optimising final sparse graph with remaining submap constraints";
+      estimator_.optimiseFullGraph(parameters_.estimator.full_graph_iterations,
+          posegraphOptimisationSummary_, parameters_.estimator.full_graph_num_threads, false);
+      hasAlignmentUpdates_ = false;
+    }
     // import pose graph optimisation
     if (estimator_.isLoopClosureAvailable()) {
       OKVIS_ASSERT_TRUE(Exception,
@@ -1347,6 +1388,9 @@ void ThreadedSlam::stopThreading() {
       TimerSwitchable synchronisationTimer("5 Import full optimisation");
       std::vector<StateId> updatedStates;
       estimator_.synchroniseRealtimeAndFullGraph(updatedStates);
+      updatedStates.insert(updatedStates.end(), precedingFinalSync.begin(), precedingFinalSync.end());
+      std::sort(updatedStates.begin(), updatedStates.end());
+      updatedStates.erase(std::unique(updatedStates.begin(), updatedStates.end()), updatedStates.end());
       synchronisationTimer.stop();
 
       // prepare publishing
@@ -1361,7 +1405,6 @@ void ThreadedSlam::stopThreading() {
       state.b_a = speedAndBiases.tail<3>();
       state.omega_S.setZero(); // FIXME: use actual value
       state.timestamp = estimator_.timestamp(currentId);
-      state.previousImuMeasurements = imuMeasurementsByFrame_.at(currentId);
       state.isKeyframe = estimator_.isKeyframe(currentId);
       TrackingState trackingState;
       trackingState.id = currentId;
@@ -1389,14 +1432,8 @@ void ThreadedSlam::stopThreading() {
           kinematics::Transformation T_WS = estimator_.pose(id);
           SpeedAndBias speedAndBias = estimator_.speedAndBias(id);
           Time timestamp = estimator_.timestamp(id);
-          ImuMeasurementDeque imuMeasurements = imuMeasurementsByFrame_.at(id);
-          Eigen::Vector3d omega_S(0.0, 0.0, 0.0); // get this for real now:
-          for (auto riter = imuMeasurements.rbegin(); riter != imuMeasurements.rend(); ++riter) {
-            if (riter->timeStamp < timestamp) {
-              omega_S = riter->measurement.gyroscopes - speedAndBias.segment<3>(3);
-              break;
-            }
-          }
+          ImuMeasurementDeque imuMeasurements;
+          const Eigen::Vector3d omega_S = Eigen::Vector3d::Zero();
           std::set<StateId> observedIds;
           estimator_.getObservedIds(id, observedIds);
           (*publicationData.updatedStates)[id] =
@@ -1411,14 +1448,8 @@ void ThreadedSlam::stopThreading() {
           kinematics::Transformation T_WS = estimator_.pose(id);
           SpeedAndBias speedAndBias = estimator_.speedAndBias(id);
           Time timestamp = estimator_.timestamp(id);
-          ImuMeasurementDeque imuMeasurements = imuMeasurementsByFrame_.at(id);
-          Eigen::Vector3d omega_S(0.0, 0.0, 0.0); // get this for real now:
-          for (auto riter = imuMeasurements.rbegin(); riter != imuMeasurements.rend(); ++riter) {
-            if (riter->timeStamp < timestamp) {
-              omega_S = riter->measurement.gyroscopes - speedAndBias.segment<3>(3);
-              break;
-            }
-          }
+          ImuMeasurementDeque imuMeasurements;
+          const Eigen::Vector3d omega_S = Eigen::Vector3d::Zero();
           std::set<StateId> observedIds;
           estimator_.getObservedIds(id, observedIds);
           (*publicationData.updatedStates)[id]
@@ -1486,35 +1517,16 @@ void ThreadedSlam::writeGlobalTrajectoryCsv(const std::string& csvFileName)
 
 void ThreadedSlam::doFinalBa()
 {
-  // Check if there are still alignment factors to be added.
-  // Map to Map Alignment Factors are added here...
-  AlignmentTerm alignmentTerm;
-  while(!submapAlignmentFactorsReceived_.Empty())
-  {
-
-    submapAlignmentFactorsReceived_.PopNonBlocking(&alignmentTerm);
-    LOG(WARNING) << "Remaining Map-to-Map Contstraints are added between " << alignmentTerm.frame_A_id << " and " << alignmentTerm.frame_B_id;
-    // add submap alignment constraints between map keyframes A and B
-    if (parameters_.lidar) {
-      estimator_.addSubmapAlignmentConstraints(alignmentTerm.submap_A_ptr, alignmentTerm.frame_A_id,
-        alignmentTerm.frame_B_id, alignmentTerm.pointCloud_B,
-        alignmentTerm.sensorError, true, "Tukey", alignmentTerm.planeMapA,
-                                               submapConfig_.usePointToPlaneFactors);
-    }
-    else {
-      estimator_.addSubmapAlignmentConstraints(alignmentTerm.submap_A_ptr, alignmentTerm.frame_A_id,
-        alignmentTerm.frame_B_id, alignmentTerm.pointCloud_B,
-        alignmentTerm.sensorError, false, "Tukey");
-    }
-
-    // Set reference submap for live constraints to recently finished submap
-    previousSubmap_ = alignmentTerm.submap_B_ptr;
-    previousPlaneMap_ = alignmentTerm.planeMapB;
-    previousSubmapId_ = alignmentTerm.frame_B_id;
-  }
+  processPendingSubmapAlignments();
 
   // thread safety -- join running stuff
   stopThreading();
+
+  if (parameters_.estimator.memory_bounded) {
+    LOG(INFO) << "Skipping final full-history bundle adjustment in bounded-memory mode; "
+                 "the corrected sparse graph and full trajectory remain available.";
+    return;
+  }
 
   // now call it
   const int numThreads = parameters_.estimator.realtime_num_threads
@@ -1543,7 +1555,6 @@ void ThreadedSlam::doFinalBa()
   state.b_a = speedAndBiases.tail<3>();
   state.omega_S.setZero(); // FIXME: use actual value
   state.timestamp = estimator_.timestamp(currentId);
-  state.previousImuMeasurements = imuMeasurementsByFrame_.at(currentId);
   state.isKeyframe = estimator_.isKeyframe(currentId);
   TrackingState trackingState;
   trackingState.id = currentId;
@@ -1572,14 +1583,8 @@ void ThreadedSlam::doFinalBa()
       kinematics::Transformation T_WS = estimator_.pose(id);
       SpeedAndBias speedAndBias = estimator_.speedAndBias(id);
       Time timestamp = estimator_.timestamp(id);
-      ImuMeasurementDeque imuMeasurements = imuMeasurementsByFrame_.at(id);
-      Eigen::Vector3d omega_S(0.0, 0.0, 0.0); // get this for real now:
-      for(auto riter = imuMeasurements.rbegin(); riter!=imuMeasurements.rend(); ++riter) {
-        if(riter->timeStamp < timestamp) {
-          omega_S = riter->measurement.gyroscopes - speedAndBias.segment<3>(3);
-          break;
-        }
-      }
+      ImuMeasurementDeque imuMeasurements;
+      const Eigen::Vector3d omega_S = Eigen::Vector3d::Zero();
       std::set<StateId> observedIds;
       estimator_.getObservedIds(id, observedIds);
       (*publicationData.updatedStates)[id] =
@@ -1594,14 +1599,8 @@ void ThreadedSlam::doFinalBa()
       kinematics::Transformation T_WS = estimator_.pose(id);
       SpeedAndBias speedAndBias = estimator_.speedAndBias(id);
       Time timestamp = estimator_.timestamp(id);
-      ImuMeasurementDeque imuMeasurements = imuMeasurementsByFrame_.at(id);
-      Eigen::Vector3d omega_S(0.0, 0.0, 0.0); // get this for real now:
-      for (auto riter = imuMeasurements.rbegin(); riter != imuMeasurements.rend(); ++riter) {
-        if (riter->timeStamp < timestamp) {
-          omega_S = riter->measurement.gyroscopes - speedAndBias.segment<3>(3);
-          break;
-        }
-      }
+      ImuMeasurementDeque imuMeasurements;
+      const Eigen::Vector3d omega_S = Eigen::Vector3d::Zero();
       std::set<StateId> observedIds;
       estimator_.getObservedIds(id, observedIds);
       (*publicationData.updatedStates)[id]

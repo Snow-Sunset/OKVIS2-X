@@ -51,12 +51,12 @@ namespace okvis{
     }
 
     void VoxelHashMap::RemovePointsFarFromLocation(const Eigen::Vector3d &origin) {
-      for (const auto &[voxel, voxel_block] : map_) {
-        const auto &pt = voxel_block.points.front();
+      for (auto it = map_.begin(); it != map_.end();) {
+        const auto &pt = it->second.points.front();
         const auto max_distance2 = max_distance_ * max_distance_;
         if ((pt - origin).squaredNorm() > (max_distance2)) {
-          map_.erase(voxel);
-        }
+          it = map_.erase(it);
+        } else ++it;
       }
     }
 

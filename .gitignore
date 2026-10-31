@@ -5,3 +5,5 @@
 *.png
 *.asv
 /documentation
+# Persistent runtime history; contains map chunks and cold keyframe payloads.
+/okvis-history/

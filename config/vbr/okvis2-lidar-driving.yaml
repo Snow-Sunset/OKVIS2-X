@@ -63,8 +63,21 @@ imu_parameters:
 frontend_parameters: {detection_threshold: 50.0, absolute_threshold: 5.0, matching_threshold: 60.0,
   octaves: 0, max_num_keypoints: 1000, keyframe_overlap: 0.6, use_cnn: false, parallelise_detection: true,
   num_matching_threads: 4}
-estimator_parameters: {num_keyframes: 5, num_loop_closure_frames: 3, num_imu_frames: 3,
-  do_loop_closures: true, do_final_ba: true, enforce_realtime: false, realtime_min_iterations: 3,
-  realtime_max_iterations: 10, realtime_time_limit: 0.035, realtime_num_threads: 3,
-  full_graph_iterations: 15, full_graph_num_threads: 3, p_dbow: 0.55, drift_percentage_heuristic: 10.0}
+estimator_parameters:
+  # Cold images are released; loop-closure features stay in RAM. No history disk archive.
+  memory_bounded: true
+  num_keyframes: 5
+  num_loop_closure_frames: 3
+  num_imu_frames: 3
+  do_loop_closures: true
+  do_final_ba: true
+  enforce_realtime: false
+  realtime_min_iterations: 3
+  realtime_max_iterations: 10
+  realtime_time_limit: 0.035
+  realtime_num_threads: 3
+  full_graph_iterations: 15
+  full_graph_num_threads: 3
+  p_dbow: 0.55
+  drift_percentage_heuristic: 10.0
 output_parameters: {display_topview: true, display_matches: false, display_overhead: false, enable_submapping: true}

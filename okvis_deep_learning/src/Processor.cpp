@@ -10,6 +10,8 @@
  * SPDX-License-Identifier: BSD-3-Clause, see LICENESE file for details
  */
 
+#include <chrono>
+#include <thread>
 #include <okvis/Processor.hpp>
 #include <okvis/DepthFusionProcessor.hpp>
 
@@ -85,9 +87,15 @@ void Processor::collectInfo() {
 }
 
 void Processor::finish() {
-  slam_.stopThreading();
-  while(!se_interface_.finishedIntegrating());
+  while (slam_.processFrame()) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  slam_.flushPendingUpdates();
+  while (!se_interface_.finishedIntegrating()) {
+    slam_.processPendingSubmapAlignments();
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+  slam_.processPendingSubmapAlignments();
   se_interface_.setFinished();
+  slam_.stopThreading();
 }
 
 void Processor::setBlocking(bool blocking) {

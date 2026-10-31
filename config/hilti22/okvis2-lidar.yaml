@@ -123,6 +123,8 @@ frontend_parameters:
 
 # estimator parameters
 estimator_parameters:
+  # Cold images are released; loop-closure features stay in RAM. No history disk archive.
+  memory_bounded: true
   num_keyframes: 5 # number of keyframes in optimisation window
   num_loop_closure_frames: 5 # number of loop closure frames in optimisation window
   num_imu_frames: 3 # number of frames linked by most recent nonlinear IMU error terms

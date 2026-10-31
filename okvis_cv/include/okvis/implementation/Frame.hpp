@@ -37,6 +37,7 @@ Frame::Frame(const cv::Mat & image,
              std::shared_ptr<cv::DescriptorExtractor> & extractor,
              std::shared_ptr<Network> & network)
     : image_(image),
+      imageSize_(image.size()),
       cameraGeometry_(cameraGeometry),
       detector_(detector),
       extractor_(extractor),
@@ -48,13 +49,18 @@ Frame::Frame(const cv::Mat & image,
 // set the frame image;
 void Frame::setImage(const cv::Mat & image)
 {
+  ensurePayload();
+  payloadDirty_ = true;
   //cv::medianBlur(image,image_,3);
   image_ = image;
+  imageSize_ = image.size();
 }
 
 // set the frame image;
 void Frame::setDepthImage(const cv::Mat & depthImage)
 {
+  ensurePayload();
+  payloadDirty_ = true;
   depthImage_ = depthImage;
 }
 
@@ -85,12 +91,14 @@ void Frame::setNetwork(std::shared_ptr<Network> network) {
 // obtain the image
 const cv::Mat & Frame::image() const
 {
+  ensurePayload();
   return image_;
 }
 
 // obtain the depth image
 const cv::Mat & Frame::depthImage() const
 {
+  ensurePayload();
   return depthImage_;
 }
 
@@ -119,6 +127,8 @@ std::shared_ptr<const GEOMETRY_T> Frame::geometryAs() const
 ///        returns the number of detected points.
 int Frame::detect()
 {
+  ensurePayload();
+  payloadDirty_ = true;
   // make sure things are set to zero for safety
   keypoints_.clear();
   descriptors_.resize(0);
@@ -139,6 +149,8 @@ int Frame::detect()
 ///        returns the number of detected points.
 int Frame::describe()
 {
+  ensurePayload();
+  payloadDirty_ = true;
   // check initialisation
   OKVIS_ASSERT_TRUE_DBG(Exception, extractor_ != nullptr,
                         "Detector not initialised!")
@@ -156,6 +168,8 @@ int Frame::describe()
 
 // Compute the back projections. Caching them should speed up things like repeated
 int Frame::computeBackProjections() {
+  ensurePayload();
+  payloadDirty_ = true;
   backProjections_.resize(keypoints_.size());
   backProjectionsValid_.resize(keypoints_.size());
   int ctr=0;
@@ -174,6 +188,7 @@ int Frame::computeBackProjections() {
 
 // Get a specific back projection
 bool Frame::getBackProjection(size_t keypointIdx, Eigen::Vector3d& backProjection) const {
+  ensurePayload();
 #ifndef NDEBUG
   OKVIS_ASSERT_TRUE(
       Exception,
@@ -188,6 +203,7 @@ bool Frame::getBackProjection(size_t keypointIdx, Eigen::Vector3d& backProjectio
 }
 
 bool Frame::getClassification(size_t keypointIdx, cv::Mat & classification) const {
+  ensurePayload();
   if(!isClassified_) {
     return false; // not computed
   }
@@ -209,6 +225,7 @@ bool Frame::getClassification(size_t keypointIdx, cv::Mat & classification) cons
 // access a specific keypoint in OpenCV format
 bool Frame::getCvKeypoint(size_t keypointIdx, cv::KeyPoint & keypoint) const
 {
+  ensurePayload();
 #ifndef NDEBUG
   OKVIS_ASSERT_TRUE(
       Exception,
@@ -225,6 +242,7 @@ bool Frame::getCvKeypoint(size_t keypointIdx, cv::KeyPoint & keypoint) const
 // get a specific keypoint
 bool Frame::getKeypoint(size_t keypointIdx, Eigen::Vector2d & keypoint) const
 {
+  ensurePayload();
 #ifndef NDEBUG
   OKVIS_ASSERT_TRUE(
       Exception,
@@ -242,6 +260,7 @@ bool Frame::getKeypoint(size_t keypointIdx, Eigen::Vector2d & keypoint) const
 // get the size of a specific keypoint
 bool Frame::getKeypointSize(size_t keypointIdx, double & keypointSize) const
 {
+  ensurePayload();
 #ifndef NDEBUG
   OKVIS_ASSERT_TRUE(
       Exception,
@@ -259,6 +278,7 @@ bool Frame::getKeypointSize(size_t keypointIdx, double & keypointSize) const
 ///        returns nullptr if out of bounds.
 const unsigned char * Frame::keypointDescriptor(size_t keypointIdx) const
 {
+  ensurePayload();
 #ifndef NDEBUG
   OKVIS_ASSERT_TRUE(
       Exception,
@@ -273,6 +293,8 @@ const unsigned char * Frame::keypointDescriptor(size_t keypointIdx) const
 // Set the landmark ID
 bool Frame::setLandmarkId(size_t keypointIdx, uint64_t landmarkId)
 {
+  ensurePayload();
+  payloadDirty_ = true;
 #ifndef NDEBUG
   OKVIS_ASSERT_TRUE(
       Exception,
@@ -290,6 +312,8 @@ bool Frame::setLandmarkId(size_t keypointIdx, uint64_t landmarkId)
 // Set the landmark
 bool Frame::setLandmark(size_t keypointIdx, const Eigen::Vector4d & landmark, bool isInitialised)
 {
+  ensurePayload();
+  payloadDirty_ = true;
 #ifndef NDEBUG
   OKVIS_ASSERT_TRUE(
       Exception,
@@ -308,6 +332,7 @@ bool Frame::setLandmark(size_t keypointIdx, const Eigen::Vector4d & landmark, bo
 // Access the landmark ID
 uint64_t Frame::landmarkId(size_t keypointIdx) const
 {
+  ensurePayload();
 #ifndef NDEBUG
   OKVIS_ASSERT_TRUE(
       Exception,
@@ -322,6 +347,7 @@ uint64_t Frame::landmarkId(size_t keypointIdx) const
 // Access the landmark
 bool Frame::getLandmark(size_t keypointIdx, Eigen::Vector4d & landmark, bool & isInitialised) const
 {
+  ensurePayload();
 #ifndef NDEBUG
   OKVIS_ASSERT_TRUE(
       Exception,
@@ -339,6 +365,8 @@ bool Frame::getLandmark(size_t keypointIdx, Eigen::Vector4d & landmark, bool & i
 
 // provide keypoints externally
 inline bool Frame::resetKeypoints(const std::vector<cv::KeyPoint> & keypoints) {
+  ensurePayload();
+  payloadDirty_ = true;
   keypoints_ = keypoints;
 
   // resizing
@@ -352,12 +380,14 @@ inline bool Frame::resetKeypoints(const std::vector<cv::KeyPoint> & keypoints) {
 
 // provide descriptors externally
 inline bool Frame::resetDescriptors(const cv::Mat & descriptors) {
+  ensurePayload();
+  payloadDirty_ = true;
   descriptors_ = descriptors;
   return true;
 }
 
 size_t Frame::numKeypoints() const {
-  return keypoints_.size();
+  return payloadResident_ ? keypoints_.size() : archivedNumKeypoints_;
 }
 
 }  // namespace okvis

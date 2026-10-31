@@ -30,6 +30,7 @@
 #include <Eigen/Dense>
 #include <vector>
 #include <fstream>
+#include <filesystem>
 #include <iostream>
 #include <string>
 
@@ -1468,6 +1469,63 @@ void ViGraph::getLandmarkHessian(LandmarkId lmId, Eigen::Matrix3d& H) {
   }
 }
 
+void ViGraph::configureObservationArchive(const std::string& directory)
+{
+  if (directory.empty()) throw std::invalid_argument("Pose-graph observation archive directory is empty");
+  std::filesystem::create_directories(directory);
+  observationArchiveDirectory_ = std::filesystem::absolute(directory).string();
+}
+
+void ViGraph::archiveTwoPoseObservations(StateId stateId)
+{
+  if (observationArchiveDirectory_.empty()) return;
+  const auto state = states_.find(stateId);
+  if (state == states_.end()) return;
+  for (const auto& link : state->second.twoPoseLinks) {
+    auto& error = *link.second.errorTerm;
+    if (!error.observationsResident()) continue;
+    std::string path = error.observationArchivePath();
+    if (path.empty()) path = observationArchiveDirectory_ + "/" +
+        std::to_string(error.referencePoseId().value()) + "_" +
+        std::to_string(error.otherPoseId().value()) + "_" +
+        std::to_string(++observationArchiveSequence_) + ".two_pose";
+    error.archiveObservations(path);
+  }
+}
+
+void ViGraph::removeSubmapAlignmentConstraints(StateId stateId)
+{
+  auto state = states_.find(stateId);
+  if (state == states_.end()) return;
+  // Copy links to keep error terms alive until Ceres no longer references them.
+  auto factors = state->second.submapReferenceLinks;
+  factors.insert(factors.end(), state->second.submapLinks.begin(), state->second.submapLinks.end());
+  if (factors.empty()) return;
+  std::set<::ceres::ResidualBlockId> removed;
+  for (const auto& factor : factors) {
+    const auto rid = factor.residualBlockId;
+    const auto first = states_.find(factor.state0), second = states_.find(factor.state1);
+    // Removing either pose implicitly removes the residual in Ceres. Avoid passing an already
+    // removed handle, without scanning the entire historical graph for every IMU-frame eviction.
+    const bool live = first != states_.end() && second != states_.end() &&
+        problem_->HasParameterBlock(first->second.pose->parameters()) &&
+        problem_->HasParameterBlock(second->second.pose->parameters());
+    if (live && removed.insert(rid).second) problem_->RemoveResidualBlock(rid);
+    for (const StateId endpoint : {factor.state0, factor.state1}) {
+      const auto other = states_.find(endpoint);
+      if (other == states_.end()) continue;
+      auto& value = other->second;
+      const auto eraseFactor = [rid](auto& links) {
+        links.erase(std::remove_if(links.begin(), links.end(),
+            [rid](const auto& link) { return link.residualBlockId == rid; }), links.end());
+      };
+      eraseFactor(value.submapReferenceLinks);
+      eraseFactor(value.submapLinks);
+      value.mapResIds.erase(std::remove(value.mapResIds.begin(), value.mapResIds.end(), rid), value.mapResIds.end());
+    }
+  }
+}
+
 bool ViGraph::addSubmapAlignmentConstraints(const SupereightMapType* submap_ptr,
                                             const uint64_t &frame_A_id, const uint64_t frame_B_id,
                                             std::vector<Eigen::Vector3f, Eigen::aligned_allocator<Eigen::Vector3f>>& pointCloud,
@@ -1513,6 +1571,8 @@ bool ViGraph::addSubmapAlignmentConstraints(const SupereightMapType* submap_ptr,
 
   for(uint64_t i = 0; i < pointCloud.size(); i++){
     SubmapAlignmentFactor newSubmapAlignmentFactor;
+    newSubmapAlignmentFactor.state0 = StateId(frame_A_id);
+    newSubmapAlignmentFactor.state1 = StateId(frame_B_id);
     Eigen::Vector3f pt = pointCloud.at(i);
     float sigma_i = sensorError.at(i);
     if (pointToPlane) {

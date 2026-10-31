@@ -47,3 +47,9 @@ install(TARGETS ${LIB_NAME} EXPORT okvisTargets
   LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
 )
 install(DIRECTORY include/okvis DESTINATION ${CMAKE_INSTALL_INCLUDEDIR} FILES_MATCHING PATTERN "*.hpp")
+
+if(BUILD_TESTS OR BUILD_POINT_TO_PLANE_TESTS)
+  add_executable(okvis_trajectory_rolling_imu_test test/TestTrajectoryRollingImu.cpp)
+  target_link_libraries(okvis_trajectory_rolling_imu_test PRIVATE okvis::Common)
+  add_test(NAME okvis_trajectory_rolling_imu COMMAND okvis_trajectory_rolling_imu_test)
+endif()

@@ -8,6 +8,7 @@
 #include <array>
 #include <cstdint>
 #include <memory>
+#include <string>
 #include <unordered_map>
 #include <vector>
 
@@ -27,6 +28,8 @@ class PlaneMap {
     double sigmaGate = 3.0;
     size_t minPoints = 6;
     size_t maxPoints = 100;
+    bool freezeStableCells = false; ///< release samples after maxPoints on a valid plane
+    size_t maxCells = 0; ///< active local working set; zero is unlimited
   };
   struct Plane {
     EIGEN_MAKE_ALIGNED_OPERATOR_NEW
@@ -43,6 +46,16 @@ class PlaneMap {
   bool match(const Eigen::Vector3d& point, double sensorSigma,
              Plane& plane, double& residualSigma) const;
   size_t numPlanes() const;
+  size_t numCells() const { return cells_.size(); }
+  size_t residentBytes() const;
+  /// Move the active local window; distant cells are intentionally forgotten.
+  void setWindow(const Eigen::Vector3d& center, double halfExtent);
+  /// Completed maps retain fitted parameters only and become immutable.
+  void finalize();
+  bool finalized() const { return finalized_; }
+  void save(const std::string& filename) const;
+  static std::shared_ptr<PlaneMap> load(const std::string& filename, const Config& config,
+                                       size_t maxBytes);
   const Eigen::AlignedBox3d& bounds() const { return bounds_; }
 
  private:
@@ -55,12 +68,22 @@ class PlaneMap {
     Points points;
     Plane plane;
     uint64_t seenPoints = 0;
+    bool frozen = false;
   };
   Key key(const Eigen::Vector3d& point) const;
   void fit(Cell& cell);
+  bool pruneWindow(const Eigen::Vector3d& center, double halfExtent);
+  void recomputeBounds();
   Config config_;
   Eigen::AlignedBox3d bounds_;
   std::unordered_map<Key, Cell, Hash> cells_;
+  Eigen::Vector3d windowCenter_ = Eigen::Vector3d::Zero();
+  Eigen::Vector3d lastWindowPruneCenter_ = Eigen::Vector3d::Zero();
+  double windowHalfExtent_ = 0.0;
+  double lastWindowPruneHalfExtent_ = 0.0;
+  bool windowPruneInitialized_ = false;
+  bool finalized_ = false;
+  size_t sampleCapacityBytes_ = 0;
 };
 
 using PlaneMapPtr = std::shared_ptr<const PlaneMap>;

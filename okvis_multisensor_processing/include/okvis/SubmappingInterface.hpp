@@ -14,8 +14,11 @@
 #define INCLUDE_OKVIS_SUBMAPPINGINTERFACE_HPP
 
 #include <okvis/LidarPointCloudMap.hpp>
+#include <okvis/LidarMeasurementBuffer.hpp>
+#include <algorithm>
 #include <chrono>
 #include <condition_variable>
+#include <filesystem>
 #include <okvis/ThreadedSlam.hpp>
 #include <okvis/VoxelGridFilter.hpp>
 #include <okvis/SubmappingUtils.hpp>
@@ -97,6 +100,7 @@ namespace okvis {
         uint64_t keyFrameId; // id of current Supereight Map
         siFrameDataMap frameData_;
         bool loop_closure;
+        bool useCurrentActiveSubmap = false; ///< delayed input, not a new keyframe request
         unsigned int stateCounter_;
         RayVector vecRayMeasurements;
         std::vector<okvis::AlignedMap<size_t, std::vector<std::pair<Eigen::Isometry3f, CameraMeasurement>>>> vecDepthFrames;
@@ -139,6 +143,8 @@ namespace okvis {
         std::vector<Eigen::Vector3f, Eigen::aligned_allocator<Eigen::Vector3f>> pointCloud_B; ///< Point cloud with points in keyframe B that are aligned to submap in frame A
         std::vector<float> sigma_B; /// 1-sigma of depth measurement of pointCloud_B
         VoxelHashMap voxelHashMap;
+        Eigen::Vector3d windowCenter = Eigen::Vector3d::Zero();
+        bool windowPruneInitialized = false;
 
         SubmapAlignmentTerm() : frame_A_id(0), frame_B_id(0), voxelHashMap(0.06, 0.0, 1)
         {
@@ -205,6 +211,7 @@ namespace okvis {
 
           blocking_ = false;
           if (parameters.lidar) submapConfig_.validateLidarMapping();
+          initializeMemoryStorage();
           
           //Quite a hacky way of doing this. Problem is that as the variable the pointers point at run afterwards 
           //in a different thread, they are getting deleted once we get out of scope. If anyone has got a better approach/proposal
@@ -252,7 +259,6 @@ namespace okvis {
               }
               
             }
-
           }
 
           if(camInMapping && parameters.lidar) {
@@ -268,14 +274,25 @@ namespace okvis {
             lidarSensors_ = std::pair<okvis::kinematics::Transformation, se::Lidar>(std::make_pair((*parameters.lidar).T_SL,
                                                                                                          se::Lidar(lidarConfig)));
           }
-          trajectoryLocked_ = false;
 
           if (parameters.lidar && submapConfig_.buildLidarPointCloudMap) {
             if (!std::isfinite(submapConfig_.pointCloudMapPublishInterval)
                 || submapConfig_.pointCloudMapPublishInterval < 0.0) {
               throw std::invalid_argument("pointcloud_map_publish_interval must be finite and nonnegative");
             }
-            pointCloudMap_ = std::make_unique<LidarPointCloudMap>(submapConfig_.pointCloudMapVoxelSize);
+            if (submapConfig_.memoryBounded && submapConfig_.pointCloudPersistentChunks) {
+              LidarPointCloudMap::ArchiveOptions archive;
+              archive.directory = (std::filesystem::path(memoryArchiveDirectory_) / "cloud").string();
+              archive.memoryBudgetBytes = submapConfig_.pointCloudMemoryMb * 1024 * 1024;
+              pointCloudMap_ = std::make_unique<LidarPointCloudMap>(submapConfig_.pointCloudMapVoxelSize, archive);
+            } else if (submapConfig_.memoryBounded) {
+              pointCloudMap_ = std::make_unique<LidarPointCloudMap>(
+                  submapConfig_.pointCloudMapVoxelSize,
+                  submapConfig_.pointCloudMemoryMb * 1024 * 1024);
+            } else {
+              pointCloudMap_ = std::make_unique<LidarPointCloudMap>(submapConfig_.pointCloudMapVoxelSize);
+            }
+
           }
 
           // Initialize Object Map
@@ -295,7 +312,8 @@ namespace okvis {
           }
           // Shutdown all the Queues.
           depthMeasurements_.Shutdown();
-          lidarMeasurements_.Shutdown();
+          try { lidarMeasurements_.Shutdown(); }
+          catch (const std::exception& error) { LOG(ERROR) << "LiDAR spool flush failed: " << error.what(); }
           stateUpdates_.Shutdown();
           supereightFrames_.Shutdown();
           submapVisQueue_.Shutdown();
@@ -313,6 +331,8 @@ namespace okvis {
 
           LOG(INFO) << "Finished submap integration thread";
           stopPointCloudPublisher();
+          try { flushMemoryStorage(); }
+          catch (const std::exception& error) { LOG(ERROR) << "Final LiDAR archive flush failed: " << error.what(); }
 
         };
 
@@ -321,7 +341,8 @@ namespace okvis {
          * @param[in] stamp     The timestamp.
          * @param[in] ray       The lidar measurement
          *
-         * @return    True if successful.
+         * @return    True if handled. A full bounded RAM queue intentionally
+         *            discards the incoming ray without blocking other sensors.
          */
         bool addLidarMeasurement(const okvis::Time &stamp, const Eigen::Vector3d &ray);
 
@@ -399,6 +420,12 @@ namespace okvis {
         LidarPointCloudMap::Points lidarPointCloudMap() const;
         void publishLidarPointCloudMap(bool force = false);
         bool saveLidarPointCloudMap(const std::string& filename) const;
+        size_t planeResidentBytes() const;
+        size_t cloudResidentBytes() const {
+          std::lock_guard lock(pointCloudMapMutex_);
+          return pointCloudMap_ ? pointCloudMap_->residentBytes() : 0;
+        }
+        const std::string& memoryArchiveDirectory() const { return memoryArchiveDirectory_; }
 
         /**
          * @brief       Checks if required data (LiDAR measurements + OKVIS estimates) is available and prepares for
@@ -501,8 +528,12 @@ namespace okvis {
         */
         void setFinished(){
             publishLidarPointCloudMap(true);
-            std::lock_guard<std::mutex> l(finishMutex_);
-            isFinished_ = true;
+            {
+              std::lock_guard<std::mutex> l(finishMutex_);
+              isFinished_ = true;
+            }
+            supereightFrames_.Shutdown();
+            flushMemoryStorage();
             const auto it = seSubmapLookup_.find(prevKeyframeId_);
             if (meshEnabled() && it != seSubmapLookup_.end() && it->second.map) {
               seMeshLookup_[prevKeyframeId_] = it->second.map->mesh();
@@ -771,7 +802,7 @@ namespace okvis {
         
         DepthFrameQueue
                 depthMeasurements_; ///< Queue with the buffered Depth measurements
-        LidarMeasurementQueue
+        LidarMeasurementBuffer
                 lidarMeasurements_; ///< Queue with buffered LiDAR Measurements
         StateUpdatesQueue
                 stateUpdates_; ///< Queue containing all the state updates from okvis
@@ -811,7 +842,15 @@ namespace okvis {
         // Need this to extract okvis estimates at abitrary timestamps
         okvis::Trajectory propagatedStates;
         std::vector<ImuMeasurement> imuMeasurements_; ///< Buffered IMU measurements (realtime pub.).
-        std::atomic_bool trajectoryLocked_; ///< Lock the trajectory object (realtime/update are async.).
+        std::mutex trajectoryMutex_;
+        std::mutex integrationInputMutex_;
+        bool finalTailReported_ = false;
+        bool preinitializationLidarReported_ = false;
+        bool lidarQueueOverflowReported_ = false;
+        Time lastTrajectoryUpdateTimestamp_;
+        size_t copyLidarAfterTrajectoryStart(
+            const Time& maxTime, size_t maxCount, LidarMeasurementBuffer::Batch* candidates);
+        bool enqueueLidarBacklog(uint64_t anchorId);
         realTimePublishingCallback realTimePublishCallback_;
         double odometryPublishingRate_ = 40.0; ///< Publishing rate for realtime propagation.
         okvis::Time lastTime_ = okvis::Time(0); ///< Keep track of last publishing (to maintain rate).
@@ -892,11 +931,21 @@ namespace okvis {
         PointCloudMapCallback pointCloudMapCallback_;
         std::chrono::steady_clock::time_point lastPointCloudPublish_;
         uint64_t publishedPointCloudRevision_ = std::numeric_limits<uint64_t>::max();
-        std::unordered_map<uint64_t, std::shared_ptr<PlaneMap>> planeMaps_;
-        PlaneMapPtr planeMap(uint64_t id) const {
-          const auto it = planeMaps_.find(id);
-          return it == planeMaps_.end() ? nullptr : it->second;
-        }
+        mutable std::unordered_map<uint64_t, std::shared_ptr<PlaneMap>> planeMaps_;
+        struct PlaneArchive {
+          std::string filename;
+          Eigen::AlignedBox3d bounds;
+        };
+        std::unordered_map<uint64_t, PlaneArchive> planeArchives_;
+        mutable std::unordered_map<uint64_t, uint64_t> planeAccess_;
+        mutable uint64_t planeAccessClock_ = 0;
+        std::string memoryArchiveDirectory_;
+        void initializeMemoryStorage();
+        void completePlaneMap(uint64_t id);
+        void flushMemoryStorage();
+        mutable std::mutex mappingDataMutex_;
+        void trimPlaneCache(uint64_t protectedId) const;
+        PlaneMapPtr planeMap(uint64_t id) const;
         IntegrationPublishCallback integrationPublishCallback_;
 
         kinematics::Transformation T_BS_;

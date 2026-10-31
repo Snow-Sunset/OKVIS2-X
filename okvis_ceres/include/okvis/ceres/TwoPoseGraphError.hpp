@@ -20,6 +20,9 @@
 #define INCLUDE_OKVIS_CERES_TWOPOSEGRAPHERROR_HPP_
 
 #include <vector>
+#include <mutex>
+#include <atomic>
+#include <string>
 
 #include <ceres/sized_cost_function.h>
 #include <ceres/loss_function.h>
@@ -107,6 +110,7 @@ class TwoPoseGraphError : public ErrorInterface {
   /// @param[out] observations The observations originally passed.
   /// @return The number of observations.
   int getObservations(std::vector<Observation> & observations) const {
+    const_cast<TwoPoseGraphError*>(this)->restoreObservations();
     for (const auto &obss : observations_) {
       for (const auto &obs : obss.second) {
         observations.push_back(obs);
@@ -114,6 +118,14 @@ class TwoPoseGraphError : public ErrorInterface {
     }
     return int(observations.size());
   }
+
+  /// Archive only recovery data after marginalisation; the online factor's small matrices stay resident.
+  /// Original pose/extrinsics and camera prototype objects remain shared so reactivation preserves IDs.
+  bool archiveObservations(const std::string& filename);
+  void restoreObservations();
+  bool observationsResident() const { return observationsResident_; }
+  size_t residentObservationBytes() const;
+  const std::string& observationArchivePath() const { return observationArchivePath_; }
 
   /// @brief This computes a relative pose error from the observations.
   /// @return True on success.
@@ -171,6 +183,12 @@ class TwoPoseGraphError : public ErrorInterface {
 
   size_t numCams_ = 0;  ///< The number of cameras on the rig.
   bool stayConst_ = true;  ///< If true, the reference and other state extrinsics are the same.
+
+  std::atomic_bool observationsResident_{true};
+  std::string observationArchivePath_;
+  std::mutex observationArchiveMutex_;
+  std::vector<std::shared_ptr<ReprojectionError2dBase>> observationPrototypes_;
+  std::vector<::ceres::LossFunction*> observationLossFunctions_;
 
   std::map<uint64_t, std::vector<Observation>> observations_; ///< Stores the added observations.
   AlignedMap<uint64_t, Eigen::Vector4d> landmarks_; ///< Landmarks in S0 coordinates.

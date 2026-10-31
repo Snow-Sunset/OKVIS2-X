@@ -70,7 +70,7 @@ struct Measurement {
 
   /// \brief Default constructor.
   Measurement()
-      : timeStamp(0.0) {
+      : timeStamp(0.0), sensorId(-1) {
   }
   /**
    * @brief Constructor

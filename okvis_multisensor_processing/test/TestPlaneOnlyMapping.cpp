@@ -98,6 +98,8 @@ void run(bool mapToMap) {
   check(mapping.seSubmapLookup_.size() == 2, "Bootstrap submap transition failed");
   const auto savedBounds = completed->bounds();
   check(mapping.lidarPointCloudMap().size() == 16, "Overlapping scans duplicated the cloud map");
+  check(publishedCloud.size() == 32,
+        "RViz publication merged retained points from overlapping submaps");
   std::vector<Eigen::Vector3f, Eigen::aligned_allocator<Eigen::Vector3f>> points;
   for (const auto& ray : second.vecRayMeasurements) points.push_back(ray.second);
   check(mapping.findMostOverlappingSubmap(points, 20, 20) == 10,
@@ -127,8 +129,9 @@ void run(bool mapToMap) {
     check(!submap.second.map, "Occupancy storage was allocated");
   }
   check(mapping.finishedIntegrating(), "Final mapping queue did not drain");
-  check(cloudCallbacks > 0 && publishedCloud.size() == 48,
-        "Unmatched points did not enter the accumulated cloud map");
+  if (cloudCallbacks == 0 || publishedCloud.size() != 64)
+    throw std::runtime_error("Unfiltered accumulated publication expected 64 retained points, got " +
+        std::to_string(publishedCloud.size()));
   auto updated = std::make_shared<okvis::AlignedMap<okvis::StateId, okvis::State>>();
   okvis::State corrected{};
   corrected.id = okvis::StateId(10);

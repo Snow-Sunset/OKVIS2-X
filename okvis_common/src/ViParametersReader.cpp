@@ -315,6 +315,9 @@ void ViParametersReader::readConfigFile(const std::string& filename) {
              viParameters_.frontend.num_matching_threads);
 
   // Parameters regarding the estimator.
+  const auto estimatorNode = file["estimator_parameters"];
+  if (!estimatorNode["memory_bounded"].empty())
+    parseEntry(estimatorNode, "memory_bounded", viParameters_.estimator.memory_bounded);
   parseEntry(file["estimator_parameters"], "num_keyframes",
              viParameters_.estimator.num_keyframes);
   parseEntry(file["estimator_parameters"], "num_loop_closure_frames",

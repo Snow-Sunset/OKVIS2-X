@@ -15,6 +15,7 @@
 #include <filesystem>
 #include "se/common/point_cloud_io.hpp"
 #include <stdexcept>
+#include <utility>
 
 #include <opencv2/highgui.hpp>
 
@@ -46,6 +47,220 @@ void saveAlignedPoints(std::vector<Eigen::Vector3d, Eigen::aligned_allocator<Eig
 }
 
 namespace okvis {
+
+  void SubmappingInterface::initializeMemoryStorage() {
+    if (!submapConfig_.memoryBounded || !viParameters_.lidar) return;
+    if (!submapConfig_.pointCloudMemoryMb || !submapConfig_.planeCacheMemoryMb
+        || !submapConfig_.planeActiveMaxCells || !submapConfig_.lidarQueueMaxPoints
+        || !submapConfig_.mappingQueueMaxFrames || !submapConfig_.stateQueueMaxUpdates
+        || !std::isfinite(submapConfig_.planeWindowHalfExtent) || submapConfig_.planeWindowHalfExtent <= 0.0
+        || !std::isfinite(submapConfig_.pointCloudWindowHalfExtent) || submapConfig_.pointCloudWindowHalfExtent <= 0.0
+        || submapConfig_.pointCloudMemoryMb > 1024 || submapConfig_.planeCacheMemoryMb > 1024) {
+      throw std::invalid_argument("Bounded LiDAR memory requires positive finite budgets and queue limits");
+    }
+    const bool persistentMappingHistory = submapConfig_.lidarSpoolEnabled
+        || submapConfig_.pointCloudPersistentChunks;
+    if (persistentMappingHistory) {
+      auto parent = submapConfig_.memoryArchiveDirectory.empty()
+          ? std::filesystem::path("./okvis-history")
+          : std::filesystem::path(submapConfig_.memoryArchiveDirectory);
+      std::filesystem::create_directories(parent);
+      const auto stamp = std::chrono::steady_clock::now().time_since_epoch().count();
+      for (size_t attempt = 0; ; ++attempt) {
+        auto session = parent / ("okvis-lidar-" + std::to_string(stamp) + "-" + std::to_string(attempt));
+        if (std::filesystem::create_directory(session)) {
+          memoryArchiveDirectory_ = session.string();
+          break;
+        }
+      }
+      if (submapConfig_.pointCloudPersistentChunks) {
+        std::filesystem::create_directory(std::filesystem::path(memoryArchiveDirectory_) / "planes");
+      }
+    }
+    submapConfig_.planeMapConfig.freezeStableCells = true;
+    submapConfig_.planeMapConfig.maxCells = submapConfig_.planeActiveMaxCells;
+    if (submapConfig_.lidarSpoolEnabled) {
+      lidarMeasurements_.configure(
+          (std::filesystem::path(memoryArchiveDirectory_) / "lidar-spool.bin").string(),
+          submapConfig_.lidarQueueMaxPoints);
+    } else {
+      lidarMeasurements_.configureMemory(submapConfig_.lidarQueueMaxPoints);
+    }
+    LOG(INFO) << "LiDAR mapping storage: "
+              << (memoryArchiveDirectory_.empty() ? "RAM only" : memoryArchiveDirectory_)
+              << "; cloud budget " << submapConfig_.pointCloudMemoryMb << " MiB, plane cache "
+              << submapConfig_.planeCacheMemoryMb << " MiB, active plane cell cap "
+              << submapConfig_.planeActiveMaxCells << ", raw LiDAR spool "
+              << (submapConfig_.lidarSpoolEnabled ? "enabled" : "disabled")
+              << ", persistent voxel chunks "
+              << (submapConfig_.pointCloudPersistentChunks ? "enabled" : "disabled")
+              << ", local window half extent " << submapConfig_.pointCloudWindowHalfExtent << " m"
+              << "; RViz publishes all retained map points without display sampling";
+  }
+
+  size_t SubmappingInterface::copyLidarAfterTrajectoryStart(
+      const Time& maxTime, size_t maxCount, LidarMeasurementBuffer::Batch* candidates) {
+    if (!candidates) throw std::invalid_argument("LiDAR candidate output must not be null");
+    candidates->clear();
+    size_t discarded = 0;
+    while (lidarMeasurements_.CopyUpTo(maxTime, maxCount, candidates)) {
+      Time earliestTrajectoryTimestamp;
+      {
+        std::lock_guard trajectoryLock(trajectoryMutex_);
+        if (!propagatedStates.earliestPoseTimestamp(earliestTrajectoryTimestamp)) {
+          candidates->clear();
+          break;
+        }
+      }
+      size_t stale = 0;
+      while (stale < candidates->size()
+          && candidates->at(stale).timeStamp < earliestTrajectoryTimestamp) {
+        ++stale;
+      }
+      if (!stale) break;
+      if (lidarMeasurements_.PopCount(stale) != stale) {
+        throw std::runtime_error("LiDAR input changed while discarding pre-initialization data");
+      }
+      discarded += stale;
+      if (stale < candidates->size()) {
+        candidates->erase(candidates->begin(), candidates->begin() + stale);
+        break;
+      }
+      candidates->clear();
+    }
+    if (discarded && !preinitializationLidarReported_) {
+      LOG(WARNING) << "Discarded " << discarded
+                   << " pre-initialization LiDAR rays older than the first available trajectory pose"
+                   << (submapConfig_.lidarSpoolEnabled
+                       ? "; raw spool records are retained"
+                       : "; bounded RAM queue capacity was released");
+      preinitializationLidarReported_ = true;
+    }
+    return discarded;
+  }
+
+  bool SubmappingInterface::enqueueLidarBacklog(uint64_t anchorId) {
+    if (anchorId == UNINITIALIZED_ID) {
+      std::lock_guard mappingLock(mappingDataMutex_);
+      if (!frame_ || frame_->frameData_.empty()) return false;
+    }
+    LidarMeasurementBuffer::Batch candidates;
+    copyLidarAfterTrajectoryStart(lastTrajectoryUpdateTimestamp_, 8192, &candidates);
+    if (!candidates.empty()) {
+      // A ray can arrive after the last state update was consumed. Drain
+      // only the portion supported by available state/IMU propagation.
+      std::vector<Time> times;
+      times.reserve(candidates.size());
+      for (const auto& ray : candidates) times.push_back(ray.timeStamp);
+      std::vector<Eigen::Matrix4d, Eigen::aligned_allocator<Eigen::Matrix4d>> poses;
+      {
+        std::lock_guard trajectoryLock(trajectoryMutex_);
+        poses.reserve(times.size());
+        for (const auto& time : times) {
+          State state;
+          if (!propagatedStates.getState(time, state)) break;
+          const Eigen::Matrix4d pose = state.T_WS.T();
+          if (!pose.allFinite()) break;
+          poses.push_back(pose);
+        }
+      }
+      // Keep the first unsupported ray in the input FIFO. Timestamps are
+      // ordered, so consuming a later ray would make retry/recovery unsafe.
+      const size_t supported = poses.size();
+      if (!supported) return false;
+      LidarMeasurementBuffer::Batch rays;
+      if (lidarMeasurements_.PopCount(supported, &rays) != supported) return false;
+      SupereightFrames tail(anchorId);
+      if (anchorId == UNINITIALIZED_ID) {
+        std::lock_guard mappingLock(mappingDataMutex_);
+        if (!frame_ || frame_->frameData_.empty()) return false;
+        tail = std::move(*frame_);
+        frame_.reset();
+      } else tail.useCurrentActiveSubmap = true;
+      for (size_t i = 0; i < supported; ++i) {
+        tail.vecRayMeasurements.emplace_back(Eigen::Isometry3f(
+            poses[i].cast<float>() * viParameters_.lidar->T_SL.T().cast<float>()),
+            rays[i].measurement.rayMeasurement.cast<float>());
+      }
+      if (!tail.vecRayMeasurements.empty())
+        return supereightFrames_.PushBlockingIfFull(std::move(tail), submapConfig_.mappingQueueMaxFrames);
+      return false;
+    }
+    return false;
+  }
+
+  size_t SubmappingInterface::planeResidentBytes() const {
+    size_t bytes = 0;
+    for (const auto& map : planeMaps_) bytes += map.second->residentBytes();
+    return bytes;
+  }
+
+  void SubmappingInterface::completePlaneMap(uint64_t id) {
+    if (!submapConfig_.memoryBounded) return;
+    const auto it = planeMaps_.find(id);
+    if (it == planeMaps_.end() || planeArchives_.count(id)) return;
+    it->second->finalize();
+    planeAccess_[id] = ++planeAccessClock_;
+    // The default FAST-LIVO2-style mode keeps only a bounded RAM plane cache.
+    // Historical plane files are written only with explicit persistent map
+    // chunks, so ordinary runs create no separate okvis-lidar-* directory.
+    if (!submapConfig_.pointCloudPersistentChunks) return;
+    const auto filename = (std::filesystem::path(memoryArchiveDirectory_) / "planes" /
+                           (std::to_string(id) + ".planes")).string();
+    it->second->save(filename); // Never evict before a successful write.
+    planeArchives_[id] = {filename, it->second->bounds()};
+  }
+
+  void SubmappingInterface::flushMemoryStorage() {
+    std::lock_guard mappingLock(mappingDataMutex_);
+    if (!submapConfig_.memoryBounded) return;
+    lidarMeasurements_.Flush();
+    completePlaneMap(prevKeyframeId_);
+    applyPendingPointCloudPoses();
+    if (pointCloudMap_) {
+      std::lock_guard mapLock(pointCloudMapMutex_);
+      pointCloudMap_->flush();
+    }
+  }
+
+  void SubmappingInterface::trimPlaneCache(uint64_t protectedId) const {
+    if (!submapConfig_.memoryBounded) return;
+    size_t bytes = 0;
+    for (const auto& map : planeMaps_) if (map.first != prevKeyframeId_) bytes += map.second->residentBytes();
+    const size_t budget = submapConfig_.planeCacheMemoryMb * 1024 * 1024;
+    while (bytes > budget) {
+      auto victim = planeMaps_.end();
+      uint64_t age = std::numeric_limits<uint64_t>::max();
+      for (auto it = planeMaps_.begin(); it != planeMaps_.end(); ++it) {
+        if (it->first == protectedId || it->first == prevKeyframeId_ || it->first == previousSubmapId_
+            || (submapConfig_.pointCloudPersistentChunks && !planeArchives_.count(it->first))) continue;
+        const auto accessed = planeAccess_.find(it->first);
+        const uint64_t used = accessed == planeAccess_.end() ? 0 : accessed->second;
+        if (used < age) { age = used; victim = it; }
+      }
+      if (victim == planeMaps_.end()) break; // active/reference maps remain pinned
+      bytes -= victim->second->residentBytes();
+      planeAccess_.erase(victim->first);
+      planeMaps_.erase(victim);
+    }
+  }
+
+  PlaneMapPtr SubmappingInterface::planeMap(uint64_t id) const {
+    auto it = planeMaps_.find(id);
+    bool loaded = false;
+    if (it == planeMaps_.end()) {
+      const auto archive = planeArchives_.find(id);
+      if (archive == planeArchives_.end()) return nullptr;
+      auto map = PlaneMap::load(archive->second.filename, submapConfig_.planeMapConfig,
+                                submapConfig_.planeCacheMemoryMb * 1024 * 1024);
+      it = planeMaps_.emplace(id, std::move(map)).first;
+      loaded = true;
+    }
+    planeAccess_[id] = ++planeAccessClock_;
+    const auto result = it->second;
+    if (loaded) trimPlaneCache(id);
+    return result;
+  }
 
   void get_bbox(const se::Submap<okvis::SupereightMapType>& submap,
                 const Eigen::Matrix4f& T_AB,
@@ -357,22 +572,23 @@ namespace okvis {
     lidarMeasurement.measurement.rayMeasurement = ray;
 
     // Push data to the Queue.
-    const size_t lidarQueueSize =100000000; ///< Arbitrary number. ToDo -> fine-tune
+    const size_t lidarQueueSize = submapConfig_.lidarQueueMaxPoints;
     sensorMeasurementDownsamplingCounter_++;
         
     if(sensorMeasurementDownsamplingCounter_ % sensorMeasurementDownsampling_ == 0){
       sensorMeasurementDownsamplingCounter_ = 0;
-      if (blocking_) { // ToDo: Remove blocking behavior?
-        const bool result =
-                lidarMeasurements_.PushBlockingIfFull(lidarMeasurement, lidarQueueSize);
-        return result;
-      } else {
-        // Push measurement and pop the oldest entry.
-        const bool result = lidarMeasurements_.PushNonBlockingDroppingIfFull(
-                lidarMeasurement, lidarQueueSize);
-        if (result)
-          DLOG(INFO) << "Oldest LiDAR measurement dropped";
-        }
+      if (submapConfig_.lidarSpoolEnabled) {
+        return lidarMeasurements_.PushBlockingIfFull(lidarMeasurement, lidarQueueSize);
+      }
+      bool droppedNewest = false;
+      const bool stored = lidarMeasurements_.PushNonBlockingDroppingNewestIfFull(
+          lidarMeasurement, &droppedNewest);
+      if (droppedNewest && !lidarQueueOverflowReported_) {
+        LOG(WARNING) << "Bounded RAM LiDAR queue reached " << lidarQueueSize
+                     << " rays; dropping incoming rays to keep camera and IMU callbacks live";
+        lidarQueueOverflowReported_ = true;
+      }
+      return stored || droppedNewest;
     }
 
     return true;
@@ -421,12 +637,17 @@ namespace okvis {
                                               const Eigen::Vector3d& omega) {
       // store in any case
       imuMeasurements_.push_back(ImuMeasurement(stamp, ImuSensorReadings(omega,alpha)));
+      if (submapConfig_.memoryBounded && !imuMeasurements_.empty()) {
+        const auto first = std::lower_bound(imuMeasurements_.begin(), imuMeasurements_.end(), stamp - Duration(5.0),
+            [](const ImuMeasurement& measurement, const Time& time) { return measurement.timeStamp < time; });
+        imuMeasurements_.erase(imuMeasurements_.begin(), first);
+      }
 
       // add to Trajectory if possible
       bool success = false;
       State state;
-      if(!trajectoryLocked_) {
-        trajectoryLocked_ = true;
+      std::unique_lock trajectoryLock(trajectoryMutex_, std::try_to_lock);
+      if(trajectoryLock.owns_lock()) {
         for(auto & imuMeasurement : imuMeasurements_) {
           State propagatedState;
           if(propagatedStates.addImuMeasurement(imuMeasurement.timeStamp,
@@ -446,7 +667,6 @@ namespace okvis {
           anchoredTrajectoryUpdateCallback_(state, std::shared_ptr<const okvis::AlignedMap<StateId, State>> (new okvis::AlignedMap<StateId, State>()));
           anchored_traj_udate.stop();
         }
-        trajectoryLocked_ = false;
         if(!success) {
           return false;
         }
@@ -497,24 +717,51 @@ namespace okvis {
 
 
     bool SubmappingInterface::finishedIntegrating(){
-      uint64_t numMessages;
-      numMessages = supereightFrames_.Size() + stateUpdates_.Size();
+      std::lock_guard integrationLock(integrationInputMutex_);
+      std::unique_lock mappingLock(mappingDataMutex_);
+      const uint64_t numMessages = supereightFrames_.Size() + stateUpdates_.Size();
+      if (numMessages == 0 && seSubmapLookup_.empty() && !isProcessingSeFrame_ && lidarSensors_) {
+        mappingLock.unlock();
+        const bool queued = enqueueLidarBacklog(UNINITIALIZED_ID);
+        mappingLock.lock();
+        if (queued) return false;
+        frame_.reset(); // state-only metadata without any posed measurements
+        if (!lidarMeasurements_.Empty() && !finalTailReported_) {
+          LOG(WARNING) << "No pose-supported LiDAR map was created; pending raw rays remain in the input "
+                       << (submapConfig_.lidarSpoolEnabled ? "archive" : "buffer");
+          finalTailReported_ = true;
+        }
+        return true;
+      }
       if (numMessages == 0 && seSubmapLookup_.empty() && !isProcessingSeFrame_ && !frame_) {
         return true;
       }
       if(numMessages == 0 && seSubmapLookup_.size() > 0 && !isProcessingSeFrame_){
 
         if(lidarSensors_){
+          // Finish a packet built by the input thread before declaring idle.
+          if (frame_ && !frame_->vecRayMeasurements.empty()) {
+            auto pendingFrame = std::move(frame_);
+            mappingLock.unlock();
+            supereightFrames_.PushBlockingIfFull(std::move(*pendingFrame), submapConfig_.mappingQueueMaxFrames);
+            return false;
+          }
+          mappingLock.unlock();
+          const bool queued = enqueueLidarBacklog(prevKeyframeId_);
+          mappingLock.lock();
+          if (queued) return false;
           if (submapConfig_.useMap2MapFactors) lidarMap2MapFactors();
 
           if(visualizeSubmaps_) {
             drawSubmaps();
           }
 
-          // Clear the queue, otherwise lidar could be still integrated.
-          while(!lidarMeasurements_.Empty()) {
-            LidarMeasurement oldestLidarMeasurement;;
-            lidarMeasurements_.PopBlocking(&oldestLidarMeasurement);
+          if (!lidarMeasurements_.Empty() && !finalTailReported_) {
+            LOG(WARNING) << lidarMeasurements_.Size() << " trailing LiDAR rays are newer than the last state; "
+                            "they remain in the input "
+                         << (submapConfig_.lidarSpoolEnabled ? "archive" : "buffer")
+                         << " and are not inserted without a valid pose";
+            finalTailReported_ = true;
           }
 
           return true;
@@ -522,13 +769,15 @@ namespace okvis {
         else {
           // Put remaining frames into supereightFrames.
           if(frame_){
-            if(blocking_){
-              supereightFrames_.PushBlockingIfFull(*frame_,1);
+            auto pendingFrame = std::move(frame_);
+            const bool bounded = blocking_ || submapConfig_.memoryBounded;
+            mappingLock.unlock();
+            if (bounded) {
+              supereightFrames_.PushBlockingIfFull(std::move(*pendingFrame),
+                                                   submapConfig_.memoryBounded ? submapConfig_.mappingQueueMaxFrames : 1);
+            } else {
+              supereightFrames_.PushNonBlockingDroppingIfFull(std::move(*pendingFrame), 2);
             }
-            else{
-              supereightFrames_.PushNonBlockingDroppingIfFull(*frame_, 2);
-            }
-            frame_.reset();
             return false;
           }
 
@@ -589,13 +838,8 @@ namespace okvis {
       if(useGtPoses_ && gtPoses_.find(finalTimestamp.toNSec()) != gtPoses_.end()){
           measurementState.T_WS = gtPoses_[finalTimestamp.toNSec()];
       }else{
-        while(trajectoryLocked_);
-        trajectoryLocked_ = true;
-        if(!propagatedStates.getState(finalTimestamp, measurementState)){
-          trajectoryLocked_ = false;
-          return false;
-        }
-        trajectoryLocked_ = false;
+        std::lock_guard trajectoryLock(trajectoryMutex_);
+        if(!propagatedStates.getState(finalTimestamp, measurementState)) return false;
       }
 
       T_WC = measurementState.T_WS * T_SC;
@@ -725,12 +969,21 @@ namespace okvis {
 
     void SubmappingInterface::processSupereightFrames() {
       SupereightFrames frame;
-      while (!isFinished() && supereightFrames_.PopBlocking(&frame)) {
-        processSupereightFrame(frame);
+      while (!isFinished() && supereightFrames_.WaitForData()) {
+        bool available = false;
+        {
+          // Keep the queue-to-processing transition atomic with respect to
+          // finishedIntegrating(), without holding the mapping lock while idle.
+          std::lock_guard mappingLock(mappingDataMutex_);
+          available = supereightFrames_.PopNonBlocking(&frame);
+          if (available) isProcessingSeFrame_ = true;
+        }
+        if (available) processSupereightFrame(frame);
       }
     }
 
     void SubmappingInterface::processSupereightFrame(SupereightFrames& supereightFrame) {
+    std::lock_guard mappingLock(mappingDataMutex_);
     if (visualizeSubmaps_) {
       drawSubmaps();
     }
@@ -738,6 +991,8 @@ namespace okvis {
     isProcessingSeFrame_ = true;
 
     TimerSwitchable timingNewSubmap("9.1 Decide a new submap");
+    if (supereightFrame.useCurrentActiveSubmap && prevKeyframeId_ != UNINITIALIZED_ID)
+      supereightFrame.keyFrameId = prevKeyframeId_;
     bool create_new_submap = decideNewSubmap(supereightFrame);
     timingNewSubmap.stop();
 
@@ -780,6 +1035,11 @@ namespace okvis {
       if(submapCounter_ > 1){
         previousSubmap_ = seSubmapLookup_[prevKeyframeId_].map.get();
         previousSubmapId_ = prevKeyframeId_;
+        completePlaneMap(previousSubmapId_);
+        if (pointCloudMap_) {
+          std::lock_guard lock(pointCloudMapMutex_);
+          pointCloudMap_->finalizeSubmap(previousSubmapId_);
+        }
       }
 
       addSubmapAlignmentFactors(supereightFrame);
@@ -806,7 +1066,8 @@ namespace okvis {
     }
 
     TimerSwitchable batchIntegration("9.2 LiDAR map update");
-    if(lidarSensors_ && supereightFrame.vecRayMeasurements.size() > 0 && supereightFrames_.Size() <= 1){
+    if(lidarSensors_ && !supereightFrame.vecRayMeasurements.empty()
+        && (submapConfig_.memoryBounded || supereightFrames_.Size() <= 1)){
       // Here prevKeyframeId_ will always be the current active submap
       okvis::kinematics::Transformation T_WK(seSubmapLookup_[prevKeyframeId_].T_WK.matrix().cast<double>());
       TimerSwitchable prepareInput("9.2.0 LiDAR input preparation");
@@ -821,9 +1082,29 @@ namespace okvis {
               || range > lidarSensors_->second.far_plane) continue;
           endpoints.push_back((ray.first * ray.second).cast<double>());
         }
-        if (submapConfig_.usePointToPlaneFactors) planeMaps_.at(prevKeyframeId_)->addPoints(endpoints);
+        if (submapConfig_.usePointToPlaneFactors) {
+          auto& map = planeMaps_.at(prevKeyframeId_);
+          if (submapConfig_.memoryBounded && !supereightFrame.vecRayMeasurements.empty()) {
+            map->setWindow(supereightFrame.vecRayMeasurements.back().first.translation().cast<double>(),
+                           submapConfig_.planeWindowHalfExtent);
+          }
+          map->addPoints(endpoints);
+        }
         if (pointCloudMap_) {
           std::lock_guard lock(pointCloudMapMutex_);
+          if (submapConfig_.memoryBounded && !submapConfig_.pointCloudPersistentChunks
+              && !supereightFrame.vecRayMeasurements.empty()) {
+            // vecRayMeasurements contains T_KL after updateLidarAlignBlock;
+            // convert the latest LiDAR origin back to world coordinates before
+            // applying the world-frame local map window.
+            const Eigen::Vector3d localSensor =
+                supereightFrame.vecRayMeasurements.back().first.translation().cast<double>();
+            const Eigen::Vector3d worldSensor =
+                (T_WK.T() * localSensor.homogeneous()).head<3>();
+            pointCloudMap_->setLocalWindow(
+                worldSensor,
+                submapConfig_.pointCloudWindowHalfExtent);
+          }
           pointCloudMap_->addPoints(prevKeyframeId_, Eigen::Isometry3d(T_WK.T()), endpoints);
         }
       }
@@ -1074,6 +1355,7 @@ namespace okvis {
     }
     publishLidarPointCloudMap();
     if (planeOnlyMapping()) updated_maps_.clear();
+    trimPlaneCache(UNINITIALIZED_ID);
     isProcessingSeFrame_ = false;
     timingProcessSeFrame.stop();
     }
@@ -1107,7 +1389,13 @@ namespace okvis {
       if (poses.empty()) return;
       std::lock_guard mapLock(pointCloudMapMutex_);
       for (const auto& pose : poses) {
-        if (pose.second.keyframe || pointCloudMap_->hasSubmap(pose.first)) {
+        // Do not recreate an evicted historical anchor in the RAM sliding
+        // window. The active anchor is updated synchronously before insertion;
+        // late callbacks for missing anchors are safe to ignore.
+        const bool keepMissingAnchor = !submapConfig_.memoryBounded
+            || submapConfig_.pointCloudPersistentChunks;
+        if (pointCloudMap_->hasSubmap(pose.first) ||
+            (pose.second.keyframe && keepMissingAnchor)) {
           pointCloudMap_->updatePose(pose.first, pose.second.pose, true, pose.second.sequence);
         }
       }
@@ -1210,8 +1498,7 @@ namespace okvis {
         if (!force && revision == publishedPointCloudRevision_) return;
         snapshot = pointCloudMap_->snapshot();
       }
-      const auto points = LidarPointCloudMap::assemble(snapshot, submapConfig_.pointCloudMapVoxelSize,
-          submapConfig_.pointCloudMapMaxPublishPoints);
+      const auto points = LidarPointCloudMap::assembleUnfiltered(snapshot);
       if (points.empty()) return;
       Time timestamp;
       {
@@ -1224,19 +1511,22 @@ namespace okvis {
     }
 
     bool SubmappingInterface::saveLidarPointCloudMap(const std::string& filename) const {
-      const auto points = lidarPointCloudMap();
-      if (points.empty() || filename.empty()) return false;
+      if (!pointCloudMap_ || filename.empty()) return false;
       try {
         const auto directory = std::filesystem::path(filename).parent_path();
         if (!directory.empty()) std::filesystem::create_directories(directory);
-        pcl::PointCloud<pcl::PointXYZ> cloud;
-        cloud.reserve(points.size());
-        for (const auto& point : points) {
-          cloud.push_back(pcl::PointXYZ(float(point.x()), float(point.y()), float(point.z())));
+        applyPendingPointCloudPoses();
+        LidarPointCloudMap::Snapshot snapshot;
+        double visualizationVoxelSize;
+        {
+          std::lock_guard lock(pointCloudMapMutex_);
+          pointCloudMap_->flush();
+          snapshot = pointCloudMap_->visualizationSnapshot();
+          visualizationVoxelSize = pointCloudMap_->visualizationVoxelSize();
         }
-        if (pcl::io::savePCDFileBinary(filename, cloud) != 0) return false;
-        LOG(INFO) << "Saved LiDAR point cloud map: " << filename << " (" << points.size() << " points)";
-        return true;
+        const bool saved = LidarPointCloudMap::savePcd(snapshot, visualizationVoxelSize, filename);
+        if (saved) LOG(INFO) << "Saved global compressed LiDAR point cloud map: " << filename;
+        return saved;
       } catch (const std::exception& error) {
         LOG(ERROR) << "Could not save LiDAR point cloud map: " << error.what();
         return false;
@@ -1298,6 +1588,7 @@ namespace okvis {
     }
 
     bool SubmappingInterface::checkForAvailableData() {
+      std::lock_guard integrationLock(integrationInputMutex_);
       std::map<size_t, std::vector<okvis::CameraMeasurement>> depthMeasurement;
       LidarMeasurement oldestLidarMeasurement;
       bool integrateLidar = true;
@@ -1312,8 +1603,9 @@ namespace okvis {
       // Check if State Updates available (if so, get neweset State).
       OkvisUpdate newestState;
       if(!stateUpdates_.getCopyOfBack(&newestState)){
-        DLOG(INFO) << "not having any state updates";
-        return false;
+        uint64_t anchorId;
+        { std::lock_guard mappingLock(mappingDataMutex_); anchorId = prevKeyframeId_; }
+        return lidarSensors_ && enqueueLidarBacklog(anchorId);
       }
 
       // Check if oldest Measurement to be integrated is older than the newest State.
@@ -1350,13 +1642,15 @@ namespace okvis {
           } else {
             continuePopping = stateUpdates_.PopNonBlocking(&popState);
           }
+          if (!continuePopping) return false;
 
           // propagatedStates.update(popState.trackingState, popState.updatedStates, popState.affectedStates);
           // update Trajectory object
-          while(trajectoryLocked_);
-          trajectoryLocked_ = true;
-          propagatedStates.update(popState.trackingState, popState.updatedStates, popState.affectedStates);
-          trajectoryLocked_ = false;
+          {
+            std::lock_guard trajectoryLock(trajectoryMutex_);
+            propagatedStates.update(popState.trackingState, popState.updatedStates, popState.affectedStates);
+            lastTrajectoryUpdateTimestamp_ = popState.timestamp;
+          }
 
           if(anchoredTrajectoryUpdateCallback_) {
             TimerSwitchable anchored_traj_udate("8.7 Anchored trajectory update");
@@ -1382,18 +1676,19 @@ namespace okvis {
 
       while(continue_popping) {
         if(blocking_) {
-          stateUpdates_.PopBlocking(&currentStateUpdate);
+          if (!stateUpdates_.PopBlocking(&currentStateUpdate)) return false;
         }
         else {
-          stateUpdates_.PopNonBlocking(&currentStateUpdate);
+          if (!stateUpdates_.PopNonBlocking(&currentStateUpdate)) return false;
         }
         // Update internal representation of the trajectory
         // propagatedStates.update(currentStateUpdate.trackingState, currentStateUpdate.updatedStates, currentStateUpdate.affectedStates);
         // update Trajectory object
-        while(trajectoryLocked_);
-        trajectoryLocked_ = true;
-        propagatedStates.update(currentStateUpdate.trackingState, currentStateUpdate.updatedStates, currentStateUpdate.affectedStates);
-        trajectoryLocked_ = false;
+        {
+          std::lock_guard trajectoryLock(trajectoryMutex_);
+          propagatedStates.update(currentStateUpdate.trackingState, currentStateUpdate.updatedStates, currentStateUpdate.affectedStates);
+          lastTrajectoryUpdateTimestamp_ = currentStateUpdate.timestamp;
+        }
         
   
         if(anchoredTrajectoryUpdateCallback_) {
@@ -1413,33 +1708,29 @@ namespace okvis {
 
       // Setting some variables required for looping over state updates and measurements
       bool keepLooping = true;
-      const size_t supereightQueueSize = 5000; /// Large Queue needed for LiDAR measurements if we do not want to drop anything.
+      const size_t maxLidarBatchPoints = submapConfig_.memoryBounded
+          ? std::min<size_t>(submapConfig_.lidarQueueMaxPoints, 32768) : std::numeric_limits<size_t>::max();
+      // Preserve the original high-throughput queue in unbounded mode. The
+      // small configurable queue is backpressure for bounded-memory sessions.
+      const size_t supereightQueueSize = submapConfig_.memoryBounded
+          ? submapConfig_.mappingQueueMaxFrames : 5000;
       Transformation T_WD;
 
       // Iterate available measurements
-      LidarMeasurement lidarMeasurement;
-      lidarMeasurements_.getCopyOfFront(&lidarMeasurement);
       depthMeasurements_.getCopyOfFront(&depthMeasurement);
 
       // Motion de-skewed LiDAR Measurements
       std::vector<Eigen::Matrix4d, Eigen::aligned_allocator<Eigen::Matrix4d>> statePoses;
       std::vector<okvis::Time> times;
-      std::vector<okvis::LidarMeasurement, Eigen::aligned_allocator<okvis::LidarMeasurement>> measurements;
+      LidarMeasurementBuffer::Batch candidates;
+      if (integrateLidar) {
+        copyLidarAfterTrajectoryStart(
+            currentStateUpdate.timestamp, maxLidarBatchPoints, &candidates);
+        times.reserve(candidates.size());
+        for (const auto& measurement : candidates) times.push_back(measurement.timeStamp);
+      }
 
       while(keepLooping){
-
-        if(integrateLidar && lidarMeasurement.timeStamp <= currentStateUpdate.timestamp){
-
-          if(blocking_) {
-            lidarMeasurements_.PopBlocking(&lidarMeasurement);
-          }
-          else {
-            lidarMeasurements_.PopNonBlocking(&lidarMeasurement);
-          }
-
-          measurements.push_back(lidarMeasurement);
-          times.push_back(lidarMeasurement.timeStamp);
-        }
         bool depthImageExisting = integrateDepthImage;
         size_t mappingCameraId = 0;
         if(cameraSensors_) {
@@ -1525,28 +1816,56 @@ namespace okvis {
         else if(depthMeasurement.at(mappingCameraId).at(0).timeStamp >= currentStateUpdate.timestamp) {
             keepLoopingDepth = false;
         }
-        bool keepLoopingLidar = true;
-        if((!lidarMeasurements_.getCopyOfFront(&lidarMeasurement) || lidarMeasurement.timeStamp >= currentStateUpdate.timestamp || !integrateLidar)){
-            keepLoopingLidar = false;
-        }
+        const bool keepLoopingLidar = false; // LiDAR was consumed above in one ordered batch.
 
         if(!keepLoopingDepth && !keepLoopingLidar ) {
           keepLooping = false;
-          if(integrateLidar){
+          if(integrateLidar && !candidates.empty()){
             statePoses.reserve(times.size());
-            // ToDo: Potentially thread-un-safe?!?!
-            bool getStatesSuccessfully = propagatedStates.getStatePoses(times, statePoses);
-            if(getStatesSuccessfully){
-              frame_->vecRayMeasurements.reserve(times.size());
-              for(size_t i = 0; i < times.size(); i++){
-                Eigen::Matrix4f T_WL = statePoses[i].cast<float>() * (*viParameters_.lidar).T_SL.T().cast<float>();
-                if(!frame_){
-                  throw std::runtime_error("About to add lidar measurements and we have found a point where there is no frame initialized where there should have be");
-                }else{
-                  frame_->vecRayMeasurements.push_back({Eigen::Isometry3f(T_WL), 
-                                                        measurements[i].measurement.rayMeasurement.template cast<float>()});
+            bool getStatesSuccessfully;
+            {
+              std::lock_guard trajectoryLock(trajectoryMutex_);
+              getStatesSuccessfully = propagatedStates.getStatePoses(times, statePoses);
+              if (!getStatesSuccessfully || statePoses.size() != times.size()) {
+                // The batch propagator supports one camera interval. Repeated
+                // timestamps or delayed input can span intervals; scalar lookup
+                // preserves the correct interval and cannot yield a short array.
+                statePoses.clear();
+                for (const auto& time : times) {
+                  State state;
+                  if (!propagatedStates.getState(time, state)) break;
+                  const Eigen::Matrix4d pose = state.T_WS.T();
+                  if (!pose.allFinite()) break;
+                  statePoses.push_back(pose);
                 }
+                getStatesSuccessfully = true;
               }
+            }
+            size_t supported = getStatesSuccessfully ? statePoses.size() : 0;
+            for (size_t i = 0; i < supported; ++i) {
+              if (!statePoses[i].allFinite()) {
+                supported = i;
+                break;
+              }
+            }
+            if (supported) {
+              LidarMeasurementBuffer::Batch measurements;
+              if (lidarMeasurements_.PopCount(supported, &measurements) != supported) {
+                throw std::runtime_error("LiDAR input changed while consuming a posed batch");
+              }
+              if (!frame_) {
+                throw std::runtime_error("About to add LiDAR measurements without an active mapping frame");
+              }
+              frame_->vecRayMeasurements.reserve(frame_->vecRayMeasurements.size() + supported);
+              for(size_t i = 0; i < supported; i++){
+                Eigen::Matrix4f T_WL = statePoses[i].cast<float>() * (*viParameters_.lidar).T_SL.T().cast<float>();
+                frame_->vecRayMeasurements.push_back({Eigen::Isometry3f(T_WL),
+                                                      measurements[i].measurement.rayMeasurement.template cast<float>()});
+              }
+            }
+            if (supported < candidates.size()) {
+              LOG(WARNING) << (candidates.size() - supported)
+                           << " LiDAR rays are waiting for a valid propagated pose";
             }
           }
 
@@ -1554,9 +1873,9 @@ namespace okvis {
           frameUpdater(currentStateUpdate);
 
           if(frame_){
-            if(blocking_){
-              supereightFrames_.PushBlockingIfFull(*frame_, 1);
-            } else if(supereightFrames_.PushNonBlockingDroppingIfFull(*frame_, supereightQueueSize)){
+            if(blocking_ || submapConfig_.memoryBounded){
+              supereightFrames_.PushBlockingIfFull(std::move(*frame_), submapConfig_.memoryBounded ? supereightQueueSize : 1);
+            } else if(supereightFrames_.PushNonBlockingDroppingIfFull(std::move(*frame_), supereightQueueSize)){
               LOG(WARNING) << "Oldest Supereight frame dropped";
             }
             frame_.reset();
@@ -1625,12 +1944,18 @@ namespace okvis {
                                   latestTrackingState,
                                   affectedStateIds,
                                   updatedStates);
-      const size_t stateUpdateQueue = 100000;
+      const size_t stateUpdateQueue = submapConfig_.stateQueueMaxUpdates;
 
       if (blocking_) {
         bool success = stateUpdates_.PushBlockingIfFull(latestStateData, 1);
         return success;
       } else {
+        if (submapConfig_.memoryBounded) {
+          if (!stateUpdates_.PushNonBlockingIfNotFull(latestStateData, stateUpdateQueue)) {
+            throw std::runtime_error("Mapping state queue budget exhausted; reduce playback rate or increase state_queue_max_updates");
+          }
+          return true;
+        }
         if (stateUpdates_.PushNonBlockingDroppingIfFull(latestStateData,
                                                         stateUpdateQueue)) {
           LOG(WARNING) << "Oldest state  measurement dropped";
@@ -1760,6 +2085,7 @@ namespace okvis {
 
     okvis::kinematics::Transformation T_WM(seSubmapLookup_[mapId].T_WK.matrix().cast<double>());
     Eigen::Isometry3f T_MW_iso(T_WM.inverse().T().cast<float>());
+    const auto reference = submapConfig_.usePointToPlaneFactors ? planeMap(mapId) : nullptr;
 
     for(size_t i = 0; i < number_of_measurements; i++) {
         if((seFrame.vecRayMeasurements[i].second.norm() > lidarSensors_->second.far_plane) || (seFrame.vecRayMeasurements[i].second.norm() < lidarSensors_->second.near_plane)){
@@ -1770,7 +2096,6 @@ namespace okvis {
         Eigen::Vector3f pt = T_MW_iso * seFrame.vecRayMeasurements[i].first * seFrame.vecRayMeasurements[i].second;
         bool observed = false;
         if (submapConfig_.usePointToPlaneFactors) {
-          const auto reference = planeMap(mapId);
           PlaneMap::Plane plane;
           double sigma;
           observed = reference && reference->match(pt.cast<double>(), submapConfig_.sensorError, plane, sigma);
@@ -1806,6 +2131,13 @@ namespace okvis {
 
   Eigen::AlignedBox3f SubmappingInterface::submapBounds(uint64_t id) const {
     if (planeOnlyMapping()) {
+      const auto archive = planeArchives_.find(id);
+      if (archive != planeArchives_.end()) {
+        if (archive->second.bounds.isEmpty()) return Eigen::AlignedBox3f();
+        const auto margin = Eigen::Vector3f::Constant(0.5 * submapConfig_.planeMapConfig.voxelSize);
+        return Eigen::AlignedBox3f(archive->second.bounds.min().cast<float>() - margin,
+                                  archive->second.bounds.max().cast<float>() + margin);
+      }
       const auto map = planeMap(id);
       if (!map || map->bounds().isEmpty()) return Eigen::AlignedBox3f();
       // Include cell support so a planar map has a nonzero-volume AABB.
@@ -1891,6 +2223,7 @@ namespace okvis {
     okvis::kinematics::Transformation T_WM_A(seSubmapLookup_[mapIdA].T_WK.matrix().cast<double>());
     okvis::kinematics::Transformation T_WM_B(seSubmapLookup_[mapIdB].T_WK.matrix().cast<double>());
     Eigen::Isometry3f T_MA_MB((T_WM_A.inverse().T() * T_WM_B.T()).cast<float>());
+    const auto reference = lidarSensors_ && submapConfig_.usePointToPlaneFactors ? planeMap(mapIdA) : nullptr;
 
     for(size_t i = 0; i < number_of_measurements; i++) {
 
@@ -1898,7 +2231,6 @@ namespace okvis {
       Eigen::Vector3f pt_A = T_MA_MB * points[i];
       bool observed = false;
       if (lidarSensors_ && submapConfig_.usePointToPlaneFactors) {
-        const auto reference = planeMap(mapIdA);
         PlaneMap::Plane plane;
         double sigma;
         observed = reference && reference->match(pt_A.cast<double>(), submapConfig_.sensorError, plane, sigma);
@@ -1945,6 +2277,14 @@ namespace okvis {
 
   bool SubmappingInterface::decideNewSubmap(SupereightFrames& supereightFrame) {
     bool create_new_submap = false;
+    if (lidarSensors_ && submapConfig_.memoryBounded && prevKeyframeId_ != UNINITIALIZED_ID
+        && supereightFrame.keyFrameId != prevKeyframeId_) {
+      const auto active = planeMaps_.find(prevKeyframeId_);
+      if (active != planeMaps_.end() && active->second->numCells() >= submapConfig_.planeActiveMaxCells) {
+        lidarKfDetected_ = true;
+        forceSubmap_ = true;
+      }
+    }
     if(cameraSensors_){
       if(prevKeyframeId_ == UNINITIALIZED_ID){
         create_new_submap = true;
@@ -2062,6 +2402,8 @@ namespace okvis {
       submapAlignBlock_.pointCloud_B.clear();
       submapAlignBlock_.sigma_B.clear();
       submapAlignBlock_.voxelHashMap.Clear();
+      submapAlignBlock_.windowCenter.setZero();
+      submapAlignBlock_.windowPruneInitialized = false;
       DLOG(INFO) << "Created new SubmapAlignmentTerm with frame A id: " << prevKeyframeId_ 
                 << " and frame B id: " << supereightFrame.keyFrameId;
     }
@@ -2289,6 +2631,33 @@ namespace okvis {
     size_t n_points = onlyRays.size();
     if(n_points > 0){
       submapAlignBlock_.voxelHashMap.AddPoints(onlyRays);
+      if (submapConfig_.memoryBounded) {
+        auto& hash = submapAlignBlock_.voxelHashMap;
+        hash.max_distance_ = submapConfig_.planeWindowHalfExtent;
+        const Eigen::Vector3d center = vecRayMeasurements.back().first.translation().cast<double>();
+        const double pruneTrigger = std::max(
+            double(hash.voxel_size_), std::min(2.0, 0.1 * hash.max_distance_));
+        const bool movedEnough = !submapAlignBlock_.windowPruneInitialized
+            || (center - submapAlignBlock_.windowCenter).cwiseAbs().maxCoeff() >= pruneTrigger;
+        if (movedEnough) {
+          hash.RemovePointsFarFromLocation(center);
+          submapAlignBlock_.windowCenter = center;
+          submapAlignBlock_.windowPruneInitialized = true;
+        }
+        const size_t cap = std::max<size_t>(submapConfig_.numSubmapFactors * 20, 1000);
+        if (hash.map_.size() > cap) {
+          auto points = hash.Pointcloud();
+          std::vector<Eigen::Vector3f, Eigen::aligned_allocator<Eigen::Vector3f>> floats;
+          floats.reserve(points.size());
+          for (const auto& point : points) floats.push_back(point.cast<float>());
+          std::vector<Eigen::Vector3f, Eigen::aligned_allocator<Eigen::Vector3f>> sampled;
+          downsamplePointCloud(floats, sampled, cap);
+          points.clear();
+          for (const auto& point : sampled) points.push_back(point.cast<double>());
+          hash.Clear();
+          hash.AddPoints(points);
+        }
+      }
     }
   }
 

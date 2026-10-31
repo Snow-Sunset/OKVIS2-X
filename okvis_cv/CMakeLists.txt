@@ -36,6 +36,7 @@ add_library(${LIB_NAME}
   include/okvis/internal/Network.hpp
   src/CameraBase.cpp
   src/Frame.cpp
+  src/FrameArchive.cpp
   src/NCameraSystem.cpp
 )
 target_include_directories(${LIB_NAME}
