@@ -1,0 +1,36 @@
+# Optional ROS2 parameters for the independent height-coloured LiDAR PCD worker.
+# Pass with --ros-args --params-file; existing OKVIS and se2 YAML stay unchanged.
+/**:
+  ros__parameters:
+    global_lidar_pcd:
+      enabled: true
+      # Independent live TF thread; not throttled by global-map publication.
+      # Display the current raw scan in world using calibrated LiDAR extrinsics.
+      publish_lidar_tf: true
+      # Auto selects Reliable for a reliable bag, Best Effort for sensor drivers.
+      # Only affects this map sidecar; does not change the estimator input.
+      input_reliability: auto
+      # Soft per-thread CPU duty cycle for mapping/display, relative to ONE core.
+      # Does not limit map points; 1.0 disables pacing. Live scan TF is unthrottled.
+      worker_cpu_budget: 0.35
+      # Each existing SLAM keyframe selects one temporally adjacent scan.
+      keyframe_match_tolerance: 0.05
+      voxel_size: 0.1
+      # Fixed display sampling only: 1 = all retained points, 2 = every other point.
+      # No display point-count cap or adaptive voxel coarsening.
+      preview_sampling_step: 1
+      publish_interval: 0.5
+      height_min: -2.0
+      height_max: 5.0
+      minimum_range: 0.5
+      maximum_range: 150.0
+      max_scan_points: 262144
+      max_scan_bytes: 16777216
+      max_pending_scan_bytes: 33554432
+      max_pending_update_bytes: 16777216
+      save_on_shutdown: true
+      # Empty output_file selects a unique session under csv_path/global_lidar_pcd/.
+      output_file: ""
+
+
+

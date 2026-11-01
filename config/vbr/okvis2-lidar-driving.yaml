@@ -79,6 +79,10 @@ frontend_parameters:
 estimator_parameters:
   # Cold images are released; loop-closure features stay in RAM. No history disk archive.
   memory_bounded: true
+  # Preserve scan-time coverage while the independent backend is behind.
+  # Complete live scans use packed storage, bounded by count AND payload bytes.
+  realtime_lidar_buffer_scans: 16
+  realtime_lidar_buffer_bytes: 67108864
   num_keyframes: 5
   num_loop_closure_frames: 3
   num_imu_frames: 3
@@ -93,4 +97,4 @@ estimator_parameters:
   full_graph_num_threads: 3
   p_dbow: 0.55
   drift_percentage_heuristic: 10.0
-output_parameters: {display_topview: true, display_matches: false, display_overhead: false, enable_submapping: true}
+output_parameters: {display_topview: true, display_matches: true, display_overhead: false, enable_submapping: true}

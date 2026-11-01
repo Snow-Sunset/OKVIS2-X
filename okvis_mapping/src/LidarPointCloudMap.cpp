@@ -139,8 +139,8 @@ class MappedChunk {
 /// seek/read pair per displayed point. The kernel still pages only the touched
 /// regions, while complete export remains a sequential traversal.
 void visitPoints(const LidarPointCloudMap::Snapshot& snapshot, size_t stride,
-                 const std::function<void(const Eigen::Vector3d&)>& visit) {
-  uint64_t offset = 0, next = 0;
+                 const std::function<void(const Eigen::Vector3d&)>& visit, size_t initialSkip = 0) {
+  uint64_t offset = 0, next = initialSkip;
   for (const auto& submap : snapshot) {
     const uint64_t count = pointCount(submap);
     if (count > std::numeric_limits<uint64_t>::max() - offset) {
@@ -625,7 +625,9 @@ LidarPointCloudMap::Snapshot LidarPointCloudMap::snapshot(
   Snapshot result;
   for (const auto& entry : submaps) {
     const auto& submap = entry.second;
-    for (const auto& chunk : submap.chunks) result.push_back({submap.pose, {}, chunk});
+    size_t chunkIndex = 0;
+    for (const auto& chunk : submap.chunks)
+      result.push_back({submap.pose, {}, chunk, entry.first, chunkIndex++});
     if (submap.voxels.empty()) continue;
     if (!submap.cachedPoints) {
       auto points = std::make_shared<Points>();
@@ -633,7 +635,7 @@ LidarPointCloudMap::Snapshot LidarPointCloudMap::snapshot(
       for (const auto& voxel : submap.voxels) points->push_back(voxel.second);
       submap.cachedPoints = std::move(points);
     }
-    result.push_back({submap.pose, submap.cachedPoints, {}});
+    result.push_back({submap.pose, submap.cachedPoints, {}, entry.first, chunkIndex});
   }
   return result;
 }
@@ -678,8 +680,40 @@ LidarPointCloudMap::Points LidarPointCloudMap::assembleUnfiltered(const Snapshot
   return points;
 }
 
+uint64_t LidarPointCloudMap::sampledPointCount(const Snapshot& snapshot, size_t samplingStep,
+    size_t initialSkip) {
+  if (!samplingStep || initialSkip >= samplingStep)
+    throw std::invalid_argument("LiDAR display requires a positive step and skip smaller than step");
+  uint64_t total = 0;
+  for (const auto& submap : snapshot) {
+    const uint64_t count = pointCount(submap);
+    if (count > std::numeric_limits<uint64_t>::max() - total)
+      throw std::overflow_error("LiDAR display point count overflow");
+    total += count;
+  }
+  return total > initialSkip ? 1 + (total - 1 - initialSkip) / samplingStep : 0;
+}
+
+void LidarPointCloudMap::forEachSampledPoint(const Snapshot& snapshot, size_t samplingStep,
+    const std::function<void(const Eigen::Vector3d&)>& visit, size_t initialSkip) {
+  if (!samplingStep || initialSkip >= samplingStep || !visit)
+    throw std::invalid_argument("LiDAR display requires a positive sampling step and visitor");
+  visitPoints(snapshot, samplingStep, visit, initialSkip);
+}
+
 bool LidarPointCloudMap::savePcd(const Snapshot& snapshot, double voxelSize,
                                const std::string& filename, size_t workspaceBytes) {
+  return savePcdImpl(snapshot, voxelSize, filename, workspaceBytes, {});
+}
+
+bool LidarPointCloudMap::saveColoredPcd(const Snapshot& snapshot, double voxelSize,
+    const std::string& filename, const Colour& colour, size_t workspaceBytes) {
+  if (!colour) throw std::invalid_argument("Coloured PCD export requires a colour function");
+  return savePcdImpl(snapshot, voxelSize, filename, workspaceBytes, colour);
+}
+
+bool LidarPointCloudMap::savePcdImpl(const Snapshot& snapshot, double voxelSize,
+    const std::string& filename, size_t workspaceBytes, const Colour& colour) {
   LidarPointCloudMap sampler(voxelSize);
   if (filename.empty() || workspaceBytes < 4096) throw std::invalid_argument("PCD export requires a filename and >=4096 workspace bytes");
   bool any = false;
@@ -764,7 +798,10 @@ bool LidarPointCloudMap::savePcd(const Snapshot& snapshot, double voxelSize,
   if (finalRun.empty()) return false;
   const uint64_t count = fs::file_size(finalRun) / sizeof(ExportRecord);
   atomicWrite(output, [&](std::ofstream& out) {
-    out << "# .PCD v0.7 - Point Cloud Data file format\nVERSION 0.7\nFIELDS x y z\nSIZE 4 4 4\nTYPE F F F\nCOUNT 1 1 1\nWIDTH "
+    out << "# .PCD v0.7 - Point Cloud Data file format\nVERSION 0.7\n"
+        << (colour ? "FIELDS x y z rgb\nSIZE 4 4 4 4\nTYPE F F F F\nCOUNT 1 1 1 1\n"
+                   : "FIELDS x y z\nSIZE 4 4 4\nTYPE F F F\nCOUNT 1 1 1\n")
+        << "WIDTH "
         << count << "\nHEIGHT 1\nVIEWPOINT 0 0 0 1 0 0 0\nPOINTS " << count << "\nDATA binary\n";
     std::ifstream in(finalRun, std::ios::binary);
     if (!in) throw std::runtime_error("Cannot reopen final PCD sort run");
@@ -775,6 +812,11 @@ bool LidarPointCloudMap::savePcd(const Snapshot& snapshot, double voxelSize,
         throw std::runtime_error("World point cannot be represented by PCD float XYZ");
       }
       out.write(reinterpret_cast<const char*>(xyz), sizeof(xyz));
+      if (colour) {
+        const uint32_t rgb = colour(Eigen::Vector3d(record.xyz[0], record.xyz[1], record.xyz[2]))
+            & 0x00ffffffu;
+        out.write(reinterpret_cast<const char*>(&rgb), sizeof(rgb));
+      }
     }
   });
   return true;

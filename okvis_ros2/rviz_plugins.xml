@@ -1,0 +1,10 @@
+<library path="okvis_lidar_map_rviz">
+  <class name="okvis/GlobalLidarMap" type="okvis::GlobalLidarMapRvizDisplay" base_class_type="rviz_common::Display">
+    <description>Persistent coloured keyframe point clouds with incremental geometry uploads, TF pose corrections and bounded receive queues.</description>
+    <message_type>visualization_msgs/msg/MarkerArray</message_type>
+  </class>
+  <class name="okvis/LiveLidarScan" type="okvis::LiveLidarScanRvizDisplay" base_class_type="rviz_common::Display">
+    <description>Current white raw LiDAR scan with bounded timestamp-correct TF waiting and automatic DDS reliability selection.</description>
+    <message_type>sensor_msgs/msg/PointCloud2</message_type>
+  </class>
+</library>

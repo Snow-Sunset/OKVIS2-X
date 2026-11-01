@@ -54,7 +54,18 @@ ThreadedSlam::ThreadedSlam(ViParameters &parameters, std::string dBowDir, se::Su
   submapConfig_(subMapConfig),
   useAlignmentFactors_(submapConfig_.useMap2LiveFactors)
 {
-  lidarMeasurementsReceived_.configureMemory();
+  if (parameters_.estimator.realtime_lidar_buffer_scans < 1
+      || parameters_.estimator.realtime_lidar_buffer_scans > 64
+      || parameters_.estimator.realtime_lidar_buffer_bytes < 1024
+      || parameters_.estimator.realtime_lidar_buffer_bytes > 256 * 1024 * 1024)
+    throw std::invalid_argument("Invalid realtime LiDAR input history budget");
+  lidarMeasurementsReceived_.configureMemory(
+      size_t(parameters_.estimator.realtime_lidar_buffer_scans),
+      size_t(parameters_.estimator.realtime_lidar_buffer_bytes));
+  LOG(INFO) << "Live LiDAR history v2: packed scans; pending scan limit="
+            << parameters_.estimator.realtime_lidar_buffer_scans
+            << ", payload byte limit=" << parameters_.estimator.realtime_lidar_buffer_bytes
+            << "; consumer coalesces obsolete scans; tracking feedback precedes full publication handoff";
   setBlocking(false);
   init();
   
@@ -387,8 +398,10 @@ bool ThreadedSlam::addLidarMeasurements(const LidarMeasurementBatch& measurement
     const auto stats = lidarMeasurementsReceived_.statistics();
     const uint64_t consumerNs = lidarConsumerTimeNs_.load(std::memory_order_relaxed);
     LOG_EVERY_N(WARNING, 40) << "Realtime LiDAR input replaced " << result.droppedScans
-                           << " old waiting scan (" << result.dropped << " rays); active scan retained"
+                           << " far-future waiting scan (" << result.dropped << " rays); active/older scans retained"
                            << "; queued rays=" << stats.queued
+                           << ", pending scans=" << stats.pendingScans
+                           << ", resident bytes=" << stats.residentBytes
                            << ", total replaced scans=" << stats.droppedScans
                            << ", consumer time ns=" << consumerNs
                            << ", oldest queued ns=" << (stats.hasFront ? stats.oldest.toNSec() : 0)
@@ -396,7 +409,10 @@ bool ThreadedSlam::addLidarMeasurements(const LidarMeasurementBatch& measurement
                            << ", input lead s=" << (consumerNs
                                ? (double(stats.newest.toNSec()) - double(consumerNs)) * 1.e-9 : -1.0);
   }
-  return !result.stopped;
+  if (result.rejected) {
+    LOG_EVERY_N(WARNING, 40) << "Realtime LiDAR scan exceeds remaining payload budget; active scan retained";
+  }
+  return !result.stopped && !result.rejected;
 }
 
 // Add a GPS measurement.
@@ -685,10 +701,7 @@ bool ThreadedSlam::processBackendFrame() {
     }
 
     lidarConsumerTimeNs_.store(multiFrame->timestamp().toNSec(), std::memory_order_relaxed);
-    lidarMeasurementsReceived_.PopWhile(
-        [&](const LidarMeasurement& measurement) {
-          return measurement.timeStamp < multiFrame->timestamp();
-        }, static_cast<LidarMeasurementDeque*>(nullptr));
+    lidarMeasurementsReceived_.PopBefore(multiFrame->timestamp(), nullptr);
 
     // Drop GPS Measurements that are older than the first frame (= first state)
     while(!gpsMeasurementsReceived_.Empty() && gpsMeasurementsReceived_.queue_.front().timeStamp < multiFrame ->timestamp()){
@@ -822,10 +835,16 @@ bool ThreadedSlam::processBackendFrame() {
 
     // now also get all relevant LiDAR measurements received thus far
     lidarConsumerTimeNs_.store(multiFrame->timestamp().toNSec(), std::memory_order_relaxed);
-    lidarMeasurementsReceived_.PopWhile(
-        [&](const LidarMeasurement& measurement) {
-          return measurement.timeStamp < multiFrame->timestamp();
-        }, &lidarMeasurementDeque_);
+    lidarMeasurementsReceived_.PopBefore(multiFrame->timestamp(), &lidarMeasurementDeque_);
+    if (parameters_.lidar && useAlignmentFactors_) {
+      const auto input = lidarMeasurementsReceived_.statistics();
+      LOG_EVERY_N(INFO, 100) << "Realtime LiDAR aligned input: queued=" << input.queued
+                           << ", pending scans=" << input.pendingScans
+                           << ", resident bytes=" << input.residentBytes
+                           << ", coalesced completed scans=" << input.coalescedScans
+                           << ", overflow replaced scans=" << input.droppedScans
+                           << ", rejected scans=" << input.rejectedScans;
+    }
 
     // Get depth measurements: in stereo network, depth and multiFrame are perfectly synced.
     while(!shutdown_ && !depthMeasurementsReceived_.Empty() && depthMeasurementsReceived_.queue_.front().timeStamp <= multiFrame->timestamp())
@@ -980,7 +999,19 @@ bool ThreadedSlam::processBackendFrame() {
             observed_points = motionUndistortion.filterObserved(previousSubmap_, estimator_.pose(StateId(previousSubmapId_)));
           }
           if (!deskewed) {
-            LOG_EVERY_N(WARNING, 40) << "Skipped live LiDAR factors: incomplete motion propagation";
+            LOG_EVERY_N(WARNING, 40) << "Skipped live LiDAR factors: incomplete motion propagation"
+                << "; rays=" << lidarMeasurementDeque_.size()
+                << ", scan begin ns=" << (lidarMeasurementDeque_.empty()
+                    ? 0 : lidarMeasurementDeque_.front().timeStamp.toNSec())
+                << ", scan end ns=" << (lidarMeasurementDeque_.empty()
+                    ? 0 : lidarMeasurementDeque_.back().timeStamp.toNSec())
+                << ", anchor ns=" << lastOptimisedState_.timestamp.toNSec()
+                << ", image ns=" << multiFrame->timestamp().toNSec()
+                << ", IMU count=" << imuMeasurementDeque_.size()
+                << ", IMU begin ns=" << (imuMeasurementDeque_.empty()
+                    ? 0 : imuMeasurementDeque_.front().timeStamp.toNSec())
+                << ", IMU end ns=" << (imuMeasurementDeque_.empty()
+                    ? 0 : imuMeasurementDeque_.back().timeStamp.toNSec());
           }
           // For point-to-plane, count valid spatial candidates before the final
           // factor limit, rather than raw duplicates or the truncated factor set.
@@ -1140,6 +1171,7 @@ void ThreadedSlam::optimisePublishMarginalise(MultiFramePtr multiFrame,
   kinematics::Transformation T_WS;
   SpeedAndBias speedAndBiases;
   const size_t numCameras = parameters_.nCameraSystem.numCameras();
+  std::optional<PublicationData> pendingPublication;
 
   // optimise (if initialised)
   TimerSwitchable optimiseTimer("3 Optimise");
@@ -1229,7 +1261,7 @@ void ThreadedSlam::optimisePublishMarginalise(MultiFramePtr multiFrame,
     // current state & tracking info via State and Tracking State.
     // the graph:
     std::vector<StateId> updatedStateIds;
-    PublicationData publicationData;
+    auto& publicationData = pendingPublication.emplace();
     publicationData.state = state;
     publicationData.trackingState = trackingState;
     publicationData.updatedStates.reset(new AlignedMap<StateId, State>());
@@ -1296,18 +1328,6 @@ void ThreadedSlam::optimisePublishMarginalise(MultiFramePtr multiFrame,
       publicationData.landmarksPublish->push_back(
             MapPoint(lm.first.value(), lm.second.point, lm.second.quality,
                      latestObservedFrameId.getFrameId()));
-    }
-
-    publicationPending_.fetch_add(1);
-    if (blocking_ || parameters_.estimator.memory_bounded) {
-      if (!publicationQueue_.PushBlockingIfFull(publicationData, blocking_ ? 1 : 3))
-        publicationPending_.fetch_sub(1);
-    } else {
-      const bool overrun = publicationQueue_.PushNonBlockingDroppingIfFull(publicationData, 3);
-      if (overrun) {
-        publicationPending_.fetch_sub(1); // account for the replaced queued update.
-        LOG(ERROR) << "publication (full update) overrun: dropping";
-      }
     }
 
     // if(realtimePropagation_) {
@@ -1399,6 +1419,20 @@ void ThreadedSlam::optimisePublishMarginalise(MultiFramePtr multiFrame,
     size_t(parameters_.estimator.num_imu_frames), affectedStates_, expand);
   marginaliseTimer.stop();
   publishTrackingSnapshot();
+  // Lightweight immutable tracking feedback must become visible BEFORE a
+  // bounded full-graph publication queue can block this backend. Keep every
+  // accepted publication and its existing queue policy; only its handoff moves.
+  if (pendingPublication) {
+    TimerSwitchable publicationWait("4.1 Full publication queue wait");
+    publicationPending_.fetch_add(1);
+    if (blocking_ || parameters_.estimator.memory_bounded) {
+      if (!publicationQueue_.PushBlockingIfFull(*pendingPublication, blocking_ ? 1 : 3))
+        publicationPending_.fetch_sub(1);
+    } else if (publicationQueue_.PushNonBlockingDroppingIfFull(*pendingPublication, 3)) {
+      publicationPending_.fetch_sub(1);
+      LOG(ERROR) << "publication (full update) overrun: dropping";
+    }
+  }
 }
 
 bool ThreadedSlam::needsNewLidarKeyframe()
@@ -1441,6 +1475,7 @@ void ThreadedSlam::publishingLoop()
     PublicationData publicationData;
     if(publicationQueue_.PopBlocking(&publicationData)) {
       if(optimisedGraphCallback_) {
+        TimerSwitchable callbackTimer("4.2 Full publication callback");
         optimisedGraphCallback_(publicationData.state, publicationData.trackingState,
                                 publicationData.updatedStates, publicationData.landmarksPublish);
       }

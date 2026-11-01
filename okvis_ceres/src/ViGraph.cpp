@@ -33,6 +33,7 @@
 #include <filesystem>
 #include <iostream>
 #include <string>
+#include <utility>
 
 
 /// \brief okvis Main namespace of this package.
@@ -1664,23 +1665,23 @@ bool ViGraph::getLandmark(LandmarkId landmarkId, MapPoint2& mapPoint) const
   OKVIS_ASSERT_TRUE_DBG(Exception, landmarks_.count(landmarkId), "landmark does not exists")
   std::set<KeypointIdentifier> observations;
   const Landmark & landmark = landmarks_.at(landmarkId);
-  for(auto observation : landmark.observations) {
-    observations.insert(observation.first);
+  for(const auto& observation : landmark.observations) {
+    observations.insert(observations.end(), observation.first);
   }
-  mapPoint = MapPoint2{landmarkId, landmark.hPoint->estimate(), observations,
+  mapPoint = MapPoint2{landmarkId, landmark.hPoint->estimate(), std::move(observations),
       landmark.hPoint->initialized(), landmark.quality, landmark.classification};
   return true;
 }
 
 size_t ViGraph::getLandmarks(MapPoints &landmarks) const
 {
-  for(auto& landmark : landmarks_) {
+  for(const auto& landmark : landmarks_) {
     std::set<KeypointIdentifier> observations;
-    for(auto observation : landmark.second.observations) {
-      observations.insert(observation.first);
+    for(const auto& observation : landmark.second.observations) {
+      observations.insert(observations.end(), observation.first);
     }
     landmarks[landmark.first] = MapPoint2{
-        landmark.first, landmark.second.hPoint->estimate(), observations,
+        landmark.first, landmark.second.hPoint->estimate(), std::move(observations),
         landmark.second.hPoint->initialized(), landmark.second.quality,
         landmark.second.classification};
   }

@@ -355,6 +355,19 @@ void ViParametersReader::readConfigFile(const std::string& filename) {
 
   // Parameters regarding the estimator.
   const auto estimatorNode = file["estimator_parameters"];
+  const EstimatorParameters estimatorDefaults{};
+  viParameters_.estimator.realtime_lidar_buffer_scans = estimatorDefaults.realtime_lidar_buffer_scans;
+  viParameters_.estimator.realtime_lidar_buffer_bytes = estimatorDefaults.realtime_lidar_buffer_bytes;
+  if (!estimatorNode["realtime_lidar_buffer_scans"].empty())
+    parseEntry(estimatorNode, "realtime_lidar_buffer_scans", viParameters_.estimator.realtime_lidar_buffer_scans);
+  if (!estimatorNode["realtime_lidar_buffer_bytes"].empty())
+    parseEntry(estimatorNode, "realtime_lidar_buffer_bytes", viParameters_.estimator.realtime_lidar_buffer_bytes);
+  OKVIS_ASSERT_TRUE(Exception, viParameters_.estimator.realtime_lidar_buffer_scans > 0
+      && viParameters_.estimator.realtime_lidar_buffer_scans <= 64,
+      "realtime_lidar_buffer_scans must be in [1, 64]")
+  OKVIS_ASSERT_TRUE(Exception, viParameters_.estimator.realtime_lidar_buffer_bytes >= 1024
+      && viParameters_.estimator.realtime_lidar_buffer_bytes <= 256 * 1024 * 1024,
+      "realtime_lidar_buffer_bytes must be in [1024, 268435456]")
   if (!estimatorNode["memory_bounded"].empty())
     parseEntry(estimatorNode, "memory_bounded", viParameters_.estimator.memory_bounded);
   parseEntry(file["estimator_parameters"], "num_keyframes",

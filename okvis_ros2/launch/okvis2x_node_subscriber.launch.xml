@@ -12,6 +12,15 @@
     <arg name="csv_path" default="/tmp/"/>
     <arg name="mesh_cutoff_z" default="2.5"/>
     <arg name="save_submap_meshes" default="false"/>
+    <!-- The LiDAR launch enables the independent PCD map by default.
+         Set global_lidar_pcd:=false to opt out; other launch branches stay unchanged. -->
+    <arg name="global_lidar_pcd" default="true"/>
+    <arg name="global_lidar_pcd_file" default=""/>
+    <arg name="global_lidar_sampling_step" default="1"/>
+    <arg name="global_lidar_publish_interval" default="0.5"/>
+    <arg name="global_lidar_publish_lidar_tf" default="true"/>
+    <arg name="global_lidar_height_min" default="-2.0"/>
+    <arg name="global_lidar_height_max" default="5.0"/>
     <arg name="rviz" default="true"/>
     <arg name="mesh" default="realsense.dae"/>
     <set_env name="OMP_NUM_THREADS" value="2"/>
@@ -37,6 +46,13 @@
     </node>
 
     <node pkg="okvis" exec="okvis2x_node_subscriber" name="okvis" namespace="okvis" if="$(var lidar)">
+        <param name="global_lidar_pcd.enabled" type="bool" value="$(var global_lidar_pcd)"/>
+        <param name="global_lidar_pcd.output_file" type="str" value="$(var global_lidar_pcd_file)"/>
+        <param name="global_lidar_pcd.preview_sampling_step" type="int" value="$(var global_lidar_sampling_step)"/>
+        <param name="global_lidar_pcd.publish_interval" type="float" value="$(var global_lidar_publish_interval)"/>
+        <param name="global_lidar_pcd.publish_lidar_tf" type="bool" value="$(var global_lidar_publish_lidar_tf)"/>
+        <param name="global_lidar_pcd.height_min" type="float" value="$(var global_lidar_height_min)"/>
+        <param name="global_lidar_pcd.height_max" type="float" value="$(var global_lidar_height_max)"/>
         <param name="lidar_ouster_time_reference" value="$(var lidar_ouster_time_reference)"/>
         <!-- Set the State publishing rate to value > 0.0 if state publishing needed -->
         <!--param name="imu_propagated_state_publishing_rate" type="float" value="40.0"/-->

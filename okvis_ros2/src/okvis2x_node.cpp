@@ -43,6 +43,7 @@
 
 #include <okvis/ThreadedSlam.hpp>
 #include <okvis/ros2/Publisher.hpp>
+#include <okvis/ros2/GlobalLidarPcdMapper.hpp>
 #include <okvis/ThreadedPublisher.hpp>
 
 #include <std_srvs/srv/set_bool.hpp>
@@ -136,6 +137,7 @@ int main(int argc, char **argv) {
     publisher.setMeshCutoffZ(mesh_cutoff_z);
   }
 
+  okvis::GlobalLidarPcdMapper globalLidarPcd(node, parameters, csv_path);
   okvis::ThreadedSlam estimator(parameters, dBowVocDir, submapConfig);
   estimator.setBlocking(false);
 
@@ -294,6 +296,7 @@ int main(int argc, char **argv) {
     publisher.setupImageTopics(parameters.nCameraSystem);
     estimator.setFrontendStateCallback([&](const okvis::State& state,
         const okvis::TrackingState& trackingState, uint64_t feedbackVersion) {
+      globalLidarPcd.frontendStateCallback(state, trackingState);
       publisher.publishFrontendState(state, trackingState, feedbackVersion);
     });
 
@@ -303,6 +306,7 @@ int main(int argc, char **argv) {
                                               std::shared_ptr<const okvis::MapPointVector> _4){
         publisher.publishEstimatorUpdate(_1,_2,_3,_4);
         seInterface->stateUpdateCallback(_1,_2,_3);
+        globalLidarPcd.stateUpdateCallback(_2, _3);
       });
 
       estimator.setAlignmentPublishCallback([&](const okvis::Time& timestamp, const okvis::kinematics::Transformation& T_WS,
@@ -339,6 +343,7 @@ int main(int argc, char **argv) {
                                               std::shared_ptr<const okvis::AlignedMap<okvis::StateId, okvis::State>> _3,
                                               std::shared_ptr<const okvis::MapPointVector> _4){
         publisher.publishEstimatorUpdate(_1,_2,_3,_4);
+        globalLidarPcd.stateUpdateCallback(_2, _3);
       });
     }
                     
@@ -428,6 +433,9 @@ int main(int argc, char **argv) {
     // Write CSV
     estimator.setFinalTrajectoryCsvFile(csv_path + "/okvis2-final_trajectory.csv", false);
     estimator.writeFinalTrajectoryCsv();
+    // All sensor callbacks and final BA/publication have stopped. Export stays
+    // on the independent PCD worker and cannot race its pose corrections.
+    globalLidarPcd.shutdown();
 
     if (saveLidarMap && seInterface && parameters.lidar && submapConfig.buildLidarPointCloudMap) {
       const std::string defaultFilename = seInterface->memoryArchiveDirectory().empty()

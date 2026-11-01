@@ -33,7 +33,7 @@
 
 #include <okvis/cameras/NCameraSystem.hpp>
 #include <okvis/Measurements.hpp>
-#include <okvis/LidarMeasurementBuffer.hpp>
+#include <okvis/RealtimeLidarMeasurementBuffer.hpp>
 #include <okvis/Frontend.hpp>
 #include <okvis/TrackingFrontend.hpp>
 #include <okvis/MultiFrame.hpp>
@@ -344,8 +344,8 @@ private:
   threadsafe::Queue<okvis::ImuMeasurement, Eigen::aligned_allocator<okvis::ImuMeasurement>>
       imuMeasurementsReceived_;
 
-  /// One active LiDAR scan plus one replaceable waiting scan.
-  LidarMeasurementBuffer lidarMeasurementsReceived_;
+  /// Pinned active LiDAR scan plus bounded, timestamp-preserving scan history.
+  RealtimeLidarMeasurementBuffer lidarMeasurementsReceived_;
 
   /// Depth-sigma measurement input queue.
   threadsafe::Queue<okvis::CameraMeasurement, Eigen::aligned_allocator<okvis::CameraMeasurement>>

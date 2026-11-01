@@ -130,6 +130,8 @@ struct FrontendParameters {
  */
 struct EstimatorParameters {
   bool memory_bounded = true; ///< Release cold images and bound transient sensor working sets; no history disk archive.
+  int realtime_lidar_buffer_scans = 16; ///< Pending complete scans; active scan is separately pinned.
+  int realtime_lidar_buffer_bytes = 64 * 1024 * 1024; ///< Total packed live-scan payload budget.
   int num_keyframes; ///< Number of keyframes in optimisation window.
   int num_loop_closure_frames; ///< Number of loop closure frames in optimisation window.
   int num_imu_frames; ///< Number of frames linked by most recent nonlinear IMU error terms.

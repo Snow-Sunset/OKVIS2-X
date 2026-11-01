@@ -16,6 +16,8 @@ option (BUILD_POINT_TO_PLANE_TESTS
         "Build focused LiDAR plane map and factor checks" OFF)
 option (BUILD_ROS2
         "Builds ros2 wrapper" ON)
+option (BUILD_LIDAR_MAP_RVIZ_PLUGIN
+        "Builds the incremental global LiDAR RViz display" ON)
 option (HAVE_LIBREALSENSE
         "Use realsense as part of okvis" ON)
 option (USE_NN
@@ -464,6 +466,7 @@ if(BUILD_ROS2)
   # ROS2 dependencies
   find_package(ament_cmake REQUIRED)
   find_package(ament_cmake_python REQUIRED)
+  include(cmake/OkvisRosYamlCpp.cmake)
   find_package(builtin_interfaces REQUIRED)
   find_package(eigen3_cmake_module REQUIRED)
   find_package(Eigen3 REQUIRED)
@@ -478,6 +481,11 @@ if(BUILD_ROS2)
   find_package(Boost REQUIRED)
   find_package(tf2_eigen REQUIRED)
   find_package(tf2_geometry_msgs REQUIRED)
+  if(BUILD_LIDAR_MAP_RVIZ_PLUGIN)
+    find_package(rviz_common REQUIRED)
+    find_package(rviz_rendering REQUIRED)
+    find_package(pluginlib REQUIRED)
+  endif()
 
   find_package(PCL REQUIRED QUIET COMPONENTS common)
   include_directories(${PCL_INCLUDE_DIRS} include)
@@ -505,6 +513,8 @@ if(BUILD_ROS2)
   set(LIB_NAME okvis_ros2)
   add_library(${LIB_NAME}
     okvis_ros2/src/Subscriber.cpp
+    okvis_ros2/src/GlobalLidarPcdMapper.cpp
+    okvis_ros2/src/GlobalLidarMapDisplay.cpp
     okvis_ros2/src/RosbagReader.cpp
     okvis_ros2/src/Publisher.cpp
     okvis_ros2/src/RePublisher.cpp
@@ -603,7 +613,24 @@ if(BUILD_ROS2)
   )
   install(DIRECTORY include/okvis DESTINATION ${CMAKE_INSTALL_INCLUDEDIR} FILES_MATCHING PATTERN "*.hpp")
 
+  # Kept separate from the SLAM/mapper library: rendering runs inside RViz.
+  if(BUILD_LIDAR_MAP_RVIZ_PLUGIN)
+    add_library(okvis_lidar_map_rviz SHARED
+      okvis_ros2/src/GlobalLidarMapRvizDisplay.cpp
+      okvis_ros2/src/LiveLidarScanRvizDisplay.cpp)
+    target_compile_features(okvis_lidar_map_rviz PRIVATE cxx_std_17)
+    target_include_directories(okvis_lidar_map_rviz PRIVATE okvis_ros2/include)
+    ament_target_dependencies(okvis_lidar_map_rviz
+      rclcpp sensor_msgs visualization_msgs rviz_common rviz_rendering pluginlib)
+    pluginlib_export_plugin_description_file(rviz_common okvis_ros2/rviz_plugins.xml)
+    install(TARGETS okvis_lidar_map_rviz LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR})
+  endif()
+
   if(BUILD_TESTS OR BUILD_POINT_TO_PLANE_TESTS)
+    add_executable(okvis_global_lidar_pcd_mapper_test okvis_ros2/test/TestGlobalLidarPcdMapper.cpp)
+    target_link_libraries(okvis_global_lidar_pcd_mapper_test PRIVATE okvis::Ros2)
+    add_test(NAME okvis_global_lidar_pcd_mapper COMMAND okvis_global_lidar_pcd_mapper_test)
+    set_tests_properties(okvis_global_lidar_pcd_mapper PROPERTIES TIMEOUT 30 ENVIRONMENT "ROS_DOMAIN_ID=192")
     add_executable(okvis_lidar_map_publisher_test okvis_ros2/test/TestLidarMapPublisher.cpp)
     target_link_libraries(okvis_lidar_map_publisher_test PRIVATE okvis::Ros2)
     add_test(NAME okvis_lidar_map_publisher COMMAND okvis_lidar_map_publisher_test)

@@ -24,6 +24,7 @@
 #include <sched.h>
 #include <sys/resource.h>
 #include <thread>
+#include <utility>
 
 #include <brisk/brisk.h>
 
@@ -1225,9 +1226,11 @@ int Frontend::matchToMap(Estimator &estimator, const okvis::ViParameters& params
     return 0;
   }
 
+  TimerSwitchable mapCopyTimer("2.01.1 Copy map landmarks");
   // get all landmarks
   MapPoints pointMap;
   estimator.getLandmarks(pointMap);
+  mapCopyTimer.stop();
 
   // these may be needed for loop-closure map fusion
   std::vector<LandmarkId> oldIds, newIds;
@@ -1241,6 +1244,12 @@ int Frontend::matchToMap(Estimator &estimator, const okvis::ViParameters& params
   std::vector<cv::Mat> descriptorPool(params.nCameraSystem.numCameras());
   kinematics::Transformation T_WS1 = estimator.pose(StateId(currentFrameId));
   double reprErr = 0.0;
+  // Pose/extrinsics do not change during descriptor preparation and the first
+  // matching pass. Reuse each observation camera pose across landmarks/cameras.
+  // This cache is call-local: the later pose refinement cannot leave stale
+  // transforms for the next frame, loop correction or online calibration.
+  AlignedMap<std::pair<StateId, size_t>, kinematics::Transformation> observationCameraPoses;
+  size_t observationVisits = 0;
   for (size_t im = 0; im < params.nCameraSystem.numCameras(); ++im) {
 
     // the current frame to match
@@ -1259,8 +1268,10 @@ int Frontend::matchToMap(Estimator &estimator, const okvis::ViParameters& params
     const double maxU = multiFrame->geometryAs<CAMERA_GEOMETRY>(im)->imageWidth() + reprThreshold;
     const double maxV = multiFrame->geometryAs<CAMERA_GEOMETRY>(im)->imageHeight() + reprThreshold;
 
-    // prepare landmarks as visible in this frame
-    AlignedMap<LandmarkId, LandmarkToMatch> landmarksToMatch;
+    TimerSwitchable descriptorTimer("2.01.2 Prepare map descriptors");
+    // Build directly in the owning container used by both matching passes.
+    // Avoid copying every map node and its Eigen observation matrices.
+    auto& landmarksToMatch = landmarksToMatchVec[im];
     const kinematics::Transformation T_SC = *multiFrame->T_SC(im);
     const kinematics::Transformation T_WC1 = T_WS1 * T_SC;
     const kinematics::Transformation T_CW1 = T_WC1.inverse();
@@ -1328,19 +1339,23 @@ int Frontend::matchToMap(Estimator &estimator, const okvis::ViParameters& params
            ++obsiter) {
 
         const KeypointIdentifier kid = *obsiter;
+        ++observationVisits;
 
         // remove some descriptors that are unlikely to match
-        const kinematics::Transformation T_SC_old =
-            *multiFrame->T_SC(kid.cameraIndex);
-        const kinematics::Transformation T_WS_old =
-            estimator.pose(StateId(kid.frameId));
-        const kinematics::Transformation T_WC_old = T_WS_old * T_SC_old;
-        const Eigen::Vector3d r_W_old = hp_W.head<3>()/hp_W[3] - T_WC_old.r();
+        const auto cameraKey = std::make_pair(StateId(kid.frameId), size_t(kid.cameraIndex));
+        auto cameraPose = observationCameraPoses.find(cameraKey);
+        if (cameraPose == observationCameraPoses.end()) {
+          const kinematics::Transformation T_WS_old = estimator.pose(cameraKey.first);
+          cameraPose = observationCameraPoses.emplace(
+              cameraKey, T_WS_old * (*multiFrame->T_SC(kid.cameraIndex))).first;
+        }
+        const auto& T_WC_old = cameraPose->second;
+        const Eigen::Vector3d r_W_old = landmarkToMatch.p_W - T_WC_old.r();
 
         // check if 3D
         if(!landmarkToMatch.is3d) {
           const Eigen::Vector3d r_close_W = r_W-(0.2/focalLength/quality*r_W_old);
-          const double cosA = r_W.normalized().dot(r_close_W.normalized());
+          const double cosA = e_W.dot(r_close_W.normalized());
           if(cosA > cos(10.0/focalLength)) {
             landmarkToMatch.is3d = true;
           }
@@ -1410,11 +1425,12 @@ int Frontend::matchToMap(Estimator &estimator, const okvis::ViParameters& params
       }
 
       // insert
-      landmarksToMatch[landmarkId] = landmarkToMatch;
+      landmarksToMatch[landmarkId] = std::move(landmarkToMatch);
     }
-    landmarksToMatchVec[im] = landmarksToMatch;
+    descriptorTimer.stop();
 
     // multithreaded matching
+    TimerSwitchable matchingTimer("2.01.3 Match initialised map points");
     const size_t num_matching_threads = size_t(params.frontend.num_matching_threads);
 
     std::vector<double> distances(numKeypoints,briskMatchingThreshold_);
@@ -1439,6 +1455,7 @@ int Frontend::matchToMap(Estimator &estimator, const okvis::ViParameters& params
       delete threads[t];
       reprErr += reprErrors[t];
     }
+    matchingTimer.stop();
 
     // now insert observations
     for(size_t k = 0; k < numKeypoints; ++k) {
@@ -1463,7 +1480,12 @@ int Frontend::matchToMap(Estimator &estimator, const okvis::ViParameters& params
       }
     }
   }
+  LOG_EVERY_N(INFO, 100) << "Backend map matching v2: landmarks=" << pointMap.size()
+      << ", observation visits=" << observationVisits
+      << ", cached observation camera poses=" << observationCameraPoses.size()
+      << ", loop subset=" << bool(loopClosureLandmarksToUseExclusively);
   //OKVIS_ASSERT_TRUE(Exception, estimator.areLandmarksInFrontOfCameras(), "before ransac")
+  TimerSwitchable refinementTimer("2.01.4 Initial pose refinement");
   reprErr /= double(params.frontend.num_matching_threads * params.nCameraSystem.numCameras());
 
   // remove outliers -- initialise pose only without IMU or when matching with large repr. err.
@@ -1509,8 +1531,10 @@ int Frontend::matchToMap(Estimator &estimator, const okvis::ViParameters& params
   if (ctr <= 3 && isInitialized_) {
     secondRansac = true;
   }
+  refinementTimer.stop();
 
   // now the non-initialised ones
+  TimerSwitchable uninitialisedTimer("2.01.5 Match uninitialised map points");
   for (size_t im = 0; im < params.nCameraSystem.numCameras(); ++im) {
     // the current frame to match
     const MultiFramePtr multiFrame = estimator.multiFrame(StateId(currentFrameId));
@@ -1621,6 +1645,7 @@ int Frontend::matchToMap(Estimator &estimator, const okvis::ViParameters& params
     }
   }
   //OKVIS_ASSERT_TRUE(Exception, estimator.areLandmarksInFrontOfCameras(), "after non-initialised match to map")
+  uninitialisedTimer.stop();
 
   // merge landmarks, if loop-closure matching
   if(loopClosureLandmarksToUseExclusively) {
@@ -1629,6 +1654,7 @@ int Frontend::matchToMap(Estimator &estimator, const okvis::ViParameters& params
 
   // final two steps optimisation
   if (secondRansac) {
+    TimerSwitchable recoveryTimer("2.01.6 Recovery pose refinement");
     LOG(INFO) << "Running RANSAC also with uninitialised landmarks";
     const bool ransacSuccess = runRansac3d2d(estimator, multiFrame->cameraSystem(), multiFrame,
                                              secondRansac, ransacRemoveOutliers);

@@ -119,7 +119,7 @@ Visualization Manager:
       Color: 255; 255; 255
       Color Transformer: RGB8
       Decay Time: 0
-      Enabled: true
+      Enabled: false
       Invert Rainbow: false
       Max Color: 255; 255; 255
       Max Intensity: 4096
@@ -140,6 +140,40 @@ Visualization Manager:
         Value: /okvis/okvis_points_matched
       Use Fixed Frame: true
       Use rainbow: true
+      Value: false
+    - Alpha: 1
+      Class: rviz_default_plugins/PointCloud2
+      Color Transformer: RGB8
+      Decay Time: 0
+      Enabled: false
+      Name: Global LiDAR Full Snapshot (Slow)
+      Position Transformer: XYZ
+      Selectable: false
+      Size (Pixels): 2
+      Size (m): 0.03
+      Style: Points
+      Topic:
+        Depth: 1
+        Durability Policy: Volatile
+        Filter size: 1
+        History Policy: Keep Last
+        Reliability Policy: Best Effort
+        Value: /okvis/global_lidar_map
+      Use Fixed Frame: true
+      Value: false
+    - Class: okvis/GlobalLidarMap
+      Enabled: true
+      Name: Global LiDAR PCD (Incremental)
+      Size (Pixels): 2
+      Topic: /okvis/global_lidar_map_markers
+      Value: true
+    - Alpha: 0.9
+      Class: okvis/LiveLidarScan
+      Enabled: true
+      Name: Current LiDAR Scan (White)
+      Reliability: Auto
+      Size (Pixels): 2
+      Topic: /ouster/points
       Value: true
     - Class: rviz_default_plugins/Image
       Enabled: false
@@ -172,7 +206,7 @@ Visualization Manager:
     - Alpha: 1
       Buffer Length: 1
       Class: rviz_default_plugins/Path
-      Color: 204; 204; 0
+      Color: 0; 255; 0
       Enabled: true
       Line Style: Billboards
       Line Width: 0.015
@@ -254,7 +288,7 @@ Visualization Manager:
       Color: 255; 255; 255
       Color Transformer: RGB8
       Decay Time: 0
-      Enabled: true
+      Enabled: false
       Invert Rainbow: false
       Max Color: 255; 255; 255
       Max Intensity: 4096
@@ -262,10 +296,10 @@ Visualization Manager:
       Min Intensity: 0
       Name: Frame-to-map points
       Position Transformer: XYZ
-      Selectable: true
+      Selectable: false
       Size (Pixels): 3
       Size (m): 0.05000000074505806
-      Style: Spheres
+      Style: Points
       Topic:
         Depth: 5
         Durability Policy: Volatile
@@ -275,10 +309,10 @@ Visualization Manager:
         Value: /okvis/okvis_points_alignment
       Use Fixed Frame: true
       Use rainbow: true
-      Value: true
+      Value: false
   Enabled: true
   Global Options:
-    Background Color: 48; 48; 48
+    Background Color: 0; 0; 0
     Fixed Frame: world
     Frame Rate: 30
   Name: root

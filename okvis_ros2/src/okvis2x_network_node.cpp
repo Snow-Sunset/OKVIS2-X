@@ -35,6 +35,7 @@
   #include <okvis/ros2/Subscriber.hpp>
 #endif
 #include <okvis/ros2/Publisher.hpp>
+#include <okvis/ros2/GlobalLidarPcdMapper.hpp>
 #include <okvis/ThreadedSlam.hpp>
 #include <okvis/DatasetWriter.hpp>
 #include <okvis/ViParametersReader.hpp>
@@ -151,6 +152,8 @@ int main(int argc, char **argv) {
     LOG(ERROR)<<"DBoW2 vocabulary " << dBowVocDir << "/small_voc.yml.gz not found.";
     return EXIT_FAILURE;
   }
+
+  okvis::GlobalLidarPcdMapper globalLidarPcd(node, parameters, csv_path);
 
   // Setereo or depth fusion or vision-language fusion
   okvis::DeepLearningProcessor* dlProcessor;
@@ -298,9 +301,12 @@ int main(int argc, char **argv) {
 
   // Setup processor callbacks
   processor.setOptimizedGraphCallback(
-        std::bind(&okvis::Publisher::publishEstimatorUpdate, &publisher,
-                  std::placeholders::_1, std::placeholders::_2,
-                  std::placeholders::_3, std::placeholders::_4));
+      [&](const okvis::State& state, const okvis::TrackingState& tracking,
+          std::shared_ptr<const okvis::AlignedMap<okvis::StateId, okvis::State>> states,
+          std::shared_ptr<const okvis::MapPointVector> landmarks) {
+        publisher.publishEstimatorUpdate(state, tracking, states, landmarks);
+        globalLidarPcd.stateUpdateCallback(tracking, std::move(states));
+      });
   processor.setAlignmentPublishCallback([&](const okvis::Time& timestamp, const okvis::kinematics::Transformation& T_WS,
     const std::vector<Eigen::Vector3f, Eigen::aligned_allocator<Eigen::Vector3f>>& alignPointCloud, bool isMapFrame)
     {publisher.publishAlignmentPointsAsCallback(timestamp, T_WS, alignPointCloud, isMapFrame);}
@@ -389,6 +395,7 @@ int main(int argc, char **argv) {
   }
   processor.slam_.setFinalTrajectoryCsvFile(csv_path + "/okvis2-final_trajectory.csv", false);
   processor.slam_.writeFinalTrajectoryCsv();
+  globalLidarPcd.shutdown();
   if (saveLidarMap && parameters.lidar && submapConfig.buildLidarPointCloudMap) {
     const std::string defaultFilename = processor.se_interface_.memoryArchiveDirectory().empty()
         ? csv_path + "/lidar_map.pcd"

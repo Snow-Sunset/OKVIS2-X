@@ -6,6 +6,7 @@
 #include <Eigen/StdVector>
 #include <array>
 #include <cstdint>
+#include <functional>
 #include <map>
 #include <memory>
 #include <string>
@@ -36,6 +37,8 @@ class LidarPointCloudMap {
     Eigen::Isometry3d pose;
     std::shared_ptr<const Points> points;
     std::shared_ptr<const ArchiveChunk> archive;
+    uint64_t id = 0;
+    size_t chunkIndex = 0;
   };
   using Snapshot = std::vector<SubmapSnapshot, Eigen::aligned_allocator<SubmapSnapshot>>;
   explicit LidarPointCloudMap(double voxelSize);
@@ -78,11 +81,24 @@ class LidarPointCloudMap {
   /// Transform every retained point to world coordinates, without display
   /// sampling, voxel filtering, deduplication or a point-count limit.
   static Points assembleUnfiltered(const Snapshot& snapshot);
+  /// Fixed-step display sampling over the complete snapshot, with no point
+  /// budget or adaptive coarsening. Step 1 visits every retained point. The
+  /// step is continuous across resident tails, archive chunks and submaps.
+  static uint64_t sampledPointCount(const Snapshot& snapshot, size_t samplingStep,
+      size_t initialSkip = 0);
+  static void forEachSampledPoint(const Snapshot& snapshot, size_t samplingStep,
+      const std::function<void(const Eigen::Vector3d&)>& visit, size_t initialSkip = 0);
   /// Complete globally voxel-deduplicated binary PCD export. External sorted
   /// runs keep RAM bounded; an atomic rename publishes the completed result.
   /// Returns false for an empty map. I/O failures throw without deleting data.
   static bool savePcd(const Snapshot& snapshot, double voxelSize,
                       const std::string& filename, size_t workspaceBytes = 8 * 1024 * 1024);
+  /// Same bounded external merge as XYZ export; colour is computed in the
+  /// corrected world frame at export time. Packed RGB uses PCL's FLOAT32 field.
+  using Colour = std::function<uint32_t(const Eigen::Vector3d&)>;
+  static bool saveColoredPcd(const Snapshot& snapshot, double voxelSize,
+      const std::string& filename, const Colour& colour,
+      size_t workspaceBytes = 8 * 1024 * 1024);
   uint64_t revision() const { return revision_; }
   uint64_t visualizationRevision() const {
     return globalPreviewEnabled_ ? previewRevision_ : revision_;
@@ -92,6 +108,8 @@ class LidarPointCloudMap {
   }
 
  private:
+  static bool savePcdImpl(const Snapshot& snapshot, double voxelSize,
+      const std::string& filename, size_t workspaceBytes, const Colour& colour);
   using Key = std::array<int64_t, 3>;
   struct Hash { size_t operator()(const Key& key) const; };
   using Voxels = std::unordered_map<Key, Eigen::Vector3d, Hash>;

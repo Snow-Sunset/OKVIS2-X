@@ -27,6 +27,11 @@
   <depend>std_srvs</depend>
   <depend>sensor_msgs</depend>
   <depend>visualization_msgs</depend>
+  <depend>rviz_common</depend>
+  <depend>rviz_rendering</depend>
+  <depend>pluginlib</depend>
+  <depend>tf2_ros</depend>
+  <depend>yaml_cpp_vendor</depend>
   <depend>language_feature_msgs</depend>
   <depend>nav_msgs</depend>
   <depend>pcl_conversions</depend>
