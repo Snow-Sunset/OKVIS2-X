@@ -267,6 +267,111 @@ void runBatchedInputGuards() {
         "Rejected tail query corrupted the last supported IMU endpoint");
 }
 
+void runFixedBiasBatchedPropagation() {
+  // Irregular IMU intervals, time-varying rotation/acceleration, a starting
+  // state inside an interval, and nonzero gyro/accelerometer bias exercise
+  // both complete-boundary integration and partial-interval interpolation.
+  okvis::ImuMeasurementDeque measurements;
+  for (const double timestamp : {1.0, 1.007, 1.019, 1.031, 1.058, 1.077, 1.103, 1.15}) {
+    const double t = timestamp - 1.0;
+    measurements.emplace_back(okvis::Time(timestamp), okvis::ImuSensorReadings(
+        Eigen::Vector3d(.2 + 1.3*t, -.15 + std::sin(3*t), .3 - .8*t),
+        Eigen::Vector3d(.4 + 2*t, -.3 + std::cos(5*t), 9.81 + .7*t)));
+  }
+  const okvis::Time start(1.003);
+  const okvis::kinematics::Transformation initial(Eigen::Vector3d(.2, -.1, .5),
+      Eigen::Quaterniond(Eigen::AngleAxisd(.2, Eigen::Vector3d(1, 2, 3).normalized())));
+  okvis::SpeedAndBias sb;
+  sb << .4, -.3, .2, .03, -.04, .02, .1, -.05, .07;
+  okvis::BatchedLidarPropagator reference(start, measurements);
+  okvis::BatchedLidarPropagator fixed(start, measurements, false);
+  okvis::kinematics::Transformation referencePose, fixedPose;
+  okvis::SpeedAndBias referenceSb, fixedSb;
+  Eigen::Vector3d referenceOmega, fixedOmega;
+  check(!fixed.getState(initial, sb, fixedPose, fixedSb, fixedOmega),
+        "Fixed-bias propagation returned a state before its first successful append");
+  for (const double timestamp : {1.004, 1.007, 1.007, 1.0125, 1.019, 1.028,
+                                 1.058, 1.058, 1.06, 1.13, 1.15}) {
+    const okvis::Time query(timestamp);
+    check(reference.appendTo(measurements, initial, sb, query)
+              && fixed.appendTo(measurements, initial, sb, query)
+              && reference.getState(initial, sb, referencePose, referenceSb, referenceOmega)
+              && fixed.getState(initial, sb, fixedPose, fixedSb, fixedOmega),
+          "Supported irregular-interval fixed-bias query failed");
+    check((referencePose.T() - fixedPose.T()).norm() < 1e-11
+              && (referenceSb - fixedSb).norm() < 1e-11
+              && (referenceOmega - fixedOmega).norm() < 1e-12,
+          "Fixed-bias fast path changed the existing pose/velocity/interpolation model");
+  }
+  const auto finalPose = fixedPose.T();
+  check(!fixed.appendTo(measurements, initial, sb, okvis::Time(1.151))
+            && !fixed.appendTo(measurements, initial, sb, okvis::Time(1.14))
+            && fixed.getState(initial, sb, fixedPose, fixedSb, fixedOmega)
+            && (finalPose - fixedPose.T()).norm() < 1e-12,
+        "Rejected missing-coverage or backward fast-path query changed the last state");
+  okvis::BatchedLidarPropagator missingStart(okvis::Time(.99), measurements, false);
+  check(!missingStart.appendTo(measurements, initial, sb, okvis::Time(1.01)),
+        "Fixed-bias propagation accepted missing initial IMU coverage");
+
+  // The fast path cannot apply a bias correction. Reject even a one-ULP change
+  // before modifying its cursor or previous result, rather than hiding it.
+  okvis::BatchedLidarPropagator guarded(start, measurements, false);
+  okvis::SpeedAndBias bad = sb;
+  bad[3] = std::numeric_limits<double>::quiet_NaN();
+  check(!guarded.appendTo(measurements, initial, bad, okvis::Time(1.0125))
+            && !guarded.getState(initial, sb, fixedPose, fixedSb, fixedOmega)
+            && guarded.appendTo(measurements, initial, sb, okvis::Time(1.0125))
+            && guarded.getState(initial, sb, fixedPose, fixedSb, fixedOmega),
+        "Nonfinite initial bias was pinned or exposed a bogus fast-path state");
+  const auto previousPose = fixedPose.T();
+  const okvis::SpeedAndBias previousSb = fixedSb;
+  const Eigen::Vector3d previousOmega = fixedOmega;
+  bad = sb;
+  bad[3] = std::nextafter(bad[3], std::numeric_limits<double>::infinity());
+  check(!guarded.appendTo(measurements, initial, bad, okvis::Time(1.028)),
+        "Fixed-bias append silently accepted a changed gyro bias");
+  bad = sb;
+  bad[7] += .001;
+  check(!guarded.appendTo(measurements, initial, bad, okvis::Time(1.028))
+            && !guarded.getState(initial, bad, fixedPose, fixedSb, fixedOmega),
+        "Fixed-bias propagation silently accepted an accelerometer-bias correction");
+  bad[7] = std::numeric_limits<double>::infinity();
+  check(!guarded.getState(initial, bad, fixedPose, fixedSb, fixedOmega)
+            && (previousPose - fixedPose.T()).norm() < 1e-12
+            && (previousSb - fixedSb).norm() < 1e-12
+            && (previousOmega - fixedOmega).norm() < 1e-12,
+        "Rejected bias correction changed caller-owned output buffers");
+  const auto identicalCopy = measurements;
+  check(!guarded.appendTo(identicalCopy, initial, sb, okvis::Time(1.028))
+            && guarded.getState(initial, sb, fixedPose, fixedSb, fixedOmega)
+            && (previousPose - fixedPose.T()).norm() < 1e-12
+            && guarded.appendTo(measurements, initial, sb, okvis::Time(1.028)),
+        "Rejected fast-path input changed its bias anchor/cursor or blocked valid continuation");
+  okvis::BatchedLidarPropagator continuationReference(start, measurements);
+  check(continuationReference.appendTo(measurements, initial, sb, okvis::Time(1.028))
+            && continuationReference.getState(initial, sb, referencePose, referenceSb, referenceOmega)
+            && guarded.getState(initial, sb, fixedPose, fixedSb, fixedOmega)
+            && (referencePose.T() - fixedPose.T()).norm() < 1e-11
+            && (referenceSb - fixedSb).norm() < 1e-11,
+        "Rejected bias changes corrupted later fixed-bias integration");
+
+  // Initial velocity remains an ordinary query input; only the six biases are
+  // pinned. The default two-argument API must retain its correction support.
+  okvis::SpeedAndBias differentVelocity = sb;
+  const Eigen::Vector3d deltaVelocity(.1, -.2, .3);
+  differentVelocity.head<3>() += deltaVelocity;
+  check(guarded.getState(initial, differentVelocity, fixedPose, fixedSb, fixedOmega)
+            && (fixedPose.r() - referencePose.r()
+                - deltaVelocity*(okvis::Time(1.028) - start).toSec()).norm() < 1e-11
+            && (fixedSb.head<3>() - referenceSb.head<3>() - deltaVelocity).norm() < 1e-11,
+        "Fixed-bias mode incorrectly pinned initial velocity");
+  bad = sb;
+  bad[3] += .001;
+  check(reference.getState(initial, bad, referencePose, referenceSb, referenceOmega)
+            && referencePose.T().allFinite() && referenceSb.allFinite(),
+        "Default propagation lost its existing linearized bias-correction API");
+}
+
 void run() {
   okvis::Trajectory trajectory;
   auto first = makeState(1, 1.0, 0.0);
@@ -354,6 +459,7 @@ int main() {
     runExpiredImuPrefixes();
     runInvalidPosePrefix();
     runBatchedInputGuards();
+    runFixedBiasBatchedPropagation();
     std::cout << "Rolling IMU lifetime and trajectory propagation checks passed\n";
   } catch (const std::exception& error) {
     std::cerr << error.what() << '\n';

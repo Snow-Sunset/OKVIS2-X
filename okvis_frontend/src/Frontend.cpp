@@ -187,8 +187,10 @@ bool Frontend::detectAndDescribe(size_t cameraIndex, std::shared_ptr<okvis::Mult
   // check there are no keypoints here
   OKVIS_ASSERT_TRUE(Exception, keypoints == nullptr, "external keypoints currently not supported")
 
-  // hack: also initialise those maps for camera-aware extraction
-  for (size_t i = 0; i < numCameras_; ++i) {
+  // Each extractor belongs to its camera mutex. Initialising other cameras here
+  // would race their first parallel extraction (including when camera zero is absent).
+  {
+    const size_t i = cameraIndex;
     if(!std::static_pointer_cast<cv::BriskDescriptorExtractor>(
          descriptorExtractors_.at(i))->isCameraAware()) {
       cv::Mat rays;
@@ -229,6 +231,14 @@ bool Frontend::detectAndDescribe(size_t cameraIndex, std::shared_ptr<okvis::Mult
   frameOut->computeBackProjections(cameraIndex);
 
   return true;
+}
+
+void Frontend::prepareFrameForBackend(const std::shared_ptr<MultiFrame>& frame) const {
+#ifdef OKVIS_USE_NN
+  for (size_t im = 0; im < numCameras_; ++im) frame->setNetwork(im, networks_.at(im));
+#else
+  (void)frame;
+#endif
 }
 
 bool Frontend::verifyRecognisedPlace(const Estimator &estimator,

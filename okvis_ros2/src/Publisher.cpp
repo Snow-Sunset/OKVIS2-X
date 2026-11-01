@@ -65,6 +65,8 @@ void Publisher::setupNode(std::shared_ptr<rclcpp::Node> node)
   slice_pub_ =              threadedPublisher_->registerPublisher<visualization_msgs::msg::Marker>("se_map_slice");
   pubObometry_ =            threadedOdometryPublisher_->registerPublisher<nav_msgs::msg::Odometry>("okvis_odometry");
   pubPath_ =                threadedPublisher_->registerPublisher<nav_msgs::msg::Path>("okvis_path");
+  pubFrontendOdometry_ =    threadedOdometryPublisher_->registerPublisher<nav_msgs::msg::Odometry>("okvis_frontend_odometry");
+  pubFrontendPath_ =        threadedPublisher_->registerPublisher<nav_msgs::msg::Path>("okvis_frontend_path");
   pubTransform_ =           threadedPublisher_->registerPublisher<geometry_msgs::msg::TransformStamped>("okvis_transform");
   pubMesh_ =                threadedPublisher_->registerPublisher<visualization_msgs::msg::Marker>("okvis_mesh");
   pubSubmapMesh_ =          threadedPublisher_->registerPublisher<visualization_msgs::msg::MarkerArray>("okvis_submap_mesh");
@@ -210,6 +212,62 @@ bool Publisher::realtimePredictAndPublish(const okvis::Time& stamp,
   // publish odometry
   pubObometry_.publish(odometryMsg);
   return true;
+}
+
+void Publisher::publishFrontendState(const State& state, const TrackingState& trackingState,
+                                     uint64_t feedbackVersion) {
+  if (trackingState.trackingQuality == TrackingQuality::Lost
+      || !state.T_WS.T().allFinite() || !state.v_W.allFinite()
+      || !state.omega_S.allFinite()) return;
+
+  std::lock_guard<std::mutex> lock(frontendPublicationMutex_);
+  if (hasFrontendState_ && (state.timestamp <= lastFrontendTime_
+      || feedbackVersion < lastFrontendFeedbackVersion_)) return;
+
+  const kinematics::Transformation T_SB = T_BS_.inverse();
+  const kinematics::Transformation T_WB = state.T_WS * T_SB;
+  const Eigen::Vector3d velocity_B = T_WB.C().transpose() * state.v_W
+      + T_BS_.C() * state.omega_S.cross(T_SB.r());
+  const Eigen::Vector3d omega_B = T_BS_.C() * state.omega_S;
+  const auto timestamp = rclcpp::Time(state.timestamp.sec, state.timestamp.nsec);
+
+  auto odometry = std::make_shared<nav_msgs::msg::Odometry>();
+  odometry->header.frame_id = "world";
+  odometry->header.stamp = timestamp;
+  odometry->child_frame_id = "body";
+  auto& pose = odometry->pose.pose;
+  pose.position.x = T_WB.r().x();
+  pose.position.y = T_WB.r().y();
+  pose.position.z = T_WB.r().z();
+  pose.orientation.x = T_WB.q().x();
+  pose.orientation.y = T_WB.q().y();
+  pose.orientation.z = T_WB.q().z();
+  pose.orientation.w = T_WB.q().w();
+  // nav_msgs/Odometry twist is expressed at the child origin in the child frame.
+  odometry->twist.twist.linear.x = velocity_B.x();
+  odometry->twist.twist.linear.y = velocity_B.y();
+  odometry->twist.twist.linear.z = velocity_B.z();
+  odometry->twist.twist.angular.x = omega_B.x();
+  odometry->twist.twist.angular.y = omega_B.y();
+  odometry->twist.twist.angular.z = omega_B.z();
+
+  geometry_msgs::msg::PoseStamped pathPose;
+  pathPose.header = odometry->header;
+  pathPose.pose = pose;
+  frontendPathPoses_.push_back(std::move(pathPose));
+  if (pathMaxPoints_)
+    while (frontendPathPoses_.size() > pathMaxPoints_) frontendPathPoses_.pop_front();
+  auto path = std::make_shared<nav_msgs::msg::Path>();
+  path->header = odometry->header;
+  path->poses.assign(frontendPathPoses_.begin(), frontendPathPoses_.end());
+
+  lastFrontendTime_ = state.timestamp;
+  lastFrontendFeedbackVersion_ = feedbackVersion;
+  hasFrontendState_ = true;
+  pubFrontendOdometry_.publish(odometry);
+  pubFrontendPath_.publish(path);
+  VLOG(2) << "Frontend pose t=" << state.timestamp
+          << " feedback_version=" << feedbackVersion;
 }
 
 void Publisher::publishEstimatorUpdate(

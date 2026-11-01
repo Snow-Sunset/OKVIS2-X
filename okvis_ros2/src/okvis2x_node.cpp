@@ -292,6 +292,10 @@ int main(int argc, char **argv) {
     publisher.setBodyTransform(parameters.imu.T_BS);
     publisher.setOdometryPublishingRate(imu_propagated_state_publishing_rate);
     publisher.setupImageTopics(parameters.nCameraSystem);
+    estimator.setFrontendStateCallback([&](const okvis::State& state,
+        const okvis::TrackingState& trackingState, uint64_t feedbackVersion) {
+      publisher.publishFrontendState(state, trackingState, feedbackVersion);
+    });
 
     if(parameters.output.enable_submapping){
       estimator.setOptimisedGraphCallback([&] (const okvis::State& _1, const okvis::TrackingState& _2,

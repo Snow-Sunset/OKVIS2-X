@@ -60,9 +60,22 @@ imu_parameters:
     -0.03200263570684775, 0.9994490166874298, -0.008798074077210848, -0.00784852988506693,
     0.006703021917434096, 0.009017052443448963, 0.9999368527795895, -0.6084150115067585,
     0.0, 0.0, 0.0, 1.0]
-frontend_parameters: {detection_threshold: 50.0, absolute_threshold: 5.0, matching_threshold: 60.0,
-  octaves: 0, max_num_keypoints: 1000, keyframe_overlap: 0.6, use_cnn: false, parallelise_detection: true,
-  num_matching_threads: 4}
+frontend_parameters:
+  detection_threshold: 50.0
+  absolute_threshold: 5.0
+  matching_threshold: 60.0
+  octaves: 0
+  max_num_keypoints: 1000
+  keyframe_overlap: 0.6
+  use_cnn: false
+  parallelise_detection: true
+  num_matching_threads: 4
+  independent_tracking: true # online Tracking / sliding-window backend separation
+  tracking_max_landmarks: 2000 # immutable local-map snapshot point cap
+  tracking_map_radius: 50.0 # m; radius around the feedback pose
+  tracking_max_keyframe_interval: 0.25 # sensor seconds; request backend candidate
+  tracking_keyframe_translation: 0.5 # m; request backend candidate
+  tracking_keyframe_rotation: 0.15 # rad; request backend candidate
 estimator_parameters:
   # Cold images are released; loop-closure features stay in RAM. No history disk archive.
   memory_bounded: true

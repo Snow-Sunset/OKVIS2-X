@@ -79,6 +79,9 @@ class Frontend : public ViFrontendInterface {
                                  const okvis::kinematics::Transformation& T_WC,
                                  const std::vector<cv::KeyPoint> * keypoints) override final;
 
+  /// Attach immutable inference resources to an owned feature copy without extracting again.
+  void prepareFrameForBackend(const std::shared_ptr<MultiFrame>& frame) const;
+
   /**
    * @brief Matching as well as initialization of landmarks and state.
    * @warning This method is not threadsafe.

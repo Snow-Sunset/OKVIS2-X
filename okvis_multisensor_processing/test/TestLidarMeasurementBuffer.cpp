@@ -177,10 +177,15 @@ int main() {
       };
       if (buffer.PopWhile(before, &live) != 2 || live.size() != 2)
         throw std::runtime_error("Live consumer changed the strict camera-time boundary");
+      if (!buffer.statistics().hasFront
+          || buffer.statistics().frontScanEnd != okvis::Time(12, 1))
+        throw std::runtime_error("Scan completion horizon lost the pinned active tail");
       scan[0].timeStamp = okvis::Time(12, 2);
       scan[1].timeStamp = okvis::Time(12, 3);
       scan[2].timeStamp = okvis::Time(12, 4);
       buffer.PushBatch(scan);
+      if (buffer.statistics().frontScanEnd != okvis::Time(12, 1))
+        throw std::runtime_error("Future pending scan changed the active completion horizon");
       scan[0].timeStamp = okvis::Time(12, 5);
       scan[1].timeStamp = okvis::Time(12, 6);
       scan[2].timeStamp = okvis::Time(12, 7);
@@ -191,6 +196,8 @@ int main() {
       okvis::LidarMeasurement point;
       if (!buffer.PopBlocking(&point) || point.timeStamp != okvis::Time(12, 1))
         throw std::runtime_error("Shutdown lost the active scan tail");
+      if (buffer.statistics().frontScanEnd != okvis::Time(12, 7))
+        throw std::runtime_error("Completion horizon did not advance to the latest pending scan");
       for (uint32_t i = 5; i <= 7; ++i) {
         if (!buffer.PopBlocking(&point) || point.timeStamp != okvis::Time(12, i))
           throw std::runtime_error("Shutdown lost the latest waiting scan");

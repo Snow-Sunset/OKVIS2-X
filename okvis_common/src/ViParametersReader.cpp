@@ -18,6 +18,7 @@
  */
 
 #include <algorithm>
+#include <cmath>
 
 #include <glog/logging.h>
 
@@ -313,6 +314,44 @@ void ViParametersReader::readConfigFile(const std::string& filename) {
              viParameters_.frontend.parallelise_detection);
   parseEntry(file["frontend_parameters"], "num_matching_threads",
              viParameters_.frontend.num_matching_threads);
+
+  // Optional independent-tracking settings retain defaults for older configs.
+  const auto frontendNode = file["frontend_parameters"];
+  const FrontendParameters frontendDefaults{};
+  viParameters_.frontend.independent_tracking = frontendDefaults.independent_tracking;
+  if (!frontendNode["independent_tracking"].empty()) {
+    const auto node = frontendNode["independent_tracking"];
+    OKVIS_ASSERT_TRUE(Exception, !node.isInt() || int(node) == 0 || int(node) == 1,
+                      "frontend_parameters: independent_tracking must be a boolean")
+    parseEntry(frontendNode, "independent_tracking", viParameters_.frontend.independent_tracking);
+  }
+  const auto readPositiveInteger = [&](const char* name, int defaultValue, int& value) {
+    value = defaultValue;
+    if (!frontendNode[name].empty()) parseEntry(frontendNode, name, value);
+    OKVIS_ASSERT_TRUE(Exception, value > 0,
+                      "frontend_parameters: " << name << " must be positive")
+  };
+  const auto readPositiveReal = [&](const char* name, double defaultValue, double& value) {
+    value = defaultValue;
+    const auto node = frontendNode[name];
+    if (!node.empty()) {
+      OKVIS_ASSERT_TRUE(Exception, node.isReal() || node.isInt(),
+                        "frontend_parameters: " << name << " must be numeric")
+      value = double(node);
+    }
+    OKVIS_ASSERT_TRUE(Exception, std::isfinite(value) && value > 0.0,
+                      "frontend_parameters: " << name << " must be finite and positive")
+  };
+  readPositiveInteger("tracking_max_landmarks", frontendDefaults.tracking_max_landmarks,
+                      viParameters_.frontend.tracking_max_landmarks);
+  readPositiveReal("tracking_map_radius", frontendDefaults.tracking_map_radius,
+                   viParameters_.frontend.tracking_map_radius);
+  readPositiveReal("tracking_max_keyframe_interval", frontendDefaults.tracking_max_keyframe_interval,
+                   viParameters_.frontend.tracking_max_keyframe_interval);
+  readPositiveReal("tracking_keyframe_translation", frontendDefaults.tracking_keyframe_translation,
+                   viParameters_.frontend.tracking_keyframe_translation);
+  readPositiveReal("tracking_keyframe_rotation", frontendDefaults.tracking_keyframe_rotation,
+                   viParameters_.frontend.tracking_keyframe_rotation);
 
   // Parameters regarding the estimator.
   const auto estimatorNode = file["estimator_parameters"];

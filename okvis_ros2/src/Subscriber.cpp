@@ -256,6 +256,10 @@ void Subscriber::lidarWorkerLoop() {
   std::optional<Time> lastLidarPointTime;
   auto lastReport = std::chrono::steady_clock::now();
   double decodeMaxMs = 0.0;
+  double pureDecodeMaxMs = 0.0;
+  double estimatorSubmitMaxMs = 0.0;
+  double mappingSubmitMaxMs = 0.0;
+  double latestScanSpanMs = 0.0;
 
   while (true) {
     sensor_msgs::msg::PointCloud2::ConstSharedPtr msg;
@@ -274,8 +278,16 @@ void Subscriber::lidarWorkerLoop() {
       auto reference = pointcloud_ros::OusterTimeReference::ScanStart;
       if (lidarPointTimeReference_ == "scan_end") reference = pointcloud_ros::OusterTimeReference::ScanEnd;
       if (lidarPointTimeReference_ == "header") reference = pointcloud_ros::OusterTimeReference::Header;
-      lidarInvalidPoints_.fetch_add(pointcloud_ros::lidar2batch(*msg, lidarBatch, reference),
-                                    std::memory_order_relaxed);
+      const auto decodeBegin = std::chrono::steady_clock::now();
+      const auto invalidPoints = pointcloud_ros::lidar2batch(*msg, lidarBatch, reference);
+      pureDecodeMaxMs = std::max(pureDecodeMaxMs,
+          std::chrono::duration<double, std::milli>(
+              std::chrono::steady_clock::now() - decodeBegin).count());
+      lidarInvalidPoints_.fetch_add(invalidPoints, std::memory_order_relaxed);
+      // Report the decoded scan before trimming overlapping input, so an unusual
+      // point-time span remains visible rather than being hidden by the watermark.
+      latestScanSpanMs = lidarBatch.empty() ? 0.0
+          : (lidarBatch.back().timeStamp - lidarBatch.front().timeStamp).toSec() * 1000.0;
 
       // Both consumers require a monotonic FIFO. Account for overlapping/replayed
       // timestamps explicitly instead of hiding an older point behind a newer one.
@@ -299,7 +311,24 @@ void Subscriber::lidarWorkerLoop() {
         // consumer receive an overlapping prefix again on the next scan.
         lastLidarPointTime = scanTail;
 
+        // Deliver live-factor input before mapping filtering or optional spool I/O.
+        // Each consumer still receives the same monotonic scan independently.
+        const auto estimatorBegin = std::chrono::steady_clock::now();
+        try {
+          if (!viInterface_->addLidarMeasurements(lidarBatch))
+            lidarEstimatorRejectedBatches_.fetch_add(1, std::memory_order_relaxed);
+        } catch (const std::exception& error) {
+          lidarEstimatorRejectedBatches_.fetch_add(1, std::memory_order_relaxed);
+          LOG(ERROR) << "Estimator rejected LiDAR scan with exception: " << error.what();
+        } catch (...) {
+          lidarEstimatorRejectedBatches_.fetch_add(1, std::memory_order_relaxed);
+          LOG(ERROR) << "Estimator rejected LiDAR scan with unknown exception";
+        }
+        estimatorSubmitMaxMs = std::max(estimatorSubmitMaxMs,
+            std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - estimatorBegin).count());
         if (seInterface_) {
+          const auto mappingBegin = std::chrono::steady_clock::now();
           try {
             if (!seInterface_->addLidarMeasurements(lidarBatch))
               lidarSubmappingRejectedBatches_.fetch_add(1, std::memory_order_relaxed);
@@ -310,16 +339,9 @@ void Subscriber::lidarWorkerLoop() {
             lidarSubmappingRejectedBatches_.fetch_add(1, std::memory_order_relaxed);
             LOG(ERROR) << "Submapping rejected LiDAR scan with unknown exception";
           }
-        }
-        try {
-          if (!viInterface_->addLidarMeasurements(lidarBatch))
-            lidarEstimatorRejectedBatches_.fetch_add(1, std::memory_order_relaxed);
-        } catch (const std::exception& error) {
-          lidarEstimatorRejectedBatches_.fetch_add(1, std::memory_order_relaxed);
-          LOG(ERROR) << "Estimator rejected LiDAR scan with exception: " << error.what();
-        } catch (...) {
-          lidarEstimatorRejectedBatches_.fetch_add(1, std::memory_order_relaxed);
-          LOG(ERROR) << "Estimator rejected LiDAR scan with unknown exception";
+          mappingSubmitMaxMs = std::max(mappingSubmitMaxMs,
+              std::chrono::duration<double, std::milli>(
+                  std::chrono::steady_clock::now() - mappingBegin).count());
         }
       }
       lidarScansProcessed_.fetch_add(1, std::memory_order_relaxed);
@@ -343,8 +365,15 @@ void Subscriber::lidarWorkerLoop() {
                   << ", submapping rejected batches "
                   << lidarSubmappingRejectedBatches_.load(std::memory_order_relaxed)
                   << ", pending " << pending << "; decode/submit max "
-                  << decodeMaxMs << " ms in reporting interval";
+                  << decodeMaxMs << " ms, decode only max " << pureDecodeMaxMs
+                  << " ms, estimator submit max " << estimatorSubmitMaxMs
+                  << " ms, mapping submit max " << mappingSubmitMaxMs
+                  << " ms in reporting interval; latest scan span " << latestScanSpanMs
+                  << " ms, Ouster header reference " << lidarPointTimeReference_;
         decodeMaxMs = 0.0;
+        pureDecodeMaxMs = 0.0;
+        estimatorSubmitMaxMs = 0.0;
+        mappingSubmitMaxMs = 0.0;
         lastReport = now;
       }
     } catch (const std::exception& error) {

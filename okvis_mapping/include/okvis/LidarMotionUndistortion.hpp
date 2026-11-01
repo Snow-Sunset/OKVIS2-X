@@ -82,6 +82,18 @@ namespace okvis{
         size_t filterPlanes(PlaneMapPtr map, const kinematics::Transformation& T_WM,
                       double sensorSigma);
 
+        struct PlaneFilterStatistics {
+          size_t initial = 0, maximum = 0, queried = 0;
+          bool expanded = false;
+        };
+        /// Query a deterministic spatial subset, expanding only on weak overlap.
+        /// Each candidate is queried at most once. Output preserves source order.
+        /// Call after voxelDownsample(); zero maximum means unlimited.
+        size_t filterPlaneCandidates(PlaneMapPtr map, const kinematics::Transformation& T_WM,
+            double sensorSigma, size_t initialCandidates, size_t maxCandidates,
+            size_t minMatches, double voxelResolution,
+            PlaneFilterStatistics* statistics = nullptr);
+
   size_t filterObserved(const SupereightMapType* map, const okvis::kinematics::Transformation& T_WM);
 
         void randomDownsample(size_t num_output_points);

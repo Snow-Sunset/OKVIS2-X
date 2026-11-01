@@ -71,6 +71,7 @@ void ThreadedSlam::init()
   assert(parameters_.nCameraSystem.numCameras() > 0);
   const size_t numCameras = parameters_.nCameraSystem.numCameras();
   shutdown_ = false;
+  trackingFrontend_.reset(new TrackingFrontend(parameters_));
 
   // setup frontend
   frontend_.setBriskDetectionOctaves(size_t(parameters_.frontend.octaves));
@@ -195,6 +196,7 @@ bool ThreadedSlam::addImages(const okvis::Time & stamp,
                              const std::map<size_t, cv::Mat> & images,
                              const std::map<size_t, cv::Mat> & depthImages)
 {
+  if (shutdown_) return false;
   // remove image delay:
   // timestamp_camera_correct = timestamp_camera - image_delay
   const Time stampCorrected = stamp - Duration(parameters_.camera.image_delay);
@@ -240,6 +242,7 @@ bool ThreadedSlam::addImages(const okvis::Time & stamp,
   else
   {
     if(cameraMeasurementsReceived_.PushNonBlockingDroppingIfFull(frames, cameraInputQueueSize)) {
+      rawImageDrops_.fetch_add(1);
       DLOG(WARNING) << "frame drop ";
       return false;
     }
@@ -252,6 +255,7 @@ bool ThreadedSlam::addImuMeasurement(const okvis::Time& stamp,
                                      const Eigen::Vector3d& alpha,
                                      const Eigen::Vector3d& omega)
 {
+  if (shutdown_) return false;
   static bool warnOnce = true;
   if (!parameters_.imu.use) {
     if (warnOnce) {
@@ -268,6 +272,26 @@ bool ThreadedSlam::addImuMeasurement(const okvis::Time& stamp,
   imu_measurement.timeStamp = stamp;
 
   const int imuQueueSize = 5000;
+
+  if (independentTracking()) {
+    // Never silently remove an IMU sample from an already admitted backend interval.
+    // Exhausting this emergency bound is a hard overload error, not usable odometry.
+    std::lock_guard<std::mutex> lock(trackingImuMutex_);
+    if ((!trackingImuMeasurements_.empty()
+         && stamp <= trackingImuMeasurements_.back().timeStamp)) {
+      LOG(ERROR) << "Rejected non-monotonic IMU timestamp " << stamp;
+      return false;
+    }
+    if (trackingImuMeasurements_.size() >= size_t(imuQueueSize)
+        || !imuMeasurementsReceived_.PushNonBlockingIfNotFull(
+             imu_measurement, size_t(imuQueueSize))) {
+      throw Exception("Independent tracking IMU backlog exceeded 5000 samples; "
+                      "stop or reduce playback rate. No IMU samples were silently replaced.");
+    }
+    trackingImuMeasurements_.push_back(imu_measurement);
+    backendCondition_.notify_all();
+    return true;
+  }
 
   if (blocking_)
   {
@@ -360,8 +384,17 @@ bool ThreadedSlam::addLidarMeasurements(const LidarMeasurementBatch& measurement
   }
   const auto result = lidarMeasurementsReceived_.PushBatch(*input);
   if (result.dropped) {
+    const auto stats = lidarMeasurementsReceived_.statistics();
+    const uint64_t consumerNs = lidarConsumerTimeNs_.load(std::memory_order_relaxed);
     LOG_EVERY_N(WARNING, 40) << "Realtime LiDAR input replaced " << result.droppedScans
-                           << " old waiting scan (" << result.dropped << " rays); active scan retained";
+                           << " old waiting scan (" << result.dropped << " rays); active scan retained"
+                           << "; queued rays=" << stats.queued
+                           << ", total replaced scans=" << stats.droppedScans
+                           << ", consumer time ns=" << consumerNs
+                           << ", oldest queued ns=" << (stats.hasFront ? stats.oldest.toNSec() : 0)
+                           << ", newest input ns=" << stats.newest.toNSec()
+                           << ", input lead s=" << (consumerNs
+                               ? (double(stats.newest.toNSec()) - double(consumerNs)) * 1.e-9 : -1.0);
   }
   return !result.stopped;
 }
@@ -449,6 +482,9 @@ bool ThreadedSlam::addSubmapAlignmentConstraints(const SupereightMapType* submap
 // should return immediately (blocking=false), or only when the processing is complete.
 void ThreadedSlam::setBlocking(bool blocking)
 {
+  if (backendStarted_ && blocking != blocking_.load()) {
+    throw Exception("Cannot change processing mode after the independent backend has started");
+  }
   blocking_ = blocking;
   // disable time limit for optimization
   if(blocking_)
@@ -459,6 +495,15 @@ void ThreadedSlam::setBlocking(bool blocking)
 }
 
 bool ThreadedSlam::getNextFrame(MultiFramePtr &multiFrame) {
+  if (backendStarted_) {
+    std::lock_guard<std::mutex> lock(backendQueueMutex_);
+    if (!activeBackendFrame_.frame && !backendFrames_.empty()) {
+      activeBackendFrame_ = std::move(backendFrames_.front());
+      backendFrames_.pop_front();
+    }
+    multiFrame = activeBackendFrame_.frame;
+    return bool(multiFrame);
+  }
   std::vector<okvis::CameraMeasurement> frames;
   if(!cameraMeasurementsReceived_.getCopyOfFront(&frames)) {
     return false;
@@ -479,8 +524,9 @@ bool ThreadedSlam::getNextFrame(MultiFramePtr &multiFrame) {
 }
 
 bool ThreadedSlam::processPendingSubmapAlignments() {
-  // The application processing thread owns estimator mutations. A mapping
-  // callback only enqueues work; it never waits on or modifies the estimator.
+  std::lock_guard<std::recursive_mutex> owner(backendOwnerMutex_);
+  // The processing owner (independent backend or legacy application thread)
+  // owns estimator mutations. Mapping callbacks only enqueue work.
   if (submapAlignmentFactorsReceived_.Empty()) return false;
   if (optimisationThread_.joinable()) optimisationThread_.join();
   // Map to Map Alignment Factors are added here...
@@ -532,6 +578,46 @@ bool ThreadedSlam::processPendingSubmapAlignments() {
 }
 
 void ThreadedSlam::flushPendingUpdates() {
+  if (backendStarted_) {
+    // At EOF a trailing image may lack the required IMU look-ahead. It was never
+    // admitted, so report its removal separately from draining accepted work.
+    size_t unadmitted = pendingTrackingFrame_ ? 1 : 0;
+    pendingTrackingFrame_.reset();
+    std::vector<CameraMeasurement> trailing;
+    while (cameraMeasurementsReceived_.PopNonBlocking(&trailing)) ++unadmitted;
+    if (unadmitted) {
+      rawImageDrops_.fetch_add(unadmitted);
+      LOG(WARNING) << "Final drain: " << unadmitted
+                   << " unadmitted image(s) lack complete processing/IMU coverage";
+    }
+    std::unique_lock<std::mutex> lock(backendQueueMutex_);
+    backendDraining_ = true; // Caller has stopped sensor input, as required by this API.
+    backendCondition_.notify_all();
+    backendCondition_.wait(lock, [&]() {
+      return backendException_ || (!backendBusy_ && backendFrames_.empty()
+                                   && !activeBackendFrame_.frame);
+    });
+    if (backendException_) std::rethrow_exception(backendException_);
+    // The last complete image might have arrived during an active solve. Retry
+    // this single unadmitted endpoint at EOF, after draining accepted work. This
+    // preserves a final trajectory endpoint without buffering old online jobs.
+    if (finalTrackingFrame_ && !backendStop_) {
+      const auto endpoint = std::move(finalTrackingFrame_);
+      lock.unlock();
+      auto backendFrame = copyTrackingFrame(endpoint);
+      lock.lock();
+      if (backendException_) std::rethrow_exception(backendException_);
+      backendFrames_.push_back({std::move(backendFrame)});
+      backendAcceptedFrames_.fetch_add(1);
+      backendCondition_.notify_all();
+      backendCondition_.wait(lock, [&]() {
+        return backendException_ || (!backendBusy_ && backendFrames_.empty()
+                                     && !activeBackendFrame_.frame);
+      });
+      if (backendException_) std::rethrow_exception(backendException_);
+    }
+  }
+  std::lock_guard<std::recursive_mutex> owner(backendOwnerMutex_);
   if (optimisationThread_.joinable()) optimisationThread_.join();
   while (publicationPending_.load() != 0) {
     std::this_thread::sleep_for(std::chrono::milliseconds(1));
@@ -540,6 +626,12 @@ void ThreadedSlam::flushPendingUpdates() {
 }
 
 bool ThreadedSlam::processFrame() {
+  if (independentTracking()) return processTrackingFrame();
+  return processBackendFrame();
+}
+
+bool ThreadedSlam::processBackendFrame() {
+  std::lock_guard<std::recursive_mutex> owner(backendOwnerMutex_);
   // Process completed submaps even while cameras are idle or have stopped.
   processPendingSubmapAlignments();
   MultiFramePtr multiFrame;
@@ -551,7 +643,7 @@ bool ThreadedSlam::processFrame() {
   kinematics::Transformation T_WS;
   SpeedAndBias speedAndBias;
 
-  bool ranDetection = false;
+  bool ranDetection = backendStarted_; // The tracking thread supplied owned BRISK features.
   if(firstFrame_) {
     // in the very beginning, we need to wait for the IMU
     if(parameters_.imu.use && !imuMeasurementsReceived_.getCopyOfFront(&imuMeasurement)) {
@@ -568,8 +660,7 @@ bool ThreadedSlam::processFrame() {
         // that's bad, we have frames without IMU measurements. Discard too old frames
         LOG(WARNING) << "startup: dropping frame because IMU measurements are newer, t="
                      << imuMeasurement.timeStamp;
-        std::vector<okvis::CameraMeasurement> frames;
-        cameraMeasurementsReceived_.PopBlocking(&frames);
+        consumeBackendFrame();
         return false;
       }
 
@@ -593,6 +684,7 @@ bool ThreadedSlam::processFrame() {
               < multiFrame->timestamp() + Duration(imuTemporalOverlap));
     }
 
+    lidarConsumerTimeNs_.store(multiFrame->timestamp().toNSec(), std::memory_order_relaxed);
     lidarMeasurementsReceived_.PopWhile(
         [&](const LidarMeasurement& measurement) {
           return measurement.timeStamp < multiFrame->timestamp();
@@ -655,41 +747,42 @@ bool ThreadedSlam::processFrame() {
     }
 
     // detection -- needed to check if we can start up
-    TimerSwitchable detectTimer("1 DetectAndDescribe");
-    if(parameters_.frontend.parallelise_detection) {
-      std::vector<std::shared_ptr<std::thread>> detectionThreads;
-      for(size_t im = 1; im < numCameras; ++im) {
-        kinematics::Transformation T_WC = T_WS * (*parameters_.nCameraSystem.T_SC(im));
-        if(!multiFrame->image(im).empty()) {
-          detectionThreads.emplace_back(
-              new std::thread(&Frontend::detectAndDescribe, &frontend_,
-                              im,  multiFrame, T_WC, nullptr));
+    if (!ranDetection) {
+      TimerSwitchable detectTimer("1 DetectAndDescribe");
+      if(parameters_.frontend.parallelise_detection) {
+        std::vector<std::shared_ptr<std::thread>> detectionThreads;
+        for(size_t im = 1; im < numCameras; ++im) {
+          kinematics::Transformation T_WC = T_WS * (*parameters_.nCameraSystem.T_SC(im));
+          if(!multiFrame->image(im).empty()) {
+            detectionThreads.emplace_back(
+                new std::thread(&Frontend::detectAndDescribe, &frontend_,
+                                im,  multiFrame, T_WC, nullptr));
+          }
+        }
+        kinematics::Transformation T_WC0 = T_WS * (*parameters_.nCameraSystem.T_SC(0));
+        if(!multiFrame->image(0).empty()) {
+          frontend_.detectAndDescribe(0, multiFrame, T_WC0, nullptr);
+        }
+        for(size_t i = 0; i < detectionThreads.size(); ++i) {
+          detectionThreads[i]->join();
+        }
+      } else {
+        for(size_t im = 0; im < numCameras; ++im) {
+          kinematics::Transformation T_WC = T_WS * (*parameters_.nCameraSystem.T_SC(im));
+          if(!multiFrame->image(im).empty()) {
+            frontend_.detectAndDescribe(im,  multiFrame, T_WC, nullptr);
+          }
         }
       }
-      kinematics::Transformation T_WC0 = T_WS * (*parameters_.nCameraSystem.T_SC(0));
-      if(!multiFrame->image(0).empty()) {
-        frontend_.detectAndDescribe(0, multiFrame, T_WC0, nullptr);
-      }
-      for(size_t i = 0; i < detectionThreads.size(); ++i) {
-        detectionThreads[i]->join();
-      }
-    } else {
-      for(size_t im = 0; im < numCameras; ++im) {
-        kinematics::Transformation T_WC = T_WS * (*parameters_.nCameraSystem.T_SC(im));
-        if(!multiFrame->image(im).empty()) {
-          frontend_.detectAndDescribe(im,  multiFrame, T_WC, nullptr);
-        }
-      }
+      detectTimer.stop();
     }
     if(!frontend_.isInitialized() && multiFrame->numKeypoints() < 15) {
       LOG(WARNING) << "Not enough keypoints (" << multiFrame->numKeypoints()
                    << ") -- cannot initialise yet.";
-      std::vector<okvis::CameraMeasurement> frames;
-      cameraMeasurementsReceived_.PopBlocking(&frames);
+      consumeBackendFrame();
       return false;
     }
     ranDetection = true;
-    detectTimer.stop();
 
   } else {
     // propagate to have a sensible pose estimate (as needed for detection)
@@ -728,6 +821,7 @@ bool ThreadedSlam::processFrame() {
     }
 
     // now also get all relevant LiDAR measurements received thus far
+    lidarConsumerTimeNs_.store(multiFrame->timestamp().toNSec(), std::memory_order_relaxed);
     lidarMeasurementsReceived_.PopWhile(
         [&](const LidarMeasurement& measurement) {
           return measurement.timeStamp < multiFrame->timestamp();
@@ -743,8 +837,7 @@ bool ThreadedSlam::processFrame() {
     }
   }
   // success, frame processed. Need to remove from the queue, as getNextFrame only obtains a copy.
-  std::vector<okvis::CameraMeasurement> frames;
-  cameraMeasurementsReceived_.PopBlocking(&frames);
+  consumeBackendFrame();
 
   // detection
   if(!ranDetection) {
@@ -874,19 +967,14 @@ bool ThreadedSlam::processFrame() {
                 : candidates.size();
             const size_t initial = submapConfig_.lidarMaxPlaneCandidates
                 ? std::min<size_t>(maximum, 4096) : maximum;
-            Point3Cloud<float> fullCandidates;
-            if (initial < maximum) fullCandidates = candidates;
-            if (initial) motionUndistortion.selectPlaneCandidates(initial, submapConfig_.voxelGridResolution);
-            observed_points = motionUndistortion.filterPlanes(previousPlaneMap_,
-                estimator_.pose(StateId(previousSubmapId_)), submapConfig_.sensorError);
-            if (observed_points < submapConfig_.numSubmapFactors && initial < maximum) {
-              candidates = std::move(fullCandidates);
-              motionUndistortion.selectPlaneCandidates(maximum, submapConfig_.voxelGridResolution);
-              observed_points = motionUndistortion.filterPlanes(previousPlaneMap_,
-                  estimator_.pose(StateId(previousSubmapId_)), submapConfig_.sensorError);
-            }
-            LOG_EVERY_N(INFO, 100) << "Live LiDAR plane candidates: initial " << initial
-                                  << ", maximum " << maximum << ", valid " << observed_points;
+            LidarMotionUndistortion::PlaneFilterStatistics stats;
+            observed_points = motionUndistortion.filterPlaneCandidates(previousPlaneMap_,
+                estimator_.pose(StateId(previousSubmapId_)), submapConfig_.sensorError,
+                initial, maximum, submapConfig_.numSubmapFactors,
+                submapConfig_.voxelGridResolution, &stats);
+            LOG_EVERY_N(INFO, 100) << "Live LiDAR plane candidates: initial " << stats.initial
+                                  << ", maximum " << stats.maximum << ", queried " << stats.queried
+                                  << ", expanded " << stats.expanded << ", valid " << observed_points;
           } else if (deskewed) {
             overlapEvaluated = !motionUndistortion.deskewedDownsampledPointCloud().empty();
             observed_points = motionUndistortion.filterObserved(previousSubmap_, estimator_.pose(StateId(previousSubmapId_)));
@@ -949,10 +1037,14 @@ bool ThreadedSlam::processFrame() {
     }
   }
   // Check if we need new kf due to lidar overlap
+  // A frontend proposal requests a backend update. The backend retains the
+  // original geometric keyframe decision; a timer/low-overlap request alone
+  // must not force every admitted image into the persistent keyframe graph.
   bool kfPrior = false;
   if(submapConfig_.useMap2LiveFactors && parameters_.lidar){
-    kfPrior = needsNewLidarKeyframe();
-    if(kfPrior) {
+    const bool lidarPrior = needsNewLidarKeyframe();
+    kfPrior = kfPrior || lidarPrior;
+    if(lidarPrior) {
       lidarKeyframes_.insert(StateId(multiFrame->id()));
     }
   }
@@ -963,6 +1055,9 @@ bool ThreadedSlam::processFrame() {
     LOG(WARNING) << "Not enough matches, cannot initialise";
     frontend_.clear();
     estimator_.clear();
+    lastOptimisedState_ = State{};
+    preLastOptimisedState_ = State{};
+    publishTrackingSnapshot(); // Invalidate the old map with a newer feedback version.
     return false;
   }
   estimator_.setKeyframe(StateId(multiFrame->id()), asKeyframe);
@@ -1010,8 +1105,10 @@ bool ThreadedSlam::processFrame() {
   // asynchronous sensor propagation. It is carried only with the in-flight
   // update and released once all consumers finish; no per-frame history is kept.
   ImuMeasurementDeque frameImuMeasurements = imuMeasurementDeque_;
-  optimisationThread_ = std::thread(&ThreadedSlam::optimisePublishMarginalise,
-                                    this, multiFrame, gyr, std::move(frameImuMeasurements));
+  if (!backendStarted_) {
+    optimisationThread_ = std::thread(&ThreadedSlam::optimisePublishMarginalise,
+                                      this, multiFrame, gyr, std::move(frameImuMeasurements));
+  }
 
   // kick off posegraph optimisation, if needed, too...
   if(estimator_.needsFullGraphOptimisation()) {
@@ -1026,6 +1123,13 @@ bool ThreadedSlam::processFrame() {
           std::ref(posegraphOptimisationSummary_),
           parameters_.estimator.full_graph_num_threads, false);
   }
+
+  // LocalMapping-style ownership: the independent backend performs its complete
+  // sliding-window update on this thread. Apart from bounding active work to one,
+  // this lets backendLoop report solver failures and clean up instead of allowing
+  // an uncaught exception in a transient optimisation thread to terminate the app.
+  if (backendStarted_)
+    optimisePublishMarginalise(multiFrame, gyr, std::move(frameImuMeasurements));
 
   return true;
 }
@@ -1294,6 +1398,7 @@ void ThreadedSlam::optimisePublishMarginalise(MultiFramePtr multiFrame,
         size_t(parameters_.estimator.num_loop_closure_frames),
     size_t(parameters_.estimator.num_imu_frames), affectedStates_, expand);
   marginaliseTimer.stop();
+  publishTrackingSnapshot();
 }
 
 bool ThreadedSlam::needsNewLidarKeyframe()
@@ -1380,12 +1485,21 @@ void ThreadedSlam::stopThreading() {
     return;
   }
 
-  // process all received
-  while (processFrame()) {
-    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  try {
+    // process all received
+    while (processFrame()) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    flushPendingUpdates();
+  } catch (const std::exception& error) {
+    // Explicit processFrame/flush calls surface backend failures. Destruction must
+    // still join every worker rather than throw with a joinable std::thread.
+    LOG(ERROR) << "SLAM drainage failed: " << error.what();
+  } catch (...) {
+    LOG(ERROR) << "SLAM drainage failed with an unknown worker exception";
   }
-
-  flushPendingUpdates();
+  stopBackend(); // Ownership returns to this shutdown thread before touching the graph.
+  if (optimisationThread_.joinable()) optimisationThread_.join();
 
   // Optional queries run on immutable snapshots. Drain/join their worker
   // before estimator teardown and apply any ready proposal on this owner.
@@ -1557,7 +1671,9 @@ void ThreadedSlam::writeFinalTrajectoryCsv()
 
 void ThreadedSlam::writeGlobalTrajectoryCsv(const std::string& csvFileName)
 {
-
+  std::lock_guard<std::recursive_mutex> owner(backendOwnerMutex_);
+  if (optimisationThread_.joinable()) optimisationThread_.join();
+  if (fullGraphOptimisationThread_.joinable()) fullGraphOptimisationThread_.join();
   estimator_.writeGlobalCsvTrajectory(csvFileName);
 }
 
@@ -1857,7 +1973,9 @@ void ThreadedSlam::saveAlignedPoints(size_t id,
 
 void ThreadedSlam::writeDebugStatisticsCsv(const std::string& csvFilePrefix)
 {
-
+  std::lock_guard<std::recursive_mutex> owner(backendOwnerMutex_);
+  if (optimisationThread_.joinable()) optimisationThread_.join();
+  if (fullGraphOptimisationThread_.joinable()) fullGraphOptimisationThread_.join();
   estimator_.writeLidarDebugStatisticsCsv(csvFilePrefix);
  
 }

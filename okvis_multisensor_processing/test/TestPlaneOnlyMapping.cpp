@@ -325,6 +325,57 @@ void runCandidateSampling() {
   points.clear();
   scan.selectPlaneCandidates(128, 0.5);
   check(points.empty(), "Empty plane candidate pool did not stay empty");
+
+  auto map = std::make_shared<okvis::PlaneMap>(okvis::PlaneMap::Config{});
+  okvis::PlaneMap::Points planePoints;
+  for (int x = -4; x < 4; ++x)
+    for (int y = -4; y < 4; ++y)
+      for (int sample = 0; sample < 8; ++sample)
+        planePoints.emplace_back(x + .1 + .15 * (sample % 4),
+                                 y + .1 + .2 * (sample / 4), .2);
+  map->addPoints(planePoints);
+  map->finalize();
+  const auto compareFilter = [&](size_t initial, size_t maximum, size_t minimum,
+                                bool expectExpansion) {
+    // The old two-pass path supplies a reference for candidate membership/order.
+    points = allCandidates;
+    scan.selectPlaneCandidates(initial, .5);
+    size_t oldMatches = scan.filterPlanes(map, identity, .15);
+    if (oldMatches < minimum && initial < maximum) {
+      points = allCandidates;
+      scan.selectPlaneCandidates(maximum, .5);
+      oldMatches = scan.filterPlanes(map, identity, .15);
+    }
+    const auto expected = points;
+    points = allCandidates;
+    okvis::LidarMotionUndistortion::PlaneFilterStatistics stats;
+    const auto matches = scan.filterPlaneCandidates(map, identity, .15,
+        initial, maximum, minimum, .5, &stats);
+    check(matches == oldMatches && points.size() == expected.size(),
+          "Incremental plane filtering changed the selected match count");
+    for (size_t i = 0; i < points.size(); ++i)
+      check((points[i] - expected[i]).squaredNorm() == 0,
+            "Incremental plane filtering changed candidate identity or source order");
+    check(stats.expanded == expectExpansion
+          && stats.queried == (expectExpansion ? stats.maximum : stats.initial),
+          "Plane filter repeated queries or expanded despite sufficient overlap");
+  };
+  compareFilter(64, 256, 0, false);
+  compareFilter(64, 256, std::numeric_limits<size_t>::max(), true);
+  compareFilter(256, 256, std::numeric_limits<size_t>::max(), false);
+  compareFilter(0, 0, 0, false);
+  points = allCandidates;
+  okvis::LidarMotionUndistortion::PlaneFilterStatistics nullStats;
+  check(scan.filterPlaneCandidates(nullptr, identity, .15, 64, 256, 100, .5, &nullStats) == 0
+        && points.empty() && !nullStats.queried, "Null plane filter retained stale candidates");
+  points = allCandidates;
+  scan.randomDownsample(128);
+  std::set<std::array<float, 3>> unique;
+  for (const auto& point : points) unique.insert({point.x(), point.y(), point.z()});
+  check(points.size() == 128 && unique.size() == points.size(),
+        "Partial random sampling repeated points or exceeded the factor budget");
+  scan.randomDownsample(0);
+  check(points.empty(), "Zero final factor budget retained points");
 }
 
 okvis::State stationaryMotionState() {

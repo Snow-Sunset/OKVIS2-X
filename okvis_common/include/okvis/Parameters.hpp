@@ -117,6 +117,12 @@ struct FrontendParameters {
   bool use_cnn; ///< Use the CNN (if available) to filter out dynamic content / sky.
   bool parallelise_detection; ///< Run parallel detect & describe.
   int num_matching_threads; ///< Parallelise matching with this number of threads.
+  bool independent_tracking = true; ///< Separate online tracking from the sliding-window backend.
+  int tracking_max_landmarks = 2000; ///< Maximum landmarks in an immutable tracking map snapshot.
+  double tracking_map_radius = 50.0; ///< Tracking map radius around the feedback pose. [m]
+  double tracking_max_keyframe_interval = 0.25; ///< Maximum interval between backend candidates. [sensor s]
+  double tracking_keyframe_translation = 0.5; ///< Translation requesting a backend candidate. [m]
+  double tracking_keyframe_rotation = 0.15; ///< Rotation requesting a backend candidate. [rad]
 };
 
 /**

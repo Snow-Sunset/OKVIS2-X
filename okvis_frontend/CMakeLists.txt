@@ -31,6 +31,7 @@ add_library(${LIB_NAME}
   src/FrameRelativeAdapter.cpp
   src/Frontend.cpp
   src/FrontendPlaceRecognition.cpp
+  src/TrackingFrontend.cpp
   src/LoopclosureNoncentralAbsoluteAdapter.cpp
   src/stereo_triangulation.cpp
 )
@@ -97,6 +98,10 @@ install(TARGETS ${LIB_NAME} EXPORT okvisTargets
 install(DIRECTORY include/okvis DESTINATION ${CMAKE_INSTALL_INCLUDEDIR} FILES_MATCHING PATTERN "*.hpp")
 
 if(BUILD_TESTS OR BUILD_POINT_TO_PLANE_TESTS)
+  add_executable(okvis_tracking_frontend_test test/TestTrackingFrontend.cpp)
+  target_link_libraries(okvis_tracking_frontend_test PRIVATE okvis::Frontend Threads::Threads)
+  add_test(NAME okvis_tracking_frontend COMMAND okvis_tracking_frontend_test)
+  set_tests_properties(okvis_tracking_frontend PROPERTIES TIMEOUT 30)
   add_executable(okvis_async_place_recognition_test test/TestAsyncPlaceRecognition.cpp)
   target_link_libraries(okvis_async_place_recognition_test PRIVATE okvis::Frontend Threads::Threads)
   target_include_directories(okvis_async_place_recognition_test PRIVATE ${DBoW2_INCLUDE_DIRS})

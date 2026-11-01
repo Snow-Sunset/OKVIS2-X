@@ -41,6 +41,7 @@ class LidarMeasurementBuffer {
     size_t pendingScans = 0;
     bool hasFront = false;
     Time oldest;
+    Time frontScanEnd; ///< Tail of the active scan, or waiting scan if no active scan.
     Time newest;
   };
 
@@ -227,6 +228,8 @@ class LidarMeasurementBuffer {
     result.hasFront = !memory_.empty() || !pending_.empty();
     if (!memory_.empty()) result.oldest = memory_.front().timeStamp;
     else if (!pending_.empty()) result.oldest = pending_.front().timeStamp;
+    if (!memory_.empty()) result.frontScanEnd = memory_.back().timeStamp;
+    else if (!pending_.empty()) result.frontScanEnd = pending_.back().timeStamp;
     result.newest = newestAcceptedTimestamp_;
     return result;
   }

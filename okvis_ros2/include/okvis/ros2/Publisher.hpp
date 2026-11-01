@@ -21,6 +21,8 @@
 #define INCLUDE_OKVIS_ROS2_PUBLISHER_HPP_
 
 #include <memory>
+#include <cstdint>
+#include <deque>
 
 #if __has_include(<cv_bridge/cv_bridge.hpp>) // requires GCC >= 5
 #include <cv_bridge/cv_bridge.hpp>
@@ -130,6 +132,11 @@ class Publisher
                               std::shared_ptr<const AlignedMap<StateId, State>> updatedStates,
                               std::shared_ptr<const okvis::MapPointVector> landmarks);
 
+  /// Publish an image-time tracking estimate, separately from the optimised graph.
+  /// Lost tracking and out-of-order timestamps/feedback versions are not published.
+  void publishFrontendState(const State& state, const TrackingState& trackingState,
+                            uint64_t feedbackVersion);
+
   /**
    * @brief Set up the topics.
    * @param nCameraSystem Multi-camera sensor setup.
@@ -230,6 +237,8 @@ class Publisher
   okvis::ThreadedPublisher::PublisherHandle<nav_msgs::msg::Odometry> pubObometry_;
   /// \brief The publisher for the path. RViz controls its colour and line width.
   okvis::ThreadedPublisher::PublisherHandle<nav_msgs::msg::Path> pubPath_;
+  okvis::ThreadedPublisher::PublisherHandle<nav_msgs::msg::Odometry> pubFrontendOdometry_;
+  okvis::ThreadedPublisher::PublisherHandle<nav_msgs::msg::Path> pubFrontendPath_;
   /// \brief The publisher for the transform.
   okvis::ThreadedPublisher::PublisherHandle<geometry_msgs::msg::TransformStamped> pubTransform_;
   /// \brief The publisher for a robot / camera mesh.
@@ -264,6 +273,13 @@ class Publisher
   Eigen::Quaterniond q_sc_;
   
   nav_msgs::msg::Odometry lastOdom_; ///< Last odometry message.
+
+  // Independent frontend output never accesses the mutable backend trajectory.
+  std::mutex frontendPublicationMutex_;
+  std::deque<geometry_msgs::msg::PoseStamped> frontendPathPoses_;
+  okvis::Time lastFrontendTime_ = okvis::Time(0);
+  uint64_t lastFrontendFeedbackVersion_ = 0;
+  bool hasFrontendState_ = false;
 
   // Submap-related members.
   std::unordered_map<uint64_t, visualization_msgs::msg::Marker> submapMeshLookup_; ///< Lookup for submap meshes.

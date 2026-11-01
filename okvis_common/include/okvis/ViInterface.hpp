@@ -128,7 +128,12 @@ public:
   /// \brief Constructor.
   /// \param t_start Start time.
   /// \param imuMeasurements Immutable input; it must outlive this propagator.
-  BatchedLidarPropagator(const Time & t_start, const ImuMeasurementDeque & imuMeasurements);
+  /// \param computeBiasJacobians Enable linearized bias corrections. When false,
+  ///        the bias of the first successful append is fixed: appendTo/getState
+  ///        reject any different or nonfinite bias. Pose/velocity integration
+  ///        and timestamp interpolation are unchanged.
+  BatchedLidarPropagator(const Time & t_start, const ImuMeasurementDeque & imuMeasurements,
+                        bool computeBiasJacobians = true);
 
   bool appendTo(
           const ImuMeasurementDeque & imuMeasurements,
@@ -145,6 +150,7 @@ private:
   const ImuMeasurementDeque* imuMeasurements_;
   ImuMeasurementDeque::const_iterator imu_iterator_;
   bool inputOrdered_;
+  bool computeBiasJacobians_;
   /// t_end_ tracks the last complete IMU boundary, not the last query time.
   std::optional<Time> lastRequested_;
 

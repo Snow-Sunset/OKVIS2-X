@@ -23,6 +23,11 @@
 #include <thread>
 #include <atomic>
 #include <algorithm>
+#include <array>
+#include <condition_variable>
+#include <deque>
+#include <exception>
+#include <mutex>
 
 #include <opencv2/core/core.hpp>
 
@@ -30,6 +35,7 @@
 #include <okvis/Measurements.hpp>
 #include <okvis/LidarMeasurementBuffer.hpp>
 #include <okvis/Frontend.hpp>
+#include <okvis/TrackingFrontend.hpp>
 #include <okvis/MultiFrame.hpp>
 #include <okvis/Parameters.hpp>
 #include <okvis/assert_macros.hpp>
@@ -183,6 +189,11 @@ class ThreadedSlam : public ViInterface {
 
   /// \brief Runs main processing iteration, call in your main loop.
   bool processFrame();
+  /// Current image-time tracking output; independent of the optimised graph callback.
+  using FrontendStateCallback = std::function<void(const State&, const TrackingState&, uint64_t)>;
+  void setFrontendStateCallback(const FrontendStateCallback& callback) {
+    frontendStateCallback_ = callback; // Configure before processing starts.
+  }
   /// Drain mapping constraints on the same application thread as processFrame().
   /// Joins an outstanding local optimisation before mutating the estimator.
   bool processPendingSubmapAlignments();
@@ -252,6 +263,53 @@ class ThreadedSlam : public ViInterface {
  /// \}
 
 private:
+  bool processBackendFrame();
+  bool processTrackingFrame();
+  bool independentTracking() const;
+  void backendLoop();
+  void startBackend();
+  void stopBackend();
+  void consumeBackendFrame();
+  void publishTrackingSnapshot();
+  MultiFramePtr copyTrackingFrame(const MultiFramePtr& frame) const;
+
+  // Only backendLoop (or the legacy synchronous caller) owns the mutable graph.
+  // Public drainage hooks serialize with that owner and join local optimisation.
+  std::recursive_mutex backendOwnerMutex_;
+  struct BackendFrame {
+    MultiFramePtr frame;
+  };
+  std::mutex backendQueueMutex_;
+  std::condition_variable backendCondition_;
+  std::deque<BackendFrame> backendFrames_;
+  BackendFrame activeBackendFrame_; // Pinned until sufficient IMU is available.
+  std::thread backendThread_;
+  std::atomic_bool backendStarted_{false};
+  bool backendBusy_ = false;
+  bool backendStop_ = false;
+  bool backendDraining_ = false;
+  std::exception_ptr backendException_;
+  std::unique_ptr<TrackingFrontend> trackingFrontend_;
+  MultiFramePtr pendingTrackingFrame_; // Atomically removed from the raw image queue.
+  MultiFramePtr finalTrackingFrame_; // Latest complete unadmitted image; retry only at EOF.
+  std::mutex trackingImuMutex_;
+  ImuMeasurementDeque trackingImuMeasurements_;
+  std::mutex trackingSnapshotMutex_;
+  std::shared_ptr<const TrackingSnapshot> trackingSnapshot_;
+  uint64_t trackingSnapshotVersion_ = 0; // Backend-owned, never reset on initialisation failure.
+  uint64_t trackingFrameSequence_ = 0;
+  Time lastTrackingImageTime_;
+  bool haveTrackingImageTime_ = false;
+  FrontendStateCallback frontendStateCallback_;
+  std::atomic<uint64_t> trackingFrames_{0}, trackingLostFrames_{0};
+  std::atomic<uint64_t> backendAcceptedFrames_{0}, backendRejectedFrames_{0};
+  std::atomic<uint64_t> rawImageDrops_{0};
+  std::atomic<uint64_t> lidarDrivenBackendFrames_{0};
+  std::atomic<uint64_t> lidarConsumerTimeNs_{0};
+  std::array<double, 256> trackingDurationsMs_{};
+  size_t trackingTimingCount_ = 0;
+  size_t trackingTimingIndex_ = 0;
+
   /// \brief Start all threads.
   void startThreads();
   /// \brief Initialises settings and calls startThreads().

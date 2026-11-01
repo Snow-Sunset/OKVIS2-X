@@ -16,11 +16,53 @@
 #include <cmath>
 #include <cstdint>
 #include <limits>
+#include <random>
 #include <stdexcept>
 #include <unordered_set>
 #include <utility>
 
 namespace okvis{
+namespace {
+struct SpatialCandidate {
+  uint64_t priority;
+  size_t index;
+  bool initial = false;
+  bool matched = false;
+};
+
+bool candidatePriorityLess(const SpatialCandidate& a, const SpatialCandidate& b) {
+  return a.priority < b.priority || (a.priority == b.priority && a.index < b.index);
+}
+
+std::vector<SpatialCandidate> spatialCandidates(const Point3Cloud<float>& points,
+                                               size_t maximum, double resolution) {
+  const auto mix = [](uint64_t value) {
+    value = (value ^ (value >> 30)) * UINT64_C(0xbf58476d1ce4e5b9);
+    value = (value ^ (value >> 27)) * UINT64_C(0x94d049bb133111eb);
+    return value ^ (value >> 31);
+  };
+  std::vector<SpatialCandidate> candidates;
+  candidates.reserve(points.size());
+  for (size_t i = 0; i < points.size(); ++i) {
+    const Eigen::Array3d index = (points[i].cast<double>().array() / resolution).floor();
+    if (!index.isFinite().all()
+        || (index < double(std::numeric_limits<int>::min())).any()
+        || (index > double(std::numeric_limits<int>::max())).any()) continue;
+    const Voxel voxel = index.cast<int>().matrix();
+    uint64_t priority = mix(uint64_t(uint32_t(voxel.x())) + UINT64_C(0x9e3779b97f4a7c15));
+    priority = mix(priority ^ uint64_t(uint32_t(voxel.y())));
+    priority = mix(priority ^ uint64_t(uint32_t(voxel.z())));
+    candidates.push_back({priority, i});
+  }
+  if (maximum && candidates.size() > maximum) {
+    std::nth_element(candidates.begin(), candidates.begin() + maximum,
+                     candidates.end(), candidatePriorityLess);
+    candidates.resize(maximum);
+  }
+  return candidates;
+}
+}
+
 LidarMotionUndistortion::LidarMotionUndistortion(const State& initialState, const kinematics::Transformation& T_WS_live,
                                                  const kinematics::Transformation& T_SL,
                                                  const LidarMeasurementDeque& lidarScan,
@@ -83,7 +125,9 @@ bool LidarMotionUndistortion::deskew() {
   SpeedAndBias speedAndBias_1;
 
   Eigen::Vector3d omega_S;
-  BatchedLidarPropagator propagator(initialState_.timestamp, *imuMeasurementDeque_);
+  // This pass never changes the anchor biases. Their correction Jacobians do
+  // not contribute to its output and need not be propagated for every point time.
+  BatchedLidarPropagator propagator(initialState_.timestamp, *imuMeasurementDeque_, false);
   lidarScanPostProcessed_.reserve(lidarScan_->size());
 
   kinematics::Transformation T_SliveL = T_SW_live_ * initialState_.T_WS * T_SL_;
@@ -125,11 +169,9 @@ size_t LidarMotionUndistortion::filterPlanes(PlaneMapPtr map,
   }
   const auto T_MS = T_WM.inverse() * T_WS_live_;
   size_t writeIndex = 0;
-  PlaneMap::Plane plane;
-  double sigma;
   for (const auto& point : lidarScanPostProcessed_) {
     const Eigen::Vector3d p = T_MS.C() * point.cast<double>() + T_MS.r();
-    if (map->match(p, sensorSigma, plane, sigma)) {
+    if (map->hasMatch(p, sensorSigma)) {
       lidarScanPostProcessed_[writeIndex++] = point;
     }
   }
@@ -167,48 +209,76 @@ void LidarMotionUndistortion::selectPlaneCandidates(size_t maxCandidates,
   }
   if (!maxCandidates || lidarScanPostProcessed_.size() <= maxCandidates) return;
 
-  struct Candidate {
-    uint64_t priority;
-    size_t index;
-  };
   // A fixed hash spreads a prefix across occupied spatial voxels instead of
   // keeping only the beginning of a scan. No RNG state or input-order shuffle
   // is involved, so enlarged budgets select nested sets from the same cloud.
-  const auto mix = [](uint64_t value) {
-    value = (value ^ (value >> 30)) * UINT64_C(0xbf58476d1ce4e5b9);
-    value = (value ^ (value >> 27)) * UINT64_C(0x94d049bb133111eb);
-    return value ^ (value >> 31);
-  };
-  std::vector<Candidate> candidates;
-  candidates.reserve(lidarScanPostProcessed_.size());
-  for (size_t i = 0; i < lidarScanPostProcessed_.size(); ++i) {
-    const Eigen::Array3d index =
-        (lidarScanPostProcessed_[i].cast<double>().array() / voxelResolution).floor();
-    if (!index.isFinite().all()
-        || (index < double(std::numeric_limits<int>::min())).any()
-        || (index > double(std::numeric_limits<int>::max())).any()) continue;
-    const Voxel voxel = index.cast<int>().matrix();
-    uint64_t priority = mix(uint64_t(uint32_t(voxel.x())) + UINT64_C(0x9e3779b97f4a7c15));
-    priority = mix(priority ^ uint64_t(uint32_t(voxel.y())));
-    priority = mix(priority ^ uint64_t(uint32_t(voxel.z())));
-    candidates.push_back({priority, i});
-  }
-  if (candidates.size() > maxCandidates) {
-    std::nth_element(candidates.begin(), candidates.begin() + maxCandidates, candidates.end(),
-        [](const Candidate& lhs, const Candidate& rhs) {
-          return lhs.priority < rhs.priority
-              || (lhs.priority == rhs.priority && lhs.index < rhs.index);
-        });
-    candidates.resize(maxCandidates);
-  }
+  auto candidates = spatialCandidates(lidarScanPostProcessed_, maxCandidates, voxelResolution);
   // Sort only the bounded selection by source index. This permits safe in-place
   // compaction and retains the original order for downstream processing.
   std::sort(candidates.begin(), candidates.end(),
-      [](const Candidate& lhs, const Candidate& rhs) { return lhs.index < rhs.index; });
+      [](const SpatialCandidate& lhs, const SpatialCandidate& rhs) { return lhs.index < rhs.index; });
   size_t writeIndex = 0;
   for (const auto& candidate : candidates)
     lidarScanPostProcessed_[writeIndex++] = lidarScanPostProcessed_[candidate.index];
   lidarScanPostProcessed_.resize(writeIndex);
+}
+
+size_t LidarMotionUndistortion::filterPlaneCandidates(PlaneMapPtr map,
+    const kinematics::Transformation& T_WM, double sensorSigma,
+    size_t initialCandidates, size_t maxCandidates, size_t minMatches,
+    double voxelResolution, PlaneFilterStatistics* statistics) {
+  if (!std::isfinite(voxelResolution) || voxelResolution <= 0.0)
+    throw std::invalid_argument("LiDAR candidate voxel resolution must be finite and positive");
+  PlaneFilterStatistics stats;
+  if (!map || lidarScanPostProcessed_.empty()) {
+    lidarScanPostProcessed_.clear();
+    if (statistics) *statistics = stats;
+    return 0;
+  }
+  const size_t fullSize = lidarScanPostProcessed_.size();
+  const size_t maximum = maxCandidates ? std::min(maxCandidates, fullSize) : fullSize;
+  const size_t initial = initialCandidates ? std::min(initialCandidates, maximum) : maximum;
+  if (maximum == fullSize && initial == fullSize) {
+    // Unlimited budgets and small clouds need no priority computation or sort.
+    stats.initial = stats.maximum = stats.queried = fullSize;
+    const size_t matches = filterPlanes(map, T_WM, sensorSigma);
+    if (statistics) *statistics = stats;
+    return matches;
+  }
+  auto candidates = spatialCandidates(lidarScanPostProcessed_, maxCandidates, voxelResolution);
+  stats.maximum = candidates.size();
+  stats.initial = initialCandidates ? std::min(initialCandidates, candidates.size())
+                                    : candidates.size();
+  if (stats.initial < candidates.size()) {
+    std::nth_element(candidates.begin(), candidates.begin() + stats.initial,
+                     candidates.end(), candidatePriorityLess);
+  }
+  for (size_t i = 0; i < stats.initial; ++i) candidates[i].initial = true;
+  std::sort(candidates.begin(), candidates.end(),
+      [](const SpatialCandidate& a, const SpatialCandidate& b) { return a.index < b.index; });
+  const auto T_MS = T_WM.inverse() * T_WS_live_;
+  const Eigen::Matrix3d rotation = T_MS.C();
+  const Eigen::Vector3d translation = T_MS.r();
+  size_t matches = 0;
+  const auto query = [&](SpatialCandidate& candidate) {
+    const Eigen::Vector3d point = rotation * lidarScanPostProcessed_[candidate.index].cast<double>()
+                               + translation;
+    candidate.matched = map->hasMatch(point, sensorSigma);
+    ++stats.queried;
+    matches += size_t(candidate.matched);
+  };
+  for (auto& candidate : candidates) if (candidate.initial) query(candidate);
+  if (matches < minMatches && stats.initial < stats.maximum) {
+    stats.expanded = true;
+    // Previously the first pool was queried a second time after expanding it.
+    for (auto& candidate : candidates) if (!candidate.initial) query(candidate);
+  }
+  size_t write = 0;
+  for (const auto& candidate : candidates)
+    if (candidate.matched) lidarScanPostProcessed_[write++] = lidarScanPostProcessed_[candidate.index];
+  lidarScanPostProcessed_.resize(write);
+  if (statistics) *statistics = stats;
+  return write;
 }
 
 bool LidarMotionUndistortion::downsample(size_t num_output_points, double voxel_grid_resolution)
@@ -223,8 +293,13 @@ bool LidarMotionUndistortion::downsample(size_t num_output_points, double voxel_
 
 void LidarMotionUndistortion::randomDownsample(size_t num_output_points) {
   if(lidarScanPostProcessed_.size() > num_output_points) {
-    std::shuffle(lidarScanPostProcessed_.begin(), lidarScanPostProcessed_.end(), std::mt19937{std::random_device{}()});
-    // then take first n
+    // Partial Fisher-Yates is a uniform sample without replacement. Work is
+    // proportional to retained factors rather than every matched candidate.
+    thread_local std::mt19937 generator{std::random_device{}()};
+    for (size_t i = 0; i < num_output_points; ++i) {
+      std::uniform_int_distribution<size_t> distribution(i, lidarScanPostProcessed_.size() - 1);
+      std::swap(lidarScanPostProcessed_[i], lidarScanPostProcessed_[distribution(generator)]);
+    }
     lidarScanPostProcessed_.resize(num_output_points);
   }
 

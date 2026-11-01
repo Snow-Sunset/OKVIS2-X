@@ -30,6 +30,7 @@ add_library(${LIB_NAME}
   src/RpgDatasetReader.cpp
   src/SubmappingInterface.cpp
   src/ThreadedSlam.cpp
+  src/ThreadedSlamTracking.cpp
   src/TrajectoryOutput.cpp
   src/ViVisualizer.cpp
 )

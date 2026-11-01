@@ -260,6 +260,15 @@ void PlaneMap::fit(Cell& cell) {
 
 bool PlaneMap::match(const Eigen::Vector3d& point, double sensorSigma,
                      Plane& plane, double& residualSigma) const {
+  return matchImpl(point, sensorSigma, &plane, &residualSigma);
+}
+
+bool PlaneMap::hasMatch(const Eigen::Vector3d& point, double sensorSigma) const {
+  return matchImpl(point, sensorSigma, nullptr, nullptr);
+}
+
+bool PlaneMap::matchImpl(const Eigen::Vector3d& point, double sensorSigma,
+                         Plane* plane, double* residualSigma) const {
   if (!point.allFinite() || !std::isfinite(sensorSigma) || sensorSigma < 0.0) return false;
   const auto scaled = (point / config_.voxelSize).array().floor();
   if ((scaled <= double(std::numeric_limits<int64_t>::min()) + 1024.0).any()
@@ -285,9 +294,12 @@ bool PlaneMap::match(const Eigen::Vector3d& point, double sensorSigma,
         // Gaussian likelihood, including the variance normalization term.
         const double likelihoodScore = score + std::log(variance);
         if (likelihoodScore < bestScore) {
+          // Use the identical likelihood comparison even for existence queries:
+          // finite input sigma can overflow variance and the likelihood score.
+          if (!plane) return true;
           bestScore = likelihoodScore;
-          plane = p;
-          residualSigma = std::sqrt(variance);
+          *plane = p;
+          *residualSigma = std::sqrt(variance);
           matched = true;
         }
       }

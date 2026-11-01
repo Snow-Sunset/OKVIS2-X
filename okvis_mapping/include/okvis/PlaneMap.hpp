@@ -45,6 +45,8 @@ class PlaneMap {
   void addPoints(const Points& points);
   bool match(const Eigen::Vector3d& point, double sensorSigma,
              Plane& plane, double& residualSigma) const;
+  /// Same acceptance as match(), stopping at the first eligible plane.
+  bool hasMatch(const Eigen::Vector3d& point, double sensorSigma) const;
   size_t numPlanes() const;
   size_t numCells() const { return cells_.size(); }
   size_t residentBytes() const;
@@ -71,6 +73,8 @@ class PlaneMap {
   };
   Key key(const Eigen::Vector3d& point) const;
   void fit(Cell& cell);
+  bool matchImpl(const Eigen::Vector3d& point, double sensorSigma,
+                 Plane* plane, double* residualSigma) const;
   bool pruneWindow(const Eigen::Vector3d& center, double halfExtent);
   void recomputeBounds();
   Config config_;

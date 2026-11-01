@@ -120,6 +120,12 @@ frontend_parameters:
   use_cnn: false # use the CNN (if available) to filter out dynamic content / sky
   parallelise_detection: true # Run parallel detect & describe.
   num_matching_threads: 4 # Parallelise matching with this number of threads.
+  independent_tracking: true # online Tracking / sliding-window backend separation
+  tracking_max_landmarks: 2000 # immutable local-map snapshot point cap
+  tracking_map_radius: 50.0 # m; radius around the feedback pose
+  tracking_max_keyframe_interval: 0.25 # sensor seconds; request backend candidate
+  tracking_keyframe_translation: 0.5 # m; request backend candidate
+  tracking_keyframe_rotation: 0.15 # rad; request backend candidate
 
 # estimator parameters
 estimator_parameters:

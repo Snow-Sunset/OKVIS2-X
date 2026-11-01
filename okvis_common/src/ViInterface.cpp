@@ -456,7 +456,7 @@ Trajectory::PoseLookupResult Trajectory::getStatePosePrefix(
     if (supportedEnd == i) return finish(PoseLookupStatus::WaitingForImu);
     const auto measurements = imuMeasurementsForInterval(state0.timestamp, timestamps[supportedEnd - 1]);
     if (measurements.empty()) return finish(PoseLookupStatus::WaitingForImu);
-    BatchedLidarPropagator propagator(state0.timestamp, measurements);
+    BatchedLidarPropagator propagator(state0.timestamp, measurements, false);
     for (; i < supportedEnd; ++i) {
       if (havePrevious && timestamps[i] == previous) {
         statePoses.push_back(previousPose);
@@ -781,13 +781,15 @@ double Propagator::sinc(double x) {
 }
 
 BatchedLidarPropagator::BatchedLidarPropagator(const okvis::Time &t_start,
-                                               const okvis::ImuMeasurementDeque &imuMeasurements) :
+                                               const okvis::ImuMeasurementDeque &imuMeasurements,
+                                               bool computeBiasJacobians) :
                                                Propagator(t_start), imuMeasurements_(&imuMeasurements),
                                                imu_iterator_(imuMeasurements.begin()),
                                                inputOrdered_(std::is_sorted(imuMeasurements.begin(), imuMeasurements.end(),
                                                    [](const ImuMeasurement& a, const ImuMeasurement& b) {
                                                      return a.timeStamp < b.timeStamp;
-                                                   })) {}
+                                                   })),
+                                               computeBiasJacobians_(computeBiasJacobians) {}
 
 
 bool BatchedLidarPropagator::appendTo(const ImuMeasurementDeque & imuMeasurements,
@@ -802,6 +804,11 @@ bool BatchedLidarPropagator::appendTo(const ImuMeasurementDeque & imuMeasurement
       || imuMeasurements.front().timeStamp > t_end_
       || imuMeasurements.back().timeStamp < t_end || t_end <= t_start_
       || (lastRequested_ && t_end < *lastRequested_)) return false;
+  if (!computeBiasJacobians_
+      && (!speedAndBiases.tail<6>().allFinite()
+          || (lastRequested_
+              && !(speedAndBiases.tail<6>().array() == sb_ref_.tail<6>().array()).all())))
+    return false;
 
   // now the propagation
   okvis::Time time = t_end_; // re-start from previous end; in the beginning: t_start_.
@@ -857,28 +864,29 @@ bool BatchedLidarPropagator::appendTo(const ImuMeasurementDeque & imuMeasurement
     const Eigen::Matrix3d C = Delta_q_.toRotationMatrix();
     const Eigen::Matrix3d C_1 = Delta_q_1.toRotationMatrix();
     const Eigen::Vector3d acc_S_true = (0.5*(acc_S_0+acc_S_1) - speedAndBiases.segment<3>(6));
-    const Eigen::Matrix3d C_integral_1 = C_integral_ + 0.5*(C + C_1)*dt;
     const Eigen::Vector3d acc_integral_1 = acc_integral_ + 0.5*(C + C_1)*acc_S_true*dt;
 
     if(nexttime == t_end){
       // Stop IMU integration and interpolate
-      C_doubleintegral_interp_ = C_doubleintegral_ + C_integral_*dt + 0.25*(C + C_1)*dt*dt;
       acc_doubleintegral_interp_ = acc_doubleintegral_ + acc_integral_*dt + 0.25*(C + C_1)*acc_S_true*dt*dt;
 
-      dalpha_db_g_interp_ = dalpha_db_g_ + dt*C_1;
-      const Eigen::Matrix3d cross_1 = dq.inverse().toRotationMatrix()*cross_ +
-                                      kinematics::rightJacobian(omega_S_true*dt)*dt;
-      const Eigen::Matrix3d acc_S_x = kinematics::crossMx(acc_S_true);
-      Eigen::Matrix3d dv_db_g_1 = dv_db_g_ + 0.5*dt*(C*acc_S_x*cross_ + C_1*acc_S_x*cross_1);
-      dp_db_g_interp_ = dp_db_g_ + dt*dv_db_g_ + 0.25*dt*dt*(C*acc_S_x*cross_ + C_1*acc_S_x*cross_1);
+      if (computeBiasJacobians_) {
+        C_doubleintegral_interp_ = C_doubleintegral_ + C_integral_*dt + 0.25*(C + C_1)*dt*dt;
+        C_integral_interp_ = C_integral_ + 0.5*(C + C_1)*dt;
+        dalpha_db_g_interp_ = dalpha_db_g_ + dt*C_1;
+        const Eigen::Matrix3d cross_1 = dq.inverse().toRotationMatrix()*cross_ +
+                                        kinematics::rightJacobian(omega_S_true*dt)*dt;
+        const Eigen::Matrix3d acc_S_x = kinematics::crossMx(acc_S_true);
+        Eigen::Matrix3d dv_db_g_1 = dv_db_g_ + 0.5*dt*(C*acc_S_x*cross_ + C_1*acc_S_x*cross_1);
+        dp_db_g_interp_ = dp_db_g_ + dt*dv_db_g_ + 0.25*dt*dt*(C*acc_S_x*cross_ + C_1*acc_S_x*cross_1);
+        cross_interp_ = cross_1;
+        dv_db_g_interp_ = dv_db_g_1;
+      }
       omega_S_interp_ = omega_S_true;
 
       // memory shift
       Delta_q_interp_ = Delta_q_1;
-      C_integral_interp_ = C_integral_1;
       acc_integral_interp_ = acc_integral_1;
-      cross_interp_ = cross_1;
-      dv_db_g_interp_ = dv_db_g_1;
       Delta_t_ = (t_end - t_start_).toSec();
       lastRequested_ = t_end;
       return true;
@@ -886,24 +894,26 @@ bool BatchedLidarPropagator::appendTo(const ImuMeasurementDeque & imuMeasurement
 
     /// Overwrite preintegration results using interpolated values
     // rotation matrix double integral:
-    C_doubleintegral_ += C_integral_*dt + 0.25*(C + C_1)*dt*dt;
     acc_doubleintegral_ += acc_integral_*dt + 0.25*(C + C_1)*acc_S_true*dt*dt;
 
     // Jacobian parts
-    dalpha_db_g_ += dt*C_1;
-    const Eigen::Matrix3d cross_1 = dq.inverse().toRotationMatrix()*cross_ +
-                                    kinematics::rightJacobian(omega_S_true*dt)*dt;
-    const Eigen::Matrix3d acc_S_x = kinematics::crossMx(acc_S_true);
-    Eigen::Matrix3d dv_db_g_1 = dv_db_g_ + 0.5*dt*(C*acc_S_x*cross_ + C_1*acc_S_x*cross_1);
-    dp_db_g_ += dt*dv_db_g_ + 0.25*dt*dt*(C*acc_S_x*cross_ + C_1*acc_S_x*cross_1);
+    if (computeBiasJacobians_) {
+      C_doubleintegral_ += C_integral_*dt + 0.25*(C + C_1)*dt*dt;
+      C_integral_ += 0.5*(C + C_1)*dt;
+      dalpha_db_g_ += dt*C_1;
+      const Eigen::Matrix3d cross_1 = dq.inverse().toRotationMatrix()*cross_ +
+                                      kinematics::rightJacobian(omega_S_true*dt)*dt;
+      const Eigen::Matrix3d acc_S_x = kinematics::crossMx(acc_S_true);
+      Eigen::Matrix3d dv_db_g_1 = dv_db_g_ + 0.5*dt*(C*acc_S_x*cross_ + C_1*acc_S_x*cross_1);
+      dp_db_g_ += dt*dv_db_g_ + 0.25*dt*dt*(C*acc_S_x*cross_ + C_1*acc_S_x*cross_1);
+      cross_ = cross_1;
+      dv_db_g_ = dv_db_g_1;
+    }
     omega_S_ = omega_S_true;
 
     // memory shift
     Delta_q_ = Delta_q_1;
-    C_integral_ = C_integral_1;
     acc_integral_ = acc_integral_1;
-    cross_ = cross_1;
-    dv_db_g_ = dv_db_g_1;
     time = nexttime;
     t_end_ = nexttime;
   }
@@ -917,12 +927,26 @@ bool BatchedLidarPropagator::getState(
         Eigen::Vector3d & omega_S) {
 
   if (!lastRequested_) return false;
+  if (!computeBiasJacobians_
+      && (!sb_0.tail<6>().allFinite()
+          || !(sb_0.tail<6>().array() == sb_ref_.tail<6>().array()).all())) return false;
 
   // actual propagation output: TODO should get the 9.81 from parameters..
   const Eigen::Vector3d g_W = 9.81 * Eigen::Vector3d(0, 0, 6371009).normalized();
 
   // this will NOT be changed:
   const Eigen::Matrix3d C_WS_0 = T_WS_0.C();
+
+  if (!computeBiasJacobians_) {
+    // The deskew caller uses the same bias for integration and pose lookup.
+    // With Delta_b == 0, neither bias Jacobians nor C integrals contribute.
+    T_WS_1.set(T_WS_0.r() + sb_0.head<3>()*Delta_t_ - 0.5*g_W*Delta_t_*Delta_t_
+                  + C_WS_0*acc_doubleintegral_interp_, T_WS_0.q()*Delta_q_interp_);
+    sb_1 = sb_0;
+    sb_1.head<3>() = sb_0.head<3>() - g_W*Delta_t_ + C_WS_0*acc_integral_interp_;
+    omega_S = omega_S_interp_;
+    return true;
+  }
 
   // call the propagation
   const Eigen::Matrix<double, 6, 1> Delta_b
