@@ -193,15 +193,19 @@ void PlaneMap::save(const std::string& filename) const {
   if (directorySynced != 0) throw std::runtime_error("Cannot sync plane archive directory");
 }
 
-std::shared_ptr<PlaneMap> PlaneMap::load(const std::string& filename, const Config& config,
-                                      size_t maxBytes) {
+std::shared_ptr<PlaneMap> PlaneMap::load(const std::string& filename, const Config& config) {
   std::ifstream in(filename, std::ios::binary);
   in.exceptions(std::ios::failbit | std::ios::badbit);
   uint64_t magic = 0, count = 0;
   in.read(reinterpret_cast<char*>(&magic), sizeof(magic));
   in.read(reinterpret_cast<char*>(&count), sizeof(count));
-  if (magic != 0x31504d5356494b4fULL || count > maxBytes / (sizeof(Cell) + sizeof(Key) + 40))
-    throw std::runtime_error("Invalid or over-budget plane archive: " + filename);
+  constexpr uint64_t headerBytes = 2 * sizeof(uint64_t) + 6 * sizeof(double);
+  constexpr uint64_t recordBytes = 3 * sizeof(int64_t) + 8 * sizeof(double);
+  const auto fileBytes = std::filesystem::file_size(filename);
+  if (magic != 0x31504d5356494b4fULL || fileBytes < headerBytes
+      || (fileBytes - headerBytes) % recordBytes
+      || count != (fileBytes - headerBytes) / recordBytes)
+    throw std::runtime_error("Invalid plane archive size or header: " + filename);
   auto result = std::make_shared<PlaneMap>(config);
   Eigen::Vector3d minimum, maximum;
   in.read(reinterpret_cast<char*>(minimum.data()), 3 * sizeof(double));

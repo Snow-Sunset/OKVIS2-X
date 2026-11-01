@@ -41,14 +41,14 @@ void archiveChecks() {
   struct Cleanup { fs::path path; ~Cleanup() { std::error_code error; fs::remove_all(path, error); } } cleanup{directory};
   okvis::LidarPointCloudMap::ArchiveOptions options;
   options.directory = directory.string();
-  options.memoryBudgetBytes = 4096;
+  options.maxResidentSubmaps = 2;
   options.chunkPointLimit = 8;
   okvis::LidarPointCloudMap map(0.1, options);
   const auto identity = Eigen::Isometry3d::Identity();
   okvis::LidarPointCloudMap::Points input;
   for (int i = 0; i < 120; ++i) input.emplace_back(i * 0.25 + 0.03, 0.03, 0.03);
   map.addPoints(1, identity, input);
-  check(map.residentBytes() <= options.memoryBudgetBytes, "Archived map exceeded resident payload budget");
+  check(map.residentSubmapCount() <= options.maxResidentSubmaps, "Archived map exceeded resident submap limit");
   check(map.archivedPointCount() == input.size(), "Chunk cap did not archive a large active submap");
   const auto oldSnapshot = map.snapshot();
   check(!oldSnapshot.empty() && !oldSnapshot.front().points && oldSnapshot.front().archive,
@@ -98,10 +98,10 @@ void archiveChecks() {
     manySubmaps.addPoints(id, identity, {{double(id) * 10 + 0.03, 0.03, 0.03},
         {double(id) * 10 + 1.03, 0.03, 0.03}, {double(id) * 10 + 2.03, 0.03, 0.03}});
     const auto snapshot = manySubmaps.snapshot();
-    check(manySubmaps.residentBytes() <= options.memoryBudgetBytes,
-          "A growing number of partial submaps exceeded the resident budget");
+    check(manySubmaps.residentSubmapCount() <= options.maxResidentSubmaps,
+          "A growing number of partial submaps exceeded the resident submap limit");
     check(okvis::LidarPointCloudMap::assemble(snapshot, 0.1).size() == (id + 1) * 3,
-          "Budget eviction lost a partial submap");
+          "Submap eviction lost archived points");
   }
   // Unfiltered display must traverse both immutable chunks and resident tails,
   // applying the snapshot's pose without mutating older snapshots.
@@ -171,6 +171,39 @@ void unfilteredDisplayChecks() {
       (large.back() - corrected * many->back()).norm() < 1e-10,
       "Unfiltered display truncated or strided a map above 200,000 points");
 }
+void submapRetentionChecks() {
+  const auto identity = Eigen::Isometry3d::Identity();
+  okvis::LidarPointCloudMap map(0.1, 2);
+  okvis::LidarPointCloudMap::Points large;
+  for (int i = 0; i < 20001; ++i) large.emplace_back(i * 0.25, 0.03, 0.03);
+  map.addPoints(10, identity, large);
+  const auto snapshot = map.snapshot();
+  check(map.pointCloud().size() == large.size(), "Submap size caused partial point eviction");
+  map.addPoints(20, identity, {{0.03, 10.03, 0.03}});
+  // Retention follows the most recent point insertion, not numeric ID order
+  // or background pose corrections.
+  map.addPoints(10, identity, {{0.03, 20.03, 0.03}});
+  auto corrected = identity;
+  corrected.translation().z() = 1.0;
+  map.updatePose(20, corrected, true);
+  map.addPoints(30, identity, {{0.03, 30.03, 0.03}});
+  check(map.residentSubmapCount() == 2 && map.hasSubmap(10) && map.hasSubmap(30)
+      && !map.hasSubmap(20), "Count retention evicted the wrong submap");
+  check(map.pointCloud().size() == large.size() + 2,
+        "Count retention truncated a retained submap");
+  check(okvis::LidarPointCloudMap::assembleUnfiltered(snapshot).size() == large.size(),
+        "Submap eviction mutated an outstanding snapshot");
+  check(map.archiveDirectory().empty(), "RAM submap retention enabled persistence");
+  const auto revision = map.revision();
+  map.addPoints(5, identity, {{0.03, 40.03, 0.03}});
+  check(map.residentSubmapCount() == 2 && map.hasSubmap(5) && map.hasSubmap(30)
+      && !map.hasSubmap(10) && map.revision() > revision,
+        "Old-ID active submap was evicted or display revision was not updated");
+  bool rejected = false;
+  try { okvis::LidarPointCloudMap invalid(0.1, 0); }
+  catch (const std::invalid_argument&) { rejected = true; }
+  check(rejected, "Zero resident submap limit was accepted");
+}
 void run() {
   const auto identity = Eigen::Isometry3d::Identity();
   okvis::LidarPointCloudMap map(1.0);
@@ -221,7 +254,7 @@ void run() {
 
   // Realtime mode must not create cloud chunks and must evict voxels outside
   // the local FAST-LIVO-style window instead of growing with the trajectory.
-  okvis::LidarPointCloudMap local(0.1, 1024 * 1024);
+  okvis::LidarPointCloudMap local(0.1, 2);
   local.addPoints(1, identity, {{0.1, 0.1, 0.1}, {100.1, 0.1, 0.1}});
   local.setLocalWindow(Eigen::Vector3d::Zero(), 2.0);
   check(local.archiveDirectory().empty(), "RAM-only map unexpectedly created an archive directory");
@@ -232,6 +265,7 @@ void run() {
   try { okvis::LidarPointCloudMap bad(0.0); } catch (const std::invalid_argument&) { invalid = true; }
   check(invalid, "Invalid map resolution accepted");
   unfilteredDisplayChecks();
+  submapRetentionChecks();
   archiveChecks();
 }
 } // namespace

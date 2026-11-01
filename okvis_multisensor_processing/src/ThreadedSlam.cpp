@@ -54,6 +54,7 @@ ThreadedSlam::ThreadedSlam(ViParameters &parameters, std::string dBowDir, se::Su
   submapConfig_(subMapConfig),
   useAlignmentFactors_(submapConfig_.useMap2LiveFactors)
 {
+  lidarMeasurementsReceived_.configureMemory();
   setBlocking(false);
   init();
   
@@ -297,24 +298,13 @@ bool ThreadedSlam::addLidarMeasurement(const okvis::Time &stamp,
   lidarMeasurement.measurement.intensity = 0;
   lidarMeasurement.timeStamp = stamp;
 
-  const int lidarQueueSize = 500000;
   const size_t stride = submapConfig_.sensorMeasurementDownsampling;
   if (!stride) throw std::invalid_argument("LiDAR downsampling stride must be positive");
   sensorMeasurementDownsamplingCounter_ = (sensorMeasurementDownsamplingCounter_ + 1) % stride;
-  bool drop = false;
   if(!sensorMeasurementDownsamplingCounter_){
-    if (blocking_)
-    {
-      return lidarMeasurementsReceived_.PushBlockingIfFull(lidarMeasurement, size_t(lidarQueueSize));
-    }
-    else
-    {
-      drop = lidarMeasurementsReceived_.PushNonBlockingDroppingIfFull(
-              lidarMeasurement, size_t(lidarQueueSize));
-      if(drop)
-       DLOG(WARNING) << "lidar measurement drop ";
-    }
-    return drop;
+    // Legacy dataset input is pointwise and has no scan boundary. The ROS path
+    // uses addLidarMeasurements() for complete-scan replacement instead.
+    return lidarMeasurementsReceived_.PushBlockingIfFull(lidarMeasurement, 0);
   }
   return true;
 }
@@ -368,13 +358,12 @@ bool ThreadedSlam::addLidarMeasurements(const LidarMeasurementBatch& measurement
   } else {
     sensorMeasurementDownsamplingCounter_ = 0;
   }
-  const auto result = lidarMeasurementsReceived_.PushBatch(
-      input->begin(), input->end(), 500000, blocking_);
+  const auto result = lidarMeasurementsReceived_.PushBatch(*input);
   if (result.dropped) {
-    LOG_EVERY_N(WARNING, 40) << "Realtime LiDAR queue overflow: replaced " << result.dropped
-                           << " old rays in this scan; pending " << lidarMeasurementsReceived_.Size();
+    LOG_EVERY_N(WARNING, 40) << "Realtime LiDAR input replaced " << result.droppedScans
+                           << " old waiting scan (" << result.dropped << " rays); active scan retained";
   }
-  return result.accepted == input->size() && result.dropped == 0;
+  return !result.stopped;
 }
 
 // Add a GPS measurement.

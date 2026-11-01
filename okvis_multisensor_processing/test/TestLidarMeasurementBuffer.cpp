@@ -3,6 +3,7 @@
 #include <chrono>
 #include <filesystem>
 #include <iostream>
+#include <thread>
 
 int main() {
   const auto directory = std::filesystem::temp_directory_path() / ("okvis-spool-test-" +
@@ -61,30 +62,29 @@ int main() {
     }
     {
       okvis::LidarMeasurementBuffer buffer;
-      buffer.configureMemory(4);
+      buffer.configureMemory();
       for (int i = 0; i < 12; ++i) {
         okvis::LidarMeasurement measurement;
         measurement.timeStamp = okvis::Time(8, i);
         measurement.measurement.rayMeasurement = Eigen::Vector3d(i, i + 1, i + 2);
         if (!buffer.PushBlockingIfFull(measurement, 4))
           throw std::runtime_error("RAM-only LiDAR buffer stopped while accepting data");
-        // Keep the producer/consumer interleaving deterministic without ever
-        // allowing the bounded RAM queue to grow past four records.
-        if (buffer.Size() == 4) {
-          okvis::LidarMeasurement consumed;
-          if (!buffer.PopNonBlocking(&consumed))
-            throw std::runtime_error("RAM-only LiDAR buffer could not drain");
-        }
       }
-      if (std::filesystem::exists(directory / "ram-only.bin") || buffer.residentPoints() > 4)
-        throw std::runtime_error("RAM-only LiDAR buffer created a spool or exceeded its cap");
+      // Pointwise dataset callbacks cannot be treated as complete scan frames.
+      if (buffer.Size() != 12 || buffer.statistics().dropped)
+        throw std::runtime_error("Legacy pointwise input lost measurements");
+      for (int i = 0; i < 12; ++i) {
+        okvis::LidarMeasurement point;
+        if (!buffer.PopNonBlocking(&point) || point.timeStamp != okvis::Time(8, i))
+          throw std::runtime_error("Legacy pointwise input changed FIFO order");
+      }
       buffer.Shutdown();
     }
     {
       okvis::LidarMeasurementBuffer buffer;
-      buffer.configureMemory(4);
+      buffer.configureMemory();
       okvis::LidarMeasurementBatch input;
-      for (uint32_t i = 0; i < 8; ++i) {
+      for (uint32_t i = 0; i < 15; ++i) {
         okvis::LidarMeasurement point;
         point.timeStamp = okvis::Time(9, i);
         point.measurement.rayMeasurement = Eigen::Vector3d(i, 0, 1);
@@ -93,34 +93,110 @@ int main() {
       }
       const okvis::LidarMeasurementBatch first(input.begin(), input.begin() + 6);
       auto result = buffer.PushBatch(first);
-      if (result.stored != 4 || result.dropped != 2 || result.stopped)
-        throw std::runtime_error("RAM batch overflow counts are incorrect");
+      if (result.stored != 6 || result.dropped || result.stopped)
+        throw std::runtime_error("RAM input truncated a complete scan");
       okvis::LidarMeasurementBatch copied, consumed;
-      if (buffer.CopyUpTo(okvis::Time(9, 99), 4, &copied) != 4)
-        throw std::runtime_error("RAM batch could not be copied for pose lookup");
-      const okvis::LidarMeasurementBatch tail(input.begin() + 6, input.end());
-      result = buffer.PushBatch(tail);
-      if (result.stored || result.dropped != 2 || buffer.PopCount(2, &consumed) != 2
+      if (buffer.CopyUpTo(okvis::Time(9, 2), 99, &copied) != 3)
+        throw std::runtime_error("RAM scan copy ignored per-point timestamp support");
+      const okvis::LidarMeasurementBatch second(input.begin() + 6, input.begin() + 8);
+      const okvis::LidarMeasurementBatch third(input.begin() + 8, input.begin() + 12);
+      okvis::LidarMeasurementBuffer::PushResult replaced;
+      std::thread producer([&] {
+        buffer.PushBatch(second);
+        replaced = buffer.PushBatch(third);
+      });
+      producer.join();
+      if (replaced.stored != 4 || replaced.dropped != 2 || replaced.droppedScans != 1
+          || buffer.PopCount(2, &consumed) != 2
           || consumed[0].timeStamp != copied[0].timeStamp
           || consumed[1].timeStamp != copied[1].timeStamp)
-        throw std::runtime_error("Overflow changed the consumer's copied FIFO prefix");
-      result = buffer.PushBatch(tail);
+        throw std::runtime_error("Waiting scan replacement changed the pinned consumer prefix");
+      buffer.PushBatch(okvis::LidarMeasurementBatch{});
       auto stats = buffer.statistics();
-      if (result.stored != 2 || result.dropped || stats.stored != 6 || stats.dropped != 4
-          || stats.consumed != 2 || stats.queued != 4 || stats.resident != 4)
-        throw std::runtime_error("RAM FIFO accounting changed after a partial consume");
-      if (buffer.PopCount(4, &consumed) != 4 || consumed[0].timeStamp != input[2].timeStamp
-          || consumed[1].timeStamp != input[3].timeStamp
-          || consumed[2].timeStamp != input[6].timeStamp
-          || consumed[3].timeStamp != input[7].timeStamp)
-        throw std::runtime_error("Batch append reordered a retained FIFO suffix");
-      stats = buffer.statistics();
-      if (stats.queued || stats.hasFront || stats.consumed != stats.stored)
-        throw std::runtime_error("Drained RAM batch counters do not balance");
+      if (stats.stored != 12 || stats.dropped != 2 || stats.droppedScans != 1
+          || stats.consumed != 2 || stats.queued != 8 || stats.resident != 8
+          || stats.pendingScans != 1)
+        throw std::runtime_error("Partial scan or empty batch changed input accounting");
+      const okvis::LidarMeasurementBatch fourth(input.begin() + 12, input.end());
+      result = buffer.PushBatch(fourth);
+      if (result.stored != 3 || result.dropped != 4 || result.droppedScans != 1
+          || buffer.CopyUpTo(okvis::Time(9, 99), 99, &copied) != 4
+          || copied.front().timeStamp != input[2].timeStamp
+          || copied.back().timeStamp != input[5].timeStamp)
+        throw std::runtime_error("New input evicted or reordered the active scan's remaining tail");
       buffer.Shutdown();
-      result = buffer.PushBatch(tail);
-      if (!result.stopped || result.stored || result.dropped)
+      result = buffer.PushBatch(fourth);
+      if (!result.stopped || result.stored || result.dropped || result.droppedScans)
         throw std::runtime_error("Stopped FIFO accepted or overflow-counted a batch");
+      if (buffer.PopCount(7, &consumed) != 7)
+        throw std::runtime_error("Shutdown did not retain the active and latest pending scans");
+      for (size_t i = 0; i < consumed.size(); ++i) {
+        const auto& expected = input[i < 4 ? i + 2 : i + 8];
+        if (consumed[i].timeStamp != expected.timeStamp
+            || consumed[i].measurement.intensity != expected.measurement.intensity
+            || (consumed[i].measurement.rayMeasurement - expected.measurement.rayMeasurement).norm() != 0.0)
+          throw std::runtime_error("Active/pending scan drain changed point identity");
+      }
+      stats = buffer.statistics();
+      if (stats.queued || stats.hasFront || stats.pendingScans || stats.droppedScans != 2
+          || stats.consumed + stats.dropped != stats.stored)
+        throw std::runtime_error("Latest-scan counters do not balance after drain");
+    }
+    {
+      okvis::LidarMeasurementBuffer buffer;
+      buffer.configureMemory();
+      // A complete scan larger than the removed 200000-point cap must survive.
+      okvis::LidarMeasurementBatch scan(200001);
+      for (uint32_t i = 0; i < scan.size(); ++i) {
+        scan[i].timeStamp = okvis::Time(11, i);
+        scan[i].measurement.rayMeasurement = Eigen::Vector3d(i, 0, 1);
+        scan[i].measurement.intensity = i;
+      }
+      buffer.PushBatch(scan);
+      const auto replaced = buffer.PushBatch(scan);
+      if (replaced.stored != scan.size() || replaced.dropped != scan.size()
+          || replaced.droppedScans != 1 || buffer.Size() != scan.size())
+        throw std::runtime_error("Waiting input was not replaced as one complete scan");
+      okvis::LidarMeasurementBatch consumed;
+      if (buffer.PopCount(scan.size(), &consumed) != scan.size()
+          || consumed.back().measurement.intensity != scan.size() - 1)
+        throw std::runtime_error("Large scan was truncated by a point-count limit");
+    }
+    {
+      okvis::LidarMeasurementBuffer buffer;
+      buffer.configureMemory();
+      okvis::LidarMeasurementBatch scan(3);
+      for (auto& point : scan) point.measurement.rayMeasurement = Eigen::Vector3d(1, 0, 1);
+      scan[0].timeStamp = okvis::Time(12, 0);
+      scan[1].timeStamp = okvis::Time(12, 0); // preserve repeated point times
+      scan[2].timeStamp = okvis::Time(12, 1);
+      buffer.PushBatch(scan);
+      okvis::LidarMeasurementDeque live;
+      const auto before = [](const okvis::LidarMeasurement& point) {
+        return point.timeStamp < okvis::Time(12, 1);
+      };
+      if (buffer.PopWhile(before, &live) != 2 || live.size() != 2)
+        throw std::runtime_error("Live consumer changed the strict camera-time boundary");
+      scan[0].timeStamp = okvis::Time(12, 2);
+      scan[1].timeStamp = okvis::Time(12, 3);
+      scan[2].timeStamp = okvis::Time(12, 4);
+      buffer.PushBatch(scan);
+      scan[0].timeStamp = okvis::Time(12, 5);
+      scan[1].timeStamp = okvis::Time(12, 6);
+      scan[2].timeStamp = okvis::Time(12, 7);
+      buffer.PushBatch(scan);
+      if (buffer.PopWhile(before, static_cast<okvis::LidarMeasurementDeque*>(nullptr)) != 0)
+        throw std::runtime_error("Pending replacement consumed the unsupported active tail");
+      buffer.Shutdown();
+      okvis::LidarMeasurement point;
+      if (!buffer.PopBlocking(&point) || point.timeStamp != okvis::Time(12, 1))
+        throw std::runtime_error("Shutdown lost the active scan tail");
+      for (uint32_t i = 5; i <= 7; ++i) {
+        if (!buffer.PopBlocking(&point) || point.timeStamp != okvis::Time(12, i))
+          throw std::runtime_error("Shutdown lost the latest waiting scan");
+      }
+      if (buffer.PopBlocking(&point))
+        throw std::runtime_error("Stopped empty scan input did not terminate");
     }
     {
       okvis::LidarMeasurementBuffer buffer;
@@ -159,7 +235,7 @@ int main() {
       if (!rejected || buffer.Size() != 0) throw std::runtime_error("Spool disk failure silently accepted data");
     }
     std::filesystem::remove_all(directory);
-    std::cout << "Bounded lossless LiDAR spool checks passed\n";
+    std::cout << "Latest-scan LiDAR input and lossless spool checks passed\n";
     return 0;
   } catch (const std::exception& error) {
     std::filesystem::remove_all(directory);

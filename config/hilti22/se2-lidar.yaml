@@ -25,16 +25,13 @@ general:
   build_lidar_pointcloud_map: true
   pointcloud_map_global: true # fixed-resolution full-history visual map in RAM
   # Bound local registration; the global visual map retains history in RAM.
-  memory_bounded: true
   memory_archive_directory: "./okvis-history" # used only if LiDAR spool/chunks are explicitly enabled
-  pointcloud_memory_mb: 96 # local mode or explicit persistent chunk cache only
-  plane_cache_memory_mb: 32
+  max_submaps: 32 # shared cloud/plane retention target; active/reference maps are protected
   plane_active_max_cells: 8192
   plane_window_half_extent: 50.0 # m; local sliding plane window
-  lidar_queue_max_points: 200000 # bounded RAM FIFO cap
-  lidar_spool_enabled: false # keep raw rays in bounded RAM only; enable for durable input recovery
-  pointcloud_persistent_chunks: false # global RAM map; no historical point-cloud files
-  pointcloud_window_half_extent: 50.0 # m; only when pointcloud_map_global is false
+  lidar_spool_enabled: false # RAM: one active scan + one latest waiting scan; true: lossless mapping spool
+  pointcloud_persistent_chunks: false # RAM map; no historical point-cloud files
+  pointcloud_window_half_extent: 50.0 # m; world-frame sliding point-cloud window half extent
   mapping_queue_max_frames: 4
   state_queue_max_updates: 32
   pointcloud_map_voxel_size: 0.1        # m; accumulated XYZ map sampling

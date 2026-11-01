@@ -281,17 +281,15 @@ namespace okvis {
                 || submapConfig_.pointCloudMapPublishInterval < 0.0) {
               throw std::invalid_argument("pointcloud_map_publish_interval must be finite and nonnegative");
             }
-            if (submapConfig_.memoryBounded && submapConfig_.pointCloudPersistentChunks) {
+            if (submapConfig_.pointCloudPersistentChunks) {
               LidarPointCloudMap::ArchiveOptions archive;
               archive.directory = (std::filesystem::path(memoryArchiveDirectory_) / "cloud").string();
-              archive.memoryBudgetBytes = submapConfig_.pointCloudMemoryMb * 1024 * 1024;
+              archive.maxResidentSubmaps = submapConfig_.maxSubmaps;
               pointCloudMap_ = std::make_unique<LidarPointCloudMap>(submapConfig_.pointCloudMapVoxelSize, archive);
-            } else if (submapConfig_.memoryBounded) {
+            } else {
               pointCloudMap_ = std::make_unique<LidarPointCloudMap>(
                   submapConfig_.pointCloudMapVoxelSize,
-                  submapConfig_.pointCloudMemoryMb * 1024 * 1024);
-            } else {
-              pointCloudMap_ = std::make_unique<LidarPointCloudMap>(submapConfig_.pointCloudMapVoxelSize);
+                  submapConfig_.maxSubmaps);
             }
 
           }
@@ -343,11 +341,10 @@ namespace okvis {
          * @param[in] stamp     The timestamp.
          * @param[in] ray       The lidar measurement
          *
-         * @return    True if handled. A full bounded RAM queue intentionally
-         *            discards the incoming ray without blocking other sensors.
+         * @return    True if handled. Legacy pointwise dataset input is lossless.
          */
         bool addLidarMeasurement(const okvis::Time &stamp, const Eigen::Vector3d &ray);
-        /// Enqueue one parsed LiDAR message without per-point queue locking.
+        /// Enqueue a complete scan, replacing only the old waiting RAM scan.
         bool addLidarMeasurements(const LidarMeasurementBatch& measurements);
 
         /**
@@ -425,9 +422,14 @@ namespace okvis {
         void publishLidarPointCloudMap(bool force = false);
         bool saveLidarPointCloudMap(const std::string& filename) const;
         size_t planeResidentBytes() const;
+        size_t planeResidentSubmapCount() const { return planeMaps_.size(); }
         size_t cloudResidentBytes() const {
           std::lock_guard lock(pointCloudMapMutex_);
           return pointCloudMap_ ? pointCloudMap_->residentBytes() : 0;
+        }
+        size_t cloudResidentSubmapCount() const {
+          std::lock_guard lock(pointCloudMapMutex_);
+          return pointCloudMap_ ? pointCloudMap_->residentSubmapCount() : 0;
         }
         const std::string& memoryArchiveDirectory() const { return memoryArchiveDirectory_; }
 
@@ -871,6 +873,7 @@ namespace okvis {
         bool preinitializationLidarReported_ = false;
         bool lidarQueueOverflowReported_ = false;
         Time lastTrajectoryUpdateTimestamp_;
+        bool addLidarMeasurementsImpl(const LidarMeasurementBatch& measurements, bool completeScan);
         size_t copyLidarAfterTrajectoryStart(
             const Time& maxTime, size_t maxCount, LidarMeasurementBuffer::Batch* candidates);
         size_t consumePosedLidar(

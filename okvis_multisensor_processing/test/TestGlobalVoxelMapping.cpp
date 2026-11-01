@@ -29,11 +29,9 @@ okvis::ViParameters parameters() {
 
 se::SubMapConfig configuration(const std::filesystem::path& directory, bool global) {
   se::SubMapConfig config;
-  config.memoryBounded = true;
   config.pointCloudMapGlobal = global;
   config.memoryArchiveDirectory = (directory / "unexpected-history").string();
-  config.pointCloudMemoryMb = 1;
-  config.planeCacheMemoryMb = 1;
+  config.maxSubmaps = 1;
   config.planeActiveMaxCells = 16;
   config.pointCloudWindowHalfExtent = 50.0;
   config.pointCloudMapVoxelSize = kVoxelSize;
@@ -122,8 +120,8 @@ void globalChecks(const std::filesystem::path& directory) {
     check(published.size() == (index + 1) * kPointsPerPacket,
           "Global visualization lost history outside its old local window/budget");
   }
-  check(mapping.cloudResidentBytes() > config.pointCloudMemoryMb * 1024 * 1024,
-        "Global fixture did not exceed the former point-cloud memory budget");
+  check(mapping.cloudResidentSubmapCount() > config.maxSubmaps,
+        "Global fixture did not exceed the local submap count limit");
   check(mapping.seSubmapLookup_.size() == 3, "Global fixture did not create separate anchors");
   auto revisit = packet(13, 0.0);
   mapping.processSupereightFrame(revisit);
@@ -182,8 +180,8 @@ void localChecks(const std::filesystem::path& directory) {
   check(published.size() == kPointsPerPacket, "Opt-in local map retained outside-window history");
   for (const auto& point : published)
     check(point.x() > 199.0, "Opt-in local map still displayed a distant historical region");
-  check(mapping.cloudResidentBytes() <= config.pointCloudMemoryMb * 1024 * 1024,
-        "Opt-in local point cloud exceeded its configured budget");
+  check(mapping.cloudResidentSubmapCount() <= config.maxSubmaps,
+        "Opt-in local point cloud exceeded its submap count limit");
   mapping.setFinished();
   check(mapping.memoryArchiveDirectory().empty() && std::filesystem::is_empty(directory),
         "Local RAM comparison unexpectedly wrote history files/directories");

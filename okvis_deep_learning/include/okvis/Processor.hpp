@@ -104,6 +104,8 @@ public:
    */
   virtual bool addLidarMeasurement(const okvis::Time & stamp,
                                    const Eigen::Vector3d & rayMeasurement) final;
+  /// Preserve scan boundaries for the SLAM latest-waiting-scan queue.
+  bool addLidarMeasurements(const LidarMeasurementBatch& measurements) override final;
 
   /**
    * @brief Adds a depth image image to the measurement Queue

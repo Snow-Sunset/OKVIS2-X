@@ -63,18 +63,12 @@ namespace okvis {
 
   void SubmappingInterface::initializeMemoryStorage() {
     if (!viParameters_.lidar) return;
-    if (!submapConfig_.memoryBounded) {
-      LOG(INFO) << "LiDAR mapping input: unbounded RAM FIFO; configured lidar_queue_max_points="
-                << submapConfig_.lidarQueueMaxPoints << " is inactive when memory_bounded=false";
-      return;
-    }
-    if (!submapConfig_.pointCloudMemoryMb || !submapConfig_.planeCacheMemoryMb
-        || !submapConfig_.planeActiveMaxCells || !submapConfig_.lidarQueueMaxPoints
+    if (!submapConfig_.maxSubmaps
+        || !submapConfig_.planeActiveMaxCells
         || !submapConfig_.mappingQueueMaxFrames || !submapConfig_.stateQueueMaxUpdates
         || !std::isfinite(submapConfig_.planeWindowHalfExtent) || submapConfig_.planeWindowHalfExtent <= 0.0
-        || !std::isfinite(submapConfig_.pointCloudWindowHalfExtent) || submapConfig_.pointCloudWindowHalfExtent <= 0.0
-        || submapConfig_.pointCloudMemoryMb > 1024 || submapConfig_.planeCacheMemoryMb > 1024) {
-      throw std::invalid_argument("Bounded LiDAR memory requires positive finite budgets and queue limits");
+        || !std::isfinite(submapConfig_.pointCloudWindowHalfExtent) || submapConfig_.pointCloudWindowHalfExtent <= 0.0) {
+      throw std::invalid_argument("LiDAR retention requires positive submap counts, finite windows and queue limits");
     }
     const bool persistentMappingHistory = submapConfig_.lidarSpoolEnabled
         || submapConfig_.pointCloudPersistentChunks;
@@ -99,22 +93,22 @@ namespace okvis {
     submapConfig_.planeMapConfig.maxCells = submapConfig_.planeActiveMaxCells;
     if (submapConfig_.lidarSpoolEnabled) {
       lidarMeasurements_.configure(
-          (std::filesystem::path(memoryArchiveDirectory_) / "lidar-spool.bin").string(),
-          submapConfig_.lidarQueueMaxPoints);
+          (std::filesystem::path(memoryArchiveDirectory_) / "lidar-spool.bin").string());
     } else {
-      lidarMeasurements_.configureMemory(submapConfig_.lidarQueueMaxPoints);
+      lidarMeasurements_.configureMemory();
     }
     LOG(INFO) << "LiDAR mapping storage: "
               << (memoryArchiveDirectory_.empty() ? "RAM only" : memoryArchiveDirectory_)
-              << "; cloud budget " << submapConfig_.pointCloudMemoryMb << " MiB, plane cache "
-              << submapConfig_.planeCacheMemoryMb << " MiB, active plane cell cap "
+              << "; submap retention target " << submapConfig_.maxSubmaps
+              << " (cloud includes active; plane cache protects references), active plane cell cap "
               << submapConfig_.planeActiveMaxCells << ", raw LiDAR spool "
               << (submapConfig_.lidarSpoolEnabled ? "enabled" : "disabled")
               << ", persistent voxel chunks "
               << (submapConfig_.pointCloudPersistentChunks ? "enabled" : "disabled")
               << ", local window half extent " << submapConfig_.pointCloudWindowHalfExtent << " m"
-              << "; effective LiDAR RAM cap " << submapConfig_.lidarQueueMaxPoints
-              << (submapConfig_.lidarSpoolEnabled ? " points (spool backlog is not capped)" : " points (drop incoming at capacity)")
+              << "; LiDAR input "
+              << (submapConfig_.lidarSpoolEnabled ? "lossless disk spool (32768-point read cache)"
+                                                : "one active scan plus one latest waiting scan")
               << "; mapping packet cap " << submapConfig_.mappingQueueMaxFrames
               << ", state update cap " << submapConfig_.stateQueueMaxUpdates
               << ", plane candidate cap " << submapConfig_.lidarMaxPlaneCandidates
@@ -266,7 +260,9 @@ namespace okvis {
     const auto stats = lidarMeasurements_.statistics();
     LOG(INFO) << "LiDAR mapping input" << (force ? " final" : "")
               << ": queued=" << stats.queued << ", resident=" << stats.resident
-              << ", accepted=" << stats.stored << ", dropped_incoming=" << stats.dropped
+              << ", accepted=" << stats.stored << ", replaced_points=" << stats.dropped
+              << ", replaced_scans=" << stats.droppedScans
+              << ", pending_scans=" << stats.pendingScans
               << ", range_filtered=" << lidarRangeFilteredPoints_.load(std::memory_order_relaxed)
               << ", consumed=" << stats.consumed
               << ", posed=" << lidarPosedPoints_ << ", expired_imu=" << lidarExpiredPoints_
@@ -324,7 +320,6 @@ namespace okvis {
   }
 
   void SubmappingInterface::completePlaneMap(uint64_t id) {
-    if (!submapConfig_.memoryBounded) return;
     const auto it = planeMaps_.find(id);
     if (it == planeMaps_.end() || planeArchives_.count(id)) return;
     it->second->finalize();
@@ -341,7 +336,6 @@ namespace okvis {
 
   void SubmappingInterface::flushMemoryStorage() {
     std::lock_guard mappingLock(mappingDataMutex_);
-    if (!submapConfig_.memoryBounded) return;
     lidarMeasurements_.Flush();
     completePlaneMap(prevKeyframeId_);
     applyPendingPointCloudPoses();
@@ -352,11 +346,8 @@ namespace okvis {
   }
 
   void SubmappingInterface::trimPlaneCache(uint64_t protectedId) const {
-    if (!submapConfig_.memoryBounded) return;
-    size_t bytes = 0;
-    for (const auto& map : planeMaps_) if (map.first != prevKeyframeId_) bytes += map.second->residentBytes();
-    const size_t budget = submapConfig_.planeCacheMemoryMb * 1024 * 1024;
-    while (bytes > budget) {
+    size_t count = planeMaps_.size() - planeMaps_.count(prevKeyframeId_);
+    while (count > submapConfig_.maxSubmaps) {
       auto victim = planeMaps_.end();
       uint64_t age = std::numeric_limits<uint64_t>::max();
       for (auto it = planeMaps_.begin(); it != planeMaps_.end(); ++it) {
@@ -367,9 +358,9 @@ namespace okvis {
         if (used < age) { age = used; victim = it; }
       }
       if (victim == planeMaps_.end()) break; // active/reference maps remain pinned
-      bytes -= victim->second->residentBytes();
       planeAccess_.erase(victim->first);
       planeMaps_.erase(victim);
+      --count;
     }
   }
 
@@ -379,8 +370,7 @@ namespace okvis {
     if (it == planeMaps_.end()) {
       const auto archive = planeArchives_.find(id);
       if (archive == planeArchives_.end()) return nullptr;
-      auto map = PlaneMap::load(archive->second.filename, submapConfig_.planeMapConfig,
-                                submapConfig_.planeCacheMemoryMb * 1024 * 1024);
+      auto map = PlaneMap::load(archive->second.filename, submapConfig_.planeMapConfig);
       it = planeMaps_.emplace(id, std::move(map)).first;
       loaded = true;
     }
@@ -698,10 +688,17 @@ namespace okvis {
     lidarMeasurement.timeStamp = stamp;
     lidarMeasurement.measurement.rayMeasurement = ray;
     lidarMeasurement.measurement.intensity = 0;
-    return addLidarMeasurements(LidarMeasurementBatch{lidarMeasurement});
+    // A pointwise dataset callback has no scan boundary; do not replace it as
+    // though each ray were a complete scan.
+    return addLidarMeasurementsImpl(LidarMeasurementBatch{lidarMeasurement}, false);
   }
 
   bool SubmappingInterface::addLidarMeasurements(const LidarMeasurementBatch& measurements) {
+    return addLidarMeasurementsImpl(measurements, true);
+  }
+
+  bool SubmappingInterface::addLidarMeasurementsImpl(
+      const LidarMeasurementBatch& measurements, bool completeScan) {
     if (measurements.empty()) return true;
     std::lock_guard inputLock(lidarInputMutex_);
     if (sensorMeasurementDownsampling_ <= 0) {
@@ -734,11 +731,16 @@ namespace okvis {
       lidarRangeFilteredPoints_.fetch_add(rangeFiltered, std::memory_order_relaxed);
       selected = &sampled;
     }
+    if (!completeScan) {
+      for (const auto& measurement : *selected) {
+        if (!lidarMeasurements_.PushBlockingIfFull(measurement, 0)) return false;
+      }
+      return true;
+    }
     const auto result = lidarMeasurements_.PushBatch(*selected);
     if (result.dropped && !lidarQueueOverflowReported_) {
-      LOG(WARNING) << "Bounded RAM LiDAR queue reached " << submapConfig_.lidarQueueMaxPoints
-                   << " rays; dropped " << result.dropped
-                   << " incoming rays in this batch to keep camera and IMU callbacks live";
+      LOG(WARNING) << "LiDAR mapping input replaced an old waiting scan (" << result.dropped
+                   << " rays); the active scan and its unconsumed tail are retained";
       lidarQueueOverflowReported_ = true;
     }
     return !result.stopped;
@@ -786,8 +788,9 @@ namespace okvis {
                                               const Eigen::Vector3d& omega) {
       // store in any case
       imuMeasurements_.push_back(ImuMeasurement(stamp, ImuSensorReadings(omega,alpha)));
-      if (submapConfig_.memoryBounded && !imuMeasurements_.empty()) {
-        const auto first = std::lower_bound(imuMeasurements_.begin(), imuMeasurements_.end(), stamp - Duration(5.0),
+      if (!imuMeasurements_.empty()) {
+        const Time cutoff = stamp >= Time(5, 0) ? stamp - Duration(5.0) : Time(0, 0);
+        const auto first = std::lower_bound(imuMeasurements_.begin(), imuMeasurements_.end(), cutoff,
             [](const ImuMeasurement& measurement, const Time& time) { return measurement.timeStamp < time; });
         imuMeasurements_.erase(imuMeasurements_.begin(), first);
       }
@@ -926,14 +929,9 @@ namespace okvis {
           // Put remaining frames into supereightFrames.
           if(frame_){
             auto pendingFrame = std::move(frame_);
-            const bool bounded = blocking_ || submapConfig_.memoryBounded;
             mappingLock.unlock();
-            if (bounded) {
-              supereightFrames_.PushBlockingIfFull(std::move(*pendingFrame),
-                                                   submapConfig_.memoryBounded ? submapConfig_.mappingQueueMaxFrames : 1);
-            } else {
-              supereightFrames_.PushNonBlockingDroppingIfFull(std::move(*pendingFrame), 2);
-            }
+            supereightFrames_.PushBlockingIfFull(std::move(*pendingFrame),
+                                                submapConfig_.mappingQueueMaxFrames);
             return false;
           }
 
@@ -1222,8 +1220,7 @@ namespace okvis {
     }
 
     TimerSwitchable batchIntegration("9.2 LiDAR map update");
-    if(lidarSensors_ && !supereightFrame.vecRayMeasurements.empty()
-        && (submapConfig_.memoryBounded || supereightFrames_.Size() <= 1)){
+    if(lidarSensors_ && !supereightFrame.vecRayMeasurements.empty()){
       // Here prevKeyframeId_ will always be the current active submap
       okvis::kinematics::Transformation T_WK(seSubmapLookup_[prevKeyframeId_].T_WK.matrix().cast<double>());
       TimerSwitchable prepareInput("9.2.0 LiDAR input preparation");
@@ -1240,7 +1237,7 @@ namespace okvis {
         }
         if (submapConfig_.usePointToPlaneFactors) {
           auto& map = planeMaps_.at(prevKeyframeId_);
-          if (submapConfig_.memoryBounded && !supereightFrame.vecRayMeasurements.empty()) {
+          if (!supereightFrame.vecRayMeasurements.empty()) {
             map->setWindow(supereightFrame.vecRayMeasurements.back().first.translation().cast<double>(),
                            submapConfig_.planeWindowHalfExtent);
           }
@@ -1248,7 +1245,7 @@ namespace okvis {
         }
         if (pointCloudMap_) {
           std::lock_guard lock(pointCloudMapMutex_);
-          if (submapConfig_.memoryBounded && !submapConfig_.pointCloudPersistentChunks
+          if (!submapConfig_.pointCloudPersistentChunks
               && !supereightFrame.vecRayMeasurements.empty()) {
             // vecRayMeasurements contains T_KL after updateLidarAlignBlock;
             // convert the latest LiDAR origin back to world coordinates before
@@ -1548,8 +1545,7 @@ namespace okvis {
         // Do not recreate an evicted historical anchor in the RAM sliding
         // window. The active anchor is updated synchronously before insertion;
         // late callbacks for missing anchors are safe to ignore.
-        const bool keepMissingAnchor = !submapConfig_.memoryBounded
-            || submapConfig_.pointCloudPersistentChunks;
+        const bool keepMissingAnchor = submapConfig_.pointCloudPersistentChunks;
         if (pointCloudMap_->hasSubmap(pose.first) ||
             (pose.second.keyframe && keepMissingAnchor)) {
           pointCloudMap_->updatePose(pose.first, pose.second.pose, true, pose.second.sequence);
@@ -1867,12 +1863,10 @@ namespace okvis {
 
       // Setting some variables required for looping over state updates and measurements
       bool keepLooping = true;
-      const size_t maxLidarBatchPoints = submapConfig_.memoryBounded
-          ? std::min<size_t>(submapConfig_.lidarQueueMaxPoints, 32768) : std::numeric_limits<size_t>::max();
-      // Preserve the original high-throughput queue in unbounded mode. The
-      // small configurable queue is backpressure for bounded-memory sessions.
-      const size_t supereightQueueSize = submapConfig_.memoryBounded
-          ? submapConfig_.mappingQueueMaxFrames : 5000;
+      // Processing chunk size, independent of the complete-scan input capacity.
+      const size_t maxLidarBatchPoints = 32768;
+      // Mapping packets always apply backpressure at the configured frame count.
+      const size_t supereightQueueSize = submapConfig_.mappingQueueMaxFrames;
       Transformation T_WD;
 
       // Iterate available measurements
@@ -1993,12 +1987,8 @@ namespace okvis {
 
           if(frame_){
             const uint64_t packetAnchor = frame_->keyFrameId;
-            bool packetQueued = true;
-            if(blocking_ || submapConfig_.memoryBounded){
-              packetQueued = supereightFrames_.PushBlockingIfFull(std::move(*frame_), submapConfig_.memoryBounded ? supereightQueueSize : 1);
-            } else if(supereightFrames_.PushNonBlockingDroppingIfFull(std::move(*frame_), supereightQueueSize)){
-              LOG(WARNING) << "Oldest Supereight frame dropped";
-            }
+            const bool packetQueued = supereightFrames_.PushBlockingIfFull(
+                std::move(*frame_), supereightQueueSize);
             frame_.reset();
             if (integrateLidar && packetQueued) {
               uint64_t anchorId;
@@ -2084,20 +2074,12 @@ namespace okvis {
         bool success = stateUpdates_.PushBlockingIfFull(latestStateData, 1);
         return success;
       } else {
-        if (submapConfig_.memoryBounded) {
-          if (!stateUpdates_.PushNonBlockingIfNotFull(latestStateData, stateUpdateQueue)) {
-            throw std::runtime_error("Mapping state queue budget exhausted; reduce playback rate or increase state_queue_max_updates");
-          }
-          return true;
+        if (!stateUpdates_.PushNonBlockingIfNotFull(latestStateData, stateUpdateQueue)) {
+          throw std::runtime_error("Mapping state queue budget exhausted; reduce playback rate or increase state_queue_max_updates");
         }
-        if (stateUpdates_.PushNonBlockingDroppingIfFull(latestStateData,
-                                                        stateUpdateQueue)) {
-          LOG(WARNING) << "Oldest state  measurement dropped";
-          return true;
-        }
+        return true;
       }
 
-      return false;
     }
 
     void SubmappingInterface::publishSubmaps(AlignedUnorderedMap<uint64_t, Transformation> submapPoses,
@@ -2411,7 +2393,7 @@ namespace okvis {
 
   bool SubmappingInterface::decideNewSubmap(SupereightFrames& supereightFrame) {
     bool create_new_submap = false;
-    if (lidarSensors_ && submapConfig_.memoryBounded && prevKeyframeId_ != UNINITIALIZED_ID
+    if (lidarSensors_ && prevKeyframeId_ != UNINITIALIZED_ID
         && supereightFrame.keyFrameId != prevKeyframeId_) {
       const auto active = planeMaps_.find(prevKeyframeId_);
       if (active != planeMaps_.end() && active->second->numCells() >= submapConfig_.planeActiveMaxCells) {
@@ -2765,32 +2747,30 @@ namespace okvis {
     size_t n_points = onlyRays.size();
     if(n_points > 0){
       submapAlignBlock_.voxelHashMap.AddPoints(onlyRays);
-      if (submapConfig_.memoryBounded) {
-        auto& hash = submapAlignBlock_.voxelHashMap;
-        hash.max_distance_ = submapConfig_.planeWindowHalfExtent;
-        const Eigen::Vector3d center = vecRayMeasurements.back().first.translation().cast<double>();
-        const double pruneTrigger = std::max(
-            double(hash.voxel_size_), std::min(2.0, 0.1 * hash.max_distance_));
-        const bool movedEnough = !submapAlignBlock_.windowPruneInitialized
-            || (center - submapAlignBlock_.windowCenter).cwiseAbs().maxCoeff() >= pruneTrigger;
-        if (movedEnough) {
-          hash.RemovePointsFarFromLocation(center);
-          submapAlignBlock_.windowCenter = center;
-          submapAlignBlock_.windowPruneInitialized = true;
-        }
-        const size_t cap = std::max<size_t>(submapConfig_.numSubmapFactors * 20, 1000);
-        if (hash.map_.size() > cap) {
-          auto points = hash.Pointcloud();
-          std::vector<Eigen::Vector3f, Eigen::aligned_allocator<Eigen::Vector3f>> floats;
-          floats.reserve(points.size());
-          for (const auto& point : points) floats.push_back(point.cast<float>());
-          std::vector<Eigen::Vector3f, Eigen::aligned_allocator<Eigen::Vector3f>> sampled;
-          downsamplePointCloud(floats, sampled, cap);
-          points.clear();
-          for (const auto& point : sampled) points.push_back(point.cast<double>());
-          hash.Clear();
-          hash.AddPoints(points);
-        }
+      auto& hash = submapAlignBlock_.voxelHashMap;
+      hash.max_distance_ = submapConfig_.planeWindowHalfExtent;
+      const Eigen::Vector3d center = vecRayMeasurements.back().first.translation().cast<double>();
+      const double pruneTrigger = std::max(
+          double(hash.voxel_size_), std::min(2.0, 0.1 * hash.max_distance_));
+      const bool movedEnough = !submapAlignBlock_.windowPruneInitialized
+          || (center - submapAlignBlock_.windowCenter).cwiseAbs().maxCoeff() >= pruneTrigger;
+      if (movedEnough) {
+        hash.RemovePointsFarFromLocation(center);
+        submapAlignBlock_.windowCenter = center;
+        submapAlignBlock_.windowPruneInitialized = true;
+      }
+      const size_t cap = std::max<size_t>(submapConfig_.numSubmapFactors * 20, 1000);
+      if (hash.map_.size() > cap) {
+        auto points = hash.Pointcloud();
+        std::vector<Eigen::Vector3f, Eigen::aligned_allocator<Eigen::Vector3f>> floats;
+        floats.reserve(points.size());
+        for (const auto& point : points) floats.push_back(point.cast<float>());
+        std::vector<Eigen::Vector3f, Eigen::aligned_allocator<Eigen::Vector3f>> sampled;
+        downsamplePointCloud(floats, sampled, cap);
+        points.clear();
+        for (const auto& point : sampled) points.push_back(point.cast<double>());
+        hash.Clear();
+        hash.AddPoints(points);
       }
     }
   }

@@ -54,8 +54,7 @@ class PlaneMap {
   void finalize();
   bool finalized() const { return finalized_; }
   void save(const std::string& filename) const;
-  static std::shared_ptr<PlaneMap> load(const std::string& filename, const Config& config,
-                                       size_t maxBytes);
+  static std::shared_ptr<PlaneMap> load(const std::string& filename, const Config& config);
   const Eigen::AlignedBox3d& bounds() const { return bounds_; }
 
  private:

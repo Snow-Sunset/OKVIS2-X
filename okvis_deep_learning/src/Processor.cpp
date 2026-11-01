@@ -177,6 +177,10 @@ bool Processor::addLidarMeasurement(const okvis::Time & stamp,
   return slam_.addLidarMeasurement(stamp, rayMeasurement);
 }
 
+bool Processor::addLidarMeasurements(const LidarMeasurementBatch& measurements) {
+  return slam_.addLidarMeasurements(measurements);
+}
+
 bool Processor::addDepthMeasurement(const okvis::Time &stamp,
                                     const cv::Mat &depthImage,
                                     const std::optional<cv::Mat> &sigmaImage) {

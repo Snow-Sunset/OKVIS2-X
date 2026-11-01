@@ -22,7 +22,6 @@
 
 #include <atomic>
 #include <condition_variable>
-#include <deque>
 #include <memory>
 #include <mutex>
 #include <thread>
@@ -151,11 +150,10 @@ class Subscriber
   std::vector<std::map<uint64_t, cv::Mat>> depthImagesReceived_; ///> The depth images obtained and buffered (to sync)
   bool syncDepthImages_ = false;
   std::string lidarPointTimeReference_ = "scan_start";
-  std::deque<sensor_msgs::msg::PointCloud2::ConstSharedPtr> lidarScanQueue_;
+  sensor_msgs::msg::PointCloud2::ConstSharedPtr pendingLidarScan_;
   std::mutex lidarScanMutex_;
   std::condition_variable lidarScanCv_;
   std::thread lidarWorker_;
-  size_t lidarWorkerQueueDepth_ = 3;
   bool lidarWorkerStop_ = false; ///< Guarded by lidarScanMutex_.
   std::atomic_bool shutdownRequested_{false};
   std::atomic<uint64_t> lidarScansReceived_{0};

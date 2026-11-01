@@ -102,24 +102,15 @@ void Subscriber::setNodeHandle(std::shared_ptr<rclcpp::Node> node,
     if (lidarPointTimeReference_ != "scan_start" && lidarPointTimeReference_ != "scan_end"
         && lidarPointTimeReference_ != "header")
       throw std::invalid_argument("lidar_ouster_time_reference must be scan_start, scan_end or header");
-    if (!node_->has_parameter("lidar_subscription_queue_depth"))
-      node_->declare_parameter<int64_t>("lidar_subscription_queue_depth", 3);
-    const auto queueDepth = node_->get_parameter("lidar_subscription_queue_depth").as_int();
-    if (queueDepth <= 0) throw std::invalid_argument("LiDAR subscription queue depth must be positive");
-    if (!node_->has_parameter("lidar_worker_queue_depth"))
-      node_->declare_parameter<int64_t>("lidar_worker_queue_depth", 3);
-    const auto workerQueueDepth = node_->get_parameter("lidar_worker_queue_depth").as_int();
-    if (workerQueueDepth <= 0) throw std::invalid_argument("LiDAR worker queue depth must be positive");
-    lidarWorkerQueueDepth_ = size_t(workerQueueDepth);
     auto lidarQos = rclcpp::SensorDataQoS();
-    lidarQos.keep_last(size_t(queueDepth));
+    lidarQos.keep_last(1);
     subLiDAR_ = node_->create_subscription<sensor_msgs::msg::PointCloud2>(
       "/okvis/lidar", lidarQos,
       std::bind(&Subscriber::lidarCallback, this, std::placeholders::_1));
     lidarWorker_ = std::thread(&Subscriber::lidarWorkerLoop, this);
-    LOG(INFO) << "LiDAR asynchronous batch input: DDS depth " << queueDepth
-              << " scans, worker depth " << workerQueueDepth
-              << " scans; Ouster UINT32 t in ns, header reference " << lidarPointTimeReference_;
+    LOG(INFO) << "LiDAR asynchronous batch input: DDS depth 1, one latest waiting scan; "
+              << "active scan is retained; Ouster UINT32 t in ns, header reference "
+              << lidarPointTimeReference_;
   }
 }
 
@@ -230,17 +221,20 @@ void Subscriber::lidarCallback(sensor_msgs::msg::PointCloud2::ConstSharedPtr msg
                                 std::memory_order_relaxed);
 
   size_t pending = 0;
+  sensor_msgs::msg::PointCloud2::ConstSharedPtr replaced;
   {
     std::lock_guard<std::mutex> lock(lidarScanMutex_);
     if (lidarWorkerStop_) return;
-    if (lidarScanQueue_.size() >= lidarWorkerQueueDepth_) {
-      lidarScanQueue_.pop_front();
+    if (pendingLidarScan_) {
+      replaced = std::move(pendingLidarScan_);
       lidarScansDropped_.fetch_add(1, std::memory_order_relaxed);
     }
-    lidarScanQueue_.push_back(std::move(msg));
-    pending = lidarScanQueue_.size();
+    pendingLidarScan_ = std::move(msg);
+    pending = 1;
   }
   lidarScanCv_.notify_one();
+  // Release a potentially large old PointCloud2 outside the worker mutex.
+  replaced.reset();
 
   const auto now = std::chrono::steady_clock::now();
   lidarCallbackMaxMs_ = std::max(lidarCallbackMaxMs_,
@@ -267,13 +261,12 @@ void Subscriber::lidarWorkerLoop() {
     sensor_msgs::msg::PointCloud2::ConstSharedPtr msg;
     {
       std::unique_lock<std::mutex> lock(lidarScanMutex_);
-      lidarScanCv_.wait(lock, [&] { return lidarWorkerStop_ || !lidarScanQueue_.empty(); });
-      if (lidarScanQueue_.empty()) {
+      lidarScanCv_.wait(lock, [&] { return lidarWorkerStop_ || bool(pendingLidarScan_); });
+      if (!pendingLidarScan_) {
         if (lidarWorkerStop_) break;
         continue;
       }
-      msg = std::move(lidarScanQueue_.front());
-      lidarScanQueue_.pop_front();
+      msg = std::move(pendingLidarScan_);
     }
 
     try {
@@ -338,7 +331,7 @@ void Subscriber::lidarWorkerLoop() {
         size_t pending = 0;
         {
           std::lock_guard<std::mutex> lock(lidarScanMutex_);
-          pending = lidarScanQueue_.size();
+          pending = pendingLidarScan_ ? 1 : 0;
         }
         LOG(INFO) << "LiDAR worker totals: scans "
                   << lidarScansProcessed_.load(std::memory_order_relaxed)

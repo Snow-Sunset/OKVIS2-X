@@ -21,9 +21,8 @@ okvis::SupereightFrames packet(uint64_t id, double anchorX) {
   frame.frameData_.emplace(id, okvis::SiFrameData(id));
   frame.frameData_.at(id).T_WS = anchor;
   const Eigen::Isometry3f lidarPose(anchor.T().cast<float>());
-  // 512 independent, non-collinear planar cells. Completing each cell releases
-  // its support samples; the fitted historical parameters still exceed the
-  // deliberately small cache after enough submaps have been completed.
+  // 512 independent, non-collinear planar cells. Each completed map must keep
+  // its fitted planes until the configured submap count is exceeded.
   for (int x = 0; x < 32; ++x) for (int y = 0; y < 16; ++y) {
     for (int sample = 0; sample < 8; ++sample) {
       frame.vecRayMeasurements.emplace_back(lidarPose, Eigen::Vector3f(
@@ -33,22 +32,20 @@ okvis::SupereightFrames packet(uint64_t id, double anchorX) {
   return frame;
 }
 
-void run(const std::filesystem::path& directory) {
+void run(const std::filesystem::path& directory, bool persistent = true) {
   okvis::ViParameters parameters{};
   parameters.lidar.emplace();
   parameters.lidar->T_SL = okvis::kinematics::Transformation::Identity();
   parameters.lidar->elevation_resolution_angle = 1.0f;
   parameters.lidar->azimuth_resolution_angle = 1.0f;
   se::SubMapConfig config;
-  config.memoryBounded = true;
   config.memoryArchiveDirectory = directory.string();
   config.lidarPlaneOnly = true;
   config.usePointToPlaneFactors = true;
   config.useMap2LiveFactors = true;
   config.useMap2MapFactors = false;
-  config.planeCacheMemoryMb = 1;
-  config.pointCloudMemoryMb = 2;
-  config.pointCloudPersistentChunks = true;
+  config.maxSubmaps = 2;
+  config.pointCloudPersistentChunks = persistent;
   config.planeActiveMaxCells = 512;
   config.planeWindowHalfExtent = 50.0;
   config.planeMapConfig.minPoints = 6;
@@ -91,11 +88,19 @@ void run(const std::filesystem::path& directory) {
   }
   check(announcements == numberOfMaps - 1 && oneMapBytes > 0,
         "Completed submap history announcements are incomplete");
-  check(oneMapBytes * (numberOfMaps - 1) > config.planeCacheMemoryMb * 1024 * 1024,
+  check(numberOfMaps - 1 > config.maxSubmaps,
         "Test history did not exceed the configured plane cache");
   check(firstReference.expired(), "The oldest plane map was not actually evicted from RAM");
-  check(mapping.planeResidentBytes() <= config.planeCacheMemoryMb * 1024 * 1024 + oneMapBytes,
-        "Plane history cache exceeded its budget plus the active submap");
+  check(mapping.planeResidentSubmapCount() <= config.maxSubmaps + 1,
+        "Plane history cache exceeded its submap limit plus the active submap");
+  if (!persistent) {
+    check(mapping.planeResidentSubmapCount() == config.maxSubmaps + 1,
+          "RAM plane cache did not retain the configured number of submaps");
+    mapping.setFinished();
+    check(mapping.memoryArchiveDirectory().empty() && !std::filesystem::exists(directory),
+          "RAM submap retention created historical files");
+    return;
+  }
   const auto session = std::filesystem::path(mapping.memoryArchiveDirectory());
   check(std::filesystem::exists(session / "planes" / (std::to_string(firstId) + ".planes")),
         "The evicted plane map has no persistent archive");
@@ -152,14 +157,11 @@ void runDelayedInput(const std::filesystem::path& directory) {
   parameters.lidar->elevation_resolution_angle = 1.0f;
   parameters.lidar->azimuth_resolution_angle = 1.0f;
   se::SubMapConfig config;
-  config.memoryBounded = true;
   config.memoryArchiveDirectory = (directory / "delayed").string();
   config.lidarSpoolEnabled = true;
   config.useMap2LiveFactors = true;
   config.useMap2MapFactors = false;
-  config.pointCloudMemoryMb = 2;
-  config.planeCacheMemoryMb = 1;
-  config.lidarQueueMaxPoints = 64;
+  config.maxSubmaps = 2;
   config.voxelGridResolution = 0.005f;
   config.pointCloudMapVoxelSize = 0.005;
   config.sensorMeasurementDownsampling = 1;
@@ -263,6 +265,35 @@ void runDelayedInput(const std::filesystem::path& directory) {
       "The unposed final ray was not preserved in the input archive");
 }
 
+void runStateQueueLimit(const std::filesystem::path& directory) {
+  // An old explicit false value must no longer disable queue protection.
+  const auto filename = directory / "legacy-se.yaml";
+  { std::ofstream output(filename);
+    output << "%YAML:1.0\ngeneral:\n  memory_bounded: false\n  state_queue_max_updates: 1\n";
+  }
+  const se::SubMapConfig config(filename.string());
+  okvis::ViParameters parameters{};
+  parameters.lidar.emplace();
+  parameters.lidar->T_SL = okvis::kinematics::Transformation::Identity();
+  parameters.lidar->elevation_resolution_angle = 1.0f;
+  parameters.lidar->azimuth_resolution_angle = 1.0f;
+  okvis::SupereightMapType::Config mapConfig;
+  okvis::SupereightMapType::DataConfigType dataConfig;
+  okvis::SubmappingInterface mapping(mapConfig, dataConfig, config, parameters);
+  okvis::State state{};
+  state.id = okvis::StateId(1);
+  state.T_WS = okvis::kinematics::Transformation::Identity();
+  auto states = std::make_shared<okvis::AlignedMap<okvis::StateId, okvis::State>>();
+  states->emplace(state.id, state);
+  okvis::TrackingState tracking{};
+  check(mapping.stateUpdateCallback(state, tracking, states), "First state update was rejected");
+  bool rejected = false;
+  try { mapping.stateUpdateCallback(state, tracking, states); }
+  catch (const std::runtime_error&) { rejected = true; }
+  check(rejected, "Full state queue silently replaced an update with legacy memory_bounded=false");
+  check(mapping.memoryArchiveDirectory().empty(), "Default queue policy enabled disk persistence");
+}
+
 void runExpiredInput(const std::filesystem::path& directory) {
   okvis::ViParameters parameters{};
   parameters.lidar.emplace();
@@ -270,12 +301,10 @@ void runExpiredInput(const std::filesystem::path& directory) {
   parameters.lidar->elevation_resolution_angle = 1.0f;
   parameters.lidar->azimuth_resolution_angle = 1.0f;
   se::SubMapConfig config;
-  config.memoryBounded = true;
   config.memoryArchiveDirectory = (directory / "expired").string();
   config.lidarSpoolEnabled = false;
   config.useMap2LiveFactors = true;
   config.useMap2MapFactors = false;
-  config.lidarQueueMaxPoints = 256;
   config.sensorMeasurementDownsampling = 1;
   config.voxelGridResolution = 0.01f;
   config.pointCloudMapVoxelSize = 0.01;
@@ -285,17 +314,22 @@ void runExpiredInput(const std::filesystem::path& directory) {
   okvis::SupereightMapType::DataConfigType dataConfig;
   okvis::SubmappingInterface mapping(mapConfig, dataConfig, config, parameters);
   mapping.setT_BS(okvis::kinematics::Transformation::Identity());
+  // Mandatory IMU pruning must also support clocks starting before t=5 s.
+  mapping.realtimePredict(okvis::Time(0, 0), Eigen::Vector3d(0, 0, 9.81),
+                          Eigen::Vector3d::Zero());
   // Populate and actually prune the rolling IMU window before pose updates are
-  // consumed. The interval beginning at state t=1 is now permanently expired.
+  // consumed. The interval beginning at relative state t=1 is now permanently expired.
+  // Keep the synthetic clock above the five-second IMU retention window.
+  constexpr uint32_t timeOffset = 10;
   for (uint32_t tick = 10; tick <= 110; ++tick) {
-    mapping.realtimePredict(okvis::Time(tick / 10, (tick % 10) * 100000000),
+    mapping.realtimePredict(okvis::Time(timeOffset + tick / 10, (tick % 10) * 100000000),
                             Eigen::Vector3d(0, 0, 9.81), Eigen::Vector3d::Zero());
   }
   const uint32_t times[] = {1, 2, 10, 11};
   for (uint64_t index = 0; index < 4; ++index) {
     okvis::State state{};
     state.id = okvis::StateId(index + 1);
-    state.timestamp = okvis::Time(times[index], 0);
+    state.timestamp = okvis::Time(timeOffset + times[index], 0);
     state.T_WS = okvis::kinematics::Transformation::Identity();
     state.T_GW = okvis::kinematics::Transformation::Identity();
     state.v_W.setZero();
@@ -316,17 +350,17 @@ void runExpiredInput(const std::filesystem::path& directory) {
   okvis::LidarMeasurementBatch input;
   for (size_t i = 0; i < 128; ++i) {
     okvis::LidarMeasurement measurement;
-    measurement.timeStamp = okvis::Time(1, 500000000);
+    measurement.timeStamp = okvis::Time(timeOffset + 1, 500000000);
     measurement.measurement.rayMeasurement = Eigen::Vector3d(8, 0, 2);
     measurement.measurement.intensity = 0;
     input.push_back(measurement);
   }
   okvis::LidarMeasurement current;
-  current.timeStamp = okvis::Time(10, 0); // exact estimated state needs no old IMU samples
+  current.timeStamp = okvis::Time(timeOffset + 10, 0); // exact estimated state needs no old IMU samples
   current.measurement.rayMeasurement = Eigen::Vector3d(1, 0, 2);
   current.measurement.intensity = 0;
   input.push_back(current);
-  current.timeStamp = okvis::Time(12, 0); // future input must remain unposed
+  current.timeStamp = okvis::Time(timeOffset + 12, 0); // future input must remain unposed
   current.measurement.rayMeasurement = Eigen::Vector3d(9, 0, 2);
   input.push_back(current);
   check(mapping.addLidarMeasurements(input), "Expired/current/future input batch was rejected");
@@ -340,7 +374,7 @@ void runExpiredInput(const std::filesystem::path& directory) {
   check(finished, "Expired IMU prefix blocked current LiDAR input or final shutdown");
   mapping.setFinished();
   const auto cloud = mapping.lidarPointCloudMap();
-  check(cloud.size() == 1 && (cloud.front() - Eigen::Vector3f(1, 0, 2)).norm() < 1e-5f,
+  check(cloud.size() == 1 && (cloud.front() - Eigen::Vector3d(1, 0, 2)).norm() < 1e-5,
         "Expired/future input was inserted, or the supported current point was lost");
 }
 } // namespace
@@ -351,7 +385,9 @@ int main() {
   try {
     std::filesystem::create_directory(directory);
     run(directory);
+    run(directory / "ram", false);
     runDelayedInput(directory);
+    runStateQueueLimit(directory);
     runExpiredInput(directory);
     std::filesystem::remove_all(directory);
     std::cout << "Plane cache eviction, cold revisit matching and final history flush checks passed\n";

@@ -27,7 +27,7 @@ void run(const std::filesystem::path& directory) {
   map.finalize();
   const auto filename = (directory / "plane.bin").string();
   map.save(filename);
-  const auto loaded = okvis::PlaneMap::load(filename, config, 1024 * 1024);
+  const auto loaded = okvis::PlaneMap::load(filename, config);
   check(loaded->numPlanes() == map.numPlanes() && loaded->finalized(), "Plane archive lost parameters");
   check((loaded->bounds().min() - map.bounds().min()).norm() == 0.0
       && (loaded->bounds().max() - map.bounds().max()).norm() == 0.0, "Plane archive changed bounds");
@@ -41,7 +41,7 @@ void run(const std::filesystem::path& directory) {
   check(rejected, "Completed archived planes were mutated");
   std::filesystem::resize_file(filename, 20);
   rejected = false;
-  try { okvis::PlaneMap::load(filename, config, 1024 * 1024); } catch (const std::exception&) { rejected = true; }
+  try { okvis::PlaneMap::load(filename, config); } catch (const std::exception&) { rejected = true; }
   check(rejected, "Truncated plane archive accepted");
   okvis::PlaneMap sliding(config);
   sliding.setWindow({0, 0, 0}, 1.0);

@@ -15,17 +15,20 @@
 #include <unistd.h>
 
 namespace okvis {
-/// Ordered LiDAR input FIFO. It can use a lossless append-only disk spool with
-/// a bounded read cache, or a bounded RAM-only queue that rejects overflow. In
+/// Ordered LiDAR input FIFO. RAM scan input keeps one consumer-owned active
+/// scan and one waiting scan; a new scan replaces only the waiting scan. An
+/// optional lossless append-only disk spool uses a bounded read cache. In
 /// spool mode all accepted rays remain on disk, including an unposed final
 /// tail. The spool is an internal session file, not a raw-scan export format.
 class LidarMeasurementBuffer {
  public:
   using Batch = LidarMeasurementBatch;
+  using Storage = std::deque<LidarMeasurement, Eigen::aligned_allocator<LidarMeasurement>>;
 
   struct PushResult {
     size_t stored = 0;
     size_t dropped = 0;
+    size_t droppedScans = 0;
     bool stopped = false;
   };
   struct Statistics {
@@ -34,29 +37,31 @@ class LidarMeasurementBuffer {
     uint64_t stored = 0;
     uint64_t dropped = 0;
     uint64_t consumed = 0;
+    uint64_t droppedScans = 0;
+    size_t pendingScans = 0;
     bool hasFront = false;
     Time oldest;
     Time newest;
   };
 
-  void configure(const std::string& filename, size_t maxPoints) {
+  void configure(const std::string& filename, size_t maxPoints = 32768) {
     std::lock_guard<std::mutex> lock(mutex_);
     if (filename.empty() || !maxPoints || !memory_.empty() || diskWritten_ || memoryOnly_)
       throw std::invalid_argument("Invalid LiDAR spool configuration");
     filename_ = filename;
     maxPoints_ = maxPoints;
   }
-  /// Configure a bounded RAM-only FIFO; no raw input file is created.
-  void configureMemory(size_t maxPoints) {
+  /// Configure latest-scan RAM input; capacity is in scans, never in points.
+  void configureMemory() {
     std::lock_guard<std::mutex> lock(mutex_);
-    if (!maxPoints || !memory_.empty() || diskWritten_ || !filename_.empty() || memoryOnly_)
+    if (!memory_.empty() || diskWritten_ || !filename_.empty() || memoryOnly_)
       throw std::invalid_argument("Invalid RAM-only LiDAR buffer configuration");
-    maxPoints_ = maxPoints;
     memoryOnly_ = true;
   }
+  /// Legacy pointwise dataset input has no scan boundary. Preserve that stream
+  /// losslessly; online callers must use PushBatch with a complete scan.
   bool PushBlockingIfFull(const LidarMeasurement& value, size_t) {
     std::unique_lock<std::mutex> lock(mutex_);
-    cv_.wait(lock, [&] { return stopped_ || !memoryOnly_ || memory_.size() < maxPoints_; });
     if (stopped_) return false;
     return pushLocked(value);
   }
@@ -65,37 +70,48 @@ class LidarMeasurementBuffer {
     PushNonBlockingDroppingNewestIfFull(value, &dropped);
     return dropped;
   }
-  /// Push without blocking the sensor callback. RAM-only mode drops the
-  /// incoming ray at capacity without modifying a prefix copied by the mapping
-  /// consumer; spool mode remains lossless and appends to disk. Returns true
-  /// only when the measurement was stored.
+  /// Legacy lossless pointwise input; no point-count capacity is applied.
   bool PushNonBlockingDroppingNewestIfFull(
       const LidarMeasurement& value, bool* droppedNewest = nullptr) {
     std::lock_guard<std::mutex> lock(mutex_);
     if (droppedNewest) *droppedNewest = false;
     if (stopped_) return false;
-    if (memoryOnly_ && memory_.size() >= maxPoints_) {
-      if (droppedNewest) *droppedNewest = true;
-      ++droppedPoints_;
-      return false;
-    }
     return pushLocked(value);
   }
-  /// Store an entire input batch with one lock acquisition. RAM overflow drops
-  /// incoming points only; a prefix copied by the sole consumer stays valid.
-  /// Spool mode appends every point and bounds only the resident read cache.
+  /// Store one complete scan. Only the consumer promotes pending_ to memory_,
+  /// so producer replacement cannot invalidate CopyUpTo/PopCount's prefix.
+  /// Explicit spool mode and legacy unconfigured input remain lossless.
   PushResult PushBatch(const Batch& values) {
-    std::lock_guard<std::mutex> lock(mutex_);
+    std::unique_lock<std::mutex> lock(mutex_);
     PushResult result;
     if (stopped_) {
       result.stopped = true;
       return result;
     }
-    const size_t acceptedLimit = memoryOnly_
-        ? std::min(values.size(), maxPoints_ - memory_.size()) : values.size();
-    result.dropped = values.size() - acceptedLimit;
-    droppedPoints_ += result.dropped;
-    for (size_t i = 0; i < acceptedLimit; ++i) {
+    if (values.empty()) return result;
+    if (memoryOnly_) {
+      // Build outside the lock: the camera consumer never waits for a whole
+      // scan allocation/copy. Configuration is immutable once RAM mode is set.
+      lock.unlock();
+      Storage replacement(values.begin(), values.end());
+      lock.lock();
+      if (stopped_) {
+        result.stopped = true;
+        return result;
+      }
+      result.dropped = pending_.size();
+      result.droppedScans = pending_.empty() ? 0 : 1;
+      pending_.swap(replacement);
+      result.stored = values.size();
+      storedPoints_ += result.stored;
+      droppedPoints_ += result.dropped;
+      droppedScans_ += result.droppedScans;
+      newestAcceptedTimestamp_ = values.back().timeStamp;
+      lock.unlock(); // Destroy the replaced scan outside the consumer mutex.
+      cv_.notify_one();
+      return result;
+    }
+    for (size_t i = 0; i < values.size(); ++i) {
       if (pushLocked(values[i], false)) ++result.stored;
     }
     if (result.stored) cv_.notify_one();
@@ -120,7 +136,7 @@ class LidarMeasurementBuffer {
     values->clear();
     if (!maxCount) return 0;
     std::lock_guard<std::mutex> lock(mutex_);
-    const size_t available = memory_.size() + size_t(diskWritten_ - diskRead_);
+    const size_t available = memory_.size() + pending_.size() + size_t(diskWritten_ - diskRead_);
     values->reserve(std::min<size_t>(std::min(maxCount, available), 32768));
     while (values->size() < maxCount) {
       fill();
@@ -131,6 +147,23 @@ class LidarMeasurementBuffer {
     consumedPoints_ += values->size();
     cv_.notify_all();
     return values->size();
+  }
+  /// Consume a timestamp prefix into the live-factor history (or discard it).
+  /// The active scan's unconsumed tail remains pinned between camera frames.
+  template <typename Predicate, typename Output>
+  size_t PopWhile(Predicate predicate, Output* values) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    size_t count = 0;
+    while (true) {
+      fill();
+      if (memory_.empty() || !predicate(memory_.front())) break;
+      if (values) values->push_back(std::move(memory_.front()));
+      memory_.pop_front();
+      ++count;
+    }
+    consumedPoints_ += count;
+    cv_.notify_all();
+    return count;
   }
   /// Copy an ordered batch without consuming it. This is used when pose lookup
   /// may fail: the caller can leave the unsupported prefix in the FIFO and
@@ -168,29 +201,32 @@ class LidarMeasurementBuffer {
   }
   bool PopBlocking(LidarMeasurement* value) {
     std::unique_lock<std::mutex> lock(mutex_);
-    cv_.wait(lock, [&] { return stopped_ || !memory_.empty() || diskRead_ < diskWritten_; });
-    if (stopped_) return false;
+    cv_.wait(lock, [&] { return stopped_ || !memory_.empty() || !pending_.empty()
+                                || diskRead_ < diskWritten_; });
     return pop(value);
   }
   size_t Size() const {
     std::lock_guard<std::mutex> lock(mutex_);
-    return memory_.size() + size_t(diskWritten_ - diskRead_);
+    return memory_.size() + pending_.size() + size_t(diskWritten_ - diskRead_);
   }
   bool Empty() const { return Size() == 0; }
   size_t residentPoints() const {
     std::lock_guard<std::mutex> lock(mutex_);
-    return memory_.size();
+    return memory_.size() + pending_.size();
   }
   Statistics statistics() const {
     std::lock_guard<std::mutex> lock(mutex_);
     Statistics result;
-    result.queued = memory_.size() + size_t(diskWritten_ - diskRead_);
-    result.resident = memory_.size();
+    result.queued = memory_.size() + pending_.size() + size_t(diskWritten_ - diskRead_);
+    result.resident = memory_.size() + pending_.size();
     result.stored = storedPoints_;
     result.dropped = droppedPoints_;
     result.consumed = consumedPoints_;
-    result.hasFront = !memory_.empty();
-    if (result.hasFront) result.oldest = memory_.front().timeStamp;
+    result.droppedScans = droppedScans_;
+    result.pendingScans = pending_.empty() ? 0 : 1;
+    result.hasFront = !memory_.empty() || !pending_.empty();
+    if (!memory_.empty()) result.oldest = memory_.front().timeStamp;
+    else if (!pending_.empty()) result.oldest = pending_.front().timeStamp;
     result.newest = newestAcceptedTimestamp_;
     return result;
   }
@@ -229,7 +265,6 @@ class LidarMeasurementBuffer {
   }
   bool pushLocked(const LidarMeasurement& value, bool notify = true) {
     if (memoryOnly_ || filename_.empty()) {
-      if (memoryOnly_ && memory_.size() >= maxPoints_) return false;
       memory_.push_back(value);
     } else {
       if (!writer_.is_open()) {
@@ -256,6 +291,12 @@ class LidarMeasurementBuffer {
     return true;
   }
   void fill() {
+    if (memoryOnly_) {
+      if (memory_.empty() && !pending_.empty()) {
+        memory_.swap(pending_); // O(1): promotion does not copy a point cloud.
+      }
+      return;
+    }
     if (diskRead_ == diskWritten_ || memory_.size() >= maxPoints_) return;
     // Refill in useful chunks instead of issuing a seek/read for every point
     // after a producer burst. Existing hot points remain at the FIFO front.
@@ -295,11 +336,13 @@ class LidarMeasurementBuffer {
   }
   mutable std::mutex mutex_;
   std::condition_variable cv_;
-  std::deque<LidarMeasurement, Eigen::aligned_allocator<LidarMeasurement>> memory_;
+  Storage memory_;
+  Storage pending_; ///< Replaceable waiting scan; memory_ is consumer-owned.
   std::string filename_;
-  size_t maxPoints_ = 200000;
+  size_t maxPoints_ = 32768; ///< Internal disk read-cache size only.
   uint64_t diskRead_ = 0, diskWritten_ = 0;
   uint64_t storedPoints_ = 0, droppedPoints_ = 0, consumedPoints_ = 0;
+  uint64_t droppedScans_ = 0;
   Time newestAcceptedTimestamp_;
   std::ofstream writer_;
   std::ifstream reader_;

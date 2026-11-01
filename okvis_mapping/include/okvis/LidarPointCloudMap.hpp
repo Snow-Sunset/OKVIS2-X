@@ -23,10 +23,8 @@ class LidarPointCloudMap {
   using Points = std::vector<Eigen::Vector3d, Eigen::aligned_allocator<Eigen::Vector3d>>;
   struct ArchiveOptions {
     std::string directory;
-    size_t memoryBudgetBytes = 96 * 1024 * 1024;
-    // About 3 MiB of float XYZ payload. Larger sequential chunks substantially
-    // reduce file/manifest fsync frequency while remaining below the default
-    // 96 MiB resident point-cloud budget.
+    size_t maxResidentSubmaps = 32;
+    // Sequential disk write size, independent of RAM submap retention.
     size_t chunkPointLimit = 262144;
   };
   struct ArchiveChunk {
@@ -41,8 +39,9 @@ class LidarPointCloudMap {
   };
   using Snapshot = std::vector<SubmapSnapshot, Eigen::aligned_allocator<SubmapSnapshot>>;
   explicit LidarPointCloudMap(double voxelSize);
-  /// RAM-only map with a resident payload budget. No archive directory is created.
-  LidarPointCloudMap(double voxelSize, size_t memoryBudgetBytes);
+  /// RAM-only map retaining up to maxResidentSubmaps populated submaps,
+  /// including the active one. Entire old submaps are removed; no byte cap.
+  LidarPointCloudMap(double voxelSize, size_t maxResidentSubmaps);
   /// The configured directory contains a unique, persistent session directory.
   /// Successful immutable chunk writes precede releasing resident point data.
   LidarPointCloudMap(double voxelSize, const ArchiveOptions& archive);
@@ -70,6 +69,7 @@ class LidarPointCloudMap {
   void finalizeSubmap(uint64_t id);
   void flush();
   size_t residentBytes() const;
+  size_t residentSubmapCount() const;
   uint64_t archivedPointCount() const;
   const std::string& archiveDirectory() const { return archiveDirectory_; }
   /// Assemble outside the owner's lock. maxPoints limits sampled input work;
@@ -100,6 +100,7 @@ class LidarPointCloudMap {
     Eigen::Isometry3d pose = Eigen::Isometry3d::Identity();
     bool estimatorPose = false;
     uint64_t estimatorSequence = 0;
+    uint64_t lastPointUpdate = 0;
     mutable std::shared_ptr<const Points> cachedPoints;
     Voxels voxels;
     std::vector<std::shared_ptr<const ArchiveChunk>> chunks;
@@ -115,13 +116,13 @@ class LidarPointCloudMap {
   void archiveSubmap(uint64_t id, Submap& submap);
   void writeSubmapManifest(uint64_t id, const Submap& submap) const;
   void writeManifest() const;
-  void enforceBudget(uint64_t activeId);
-  void enforceResidentBudget(uint64_t activeId);
+  void enforceSubmapLimit(uint64_t activeId);
   double voxelSize_;
   uint64_t revision_ = 0;
   std::map<uint64_t, Submap> submaps_;
   std::string archiveDirectory_;
-  size_t memoryBudgetBytes_ = 0;
+  size_t maxResidentSubmaps_ = 0; ///< zero only for the unbounded constructor
+  uint64_t pointUpdateClock_ = 0;
   size_t chunkPointLimit_ = 0;
   uint64_t nextChunk_ = 0;
   bool localWindowEnabled_ = false;

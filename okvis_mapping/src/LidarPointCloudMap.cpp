@@ -207,22 +207,21 @@ LidarPointCloudMap::LidarPointCloudMap(double voxelSize) : voxelSize_(voxelSize)
   }
 }
 
-LidarPointCloudMap::LidarPointCloudMap(double voxelSize, size_t memoryBudgetBytes)
+LidarPointCloudMap::LidarPointCloudMap(double voxelSize, size_t maxResidentSubmaps)
     : LidarPointCloudMap(voxelSize) {
-  if (memoryBudgetBytes < 4096) {
-    throw std::invalid_argument("RAM-only LiDAR map requires >=4096 resident bytes");
+  if (!maxResidentSubmaps) {
+    throw std::invalid_argument("RAM-only LiDAR map requires a positive submap limit");
   }
-  memoryBudgetBytes_ = memoryBudgetBytes;
+  maxResidentSubmaps_ = maxResidentSubmaps;
 }
 
 LidarPointCloudMap::LidarPointCloudMap(double voxelSize, const ArchiveOptions& archive)
     : LidarPointCloudMap(voxelSize) {
-  if (archive.directory.empty() || archive.memoryBudgetBytes < 4096 || archive.chunkPointLimit == 0) {
-    throw std::invalid_argument("LiDAR archive requires a directory, >=4096 resident bytes and positive chunk size");
+  if (archive.directory.empty() || !archive.maxResidentSubmaps || archive.chunkPointLimit == 0) {
+    throw std::invalid_argument("LiDAR archive requires a directory, positive submap limit and chunk size");
   }
-  memoryBudgetBytes_ = archive.memoryBudgetBytes;
-  // Includes unordered-map nodes, buckets and the immutable snapshot copy.
-  chunkPointLimit_ = std::min(archive.chunkPointLimit, std::max(size_t(1), memoryBudgetBytes_ / 256));
+  maxResidentSubmaps_ = archive.maxResidentSubmaps;
+  chunkPointLimit_ = archive.chunkPointLimit;
   fs::create_directories(archive.directory);
   archiveDirectory_ = (fs::path(archive.directory) / uniqueName("lidar-cloud-")).string();
   if (!fs::create_directory(archiveDirectory_)) ioError("Cannot create LiDAR archive", archiveDirectory_);
@@ -462,6 +461,7 @@ void LidarPointCloudMap::addPoints(uint64_t id, const Eigen::Isometry3d& initial
   }
   updatePose(id, initialPose);
   auto& submap = submaps_.at(id);
+  if (!points.empty()) submap.lastPointUpdate = ++pointUpdateClock_;
   addPreviewPoints(id, submap, points);
   bool changed = false;
   try {
@@ -483,7 +483,7 @@ void LidarPointCloudMap::addPoints(uint64_t id, const Eigen::Isometry3d& initial
     submap.cachedPoints.reset();
     ++revision_;
   }
-  enforceBudget(id);
+  enforceSubmapLimit(id);
   if (localWindowEnabled_ && archiveDirectory_.empty()) {
     const auto empty = submaps_.find(id);
     if (empty != submaps_.end() && empty->second.voxels.empty() && empty->second.chunks.empty()) {
@@ -575,59 +575,31 @@ void LidarPointCloudMap::archiveSubmap(uint64_t id, Submap& submap) {
   Voxels().swap(submap.voxels);
 }
 
-void LidarPointCloudMap::enforceBudget(uint64_t activeId) {
-  if (archiveDirectory_.empty()) {
-    enforceResidentBudget(activeId);
-    return;
-  }
-  if (residentBytes() <= memoryBudgetBytes_) return;
-  for (auto& entry : submaps_) {
-    if (entry.first == activeId || entry.second.voxels.empty()) continue;
-    archiveSubmap(entry.first, entry.second);
-    if (residentBytes() <= memoryBudgetBytes_) return;
-  }
-  const auto active = submaps_.find(activeId);
-  if (active != submaps_.end()) archiveSubmap(activeId, active->second);
+size_t LidarPointCloudMap::residentSubmapCount() const {
+  return std::count_if(submaps_.begin(), submaps_.end(), [](const auto& entry) {
+    return !entry.second.voxels.empty();
+  });
 }
 
-void LidarPointCloudMap::enforceResidentBudget(uint64_t activeId) {
-  if (!memoryBudgetBytes_) return;
-  // A cached immutable copy is only a convenience for snapshots. Release it
-  // before trimming so the resident budget reflects the actual map payload.
-  for (auto& entry : submaps_) entry.second.cachedPoints.reset();
-  for (auto& entry : previewSubmaps_) entry.second.cachedPoints.reset();
-  if (residentBytes() <= memoryBudgetBytes_) return;
-
-  // Prefer dropping complete old submaps. This keeps the active local map
-  // useful and avoids repeatedly rehashing a large unordered_map.
-  for (auto& entry : submaps_) {
-    if (entry.first == activeId || entry.second.voxels.empty()) continue;
-    Voxels().swap(entry.second.voxels);
-    entry.second.cachedPoints.reset();
-    if (residentBytes() <= memoryBudgetBytes_) return;
-  }
-
-  auto active = submaps_.find(activeId);
-  if (active == submaps_.end() || active->second.voxels.empty()) return;
-  // Include an estimate for the hash bucket/pointer overhead as well as the
-  // node and cached XYZ payload. The final check below handles allocator
-  // rounding for very small budgets.
-  constexpr size_t estimatedVoxelBytes = 128 + sizeof(Eigen::Vector3d) + sizeof(void*);
-  const size_t target = std::max<size_t>(1, memoryBudgetBytes_ / estimatedVoxelBytes);
-  if (active->second.voxels.size() > target) {
-    size_t remove = active->second.voxels.size() - target;
-    auto voxel = active->second.voxels.begin();
-    while (remove-- && voxel != active->second.voxels.end())
-      voxel = active->second.voxels.erase(voxel);
-    active->second.cachedPoints.reset();
-  }
-  while (residentBytes() > memoryBudgetBytes_ && !active->second.voxels.empty()) {
-    active->second.voxels.erase(active->second.voxels.begin());
-  }
-  if (active->second.voxels.empty()) {
-    Voxels().swap(active->second.voxels);
-  } else if (active->second.voxels.bucket_count() > 2 * active->second.voxels.size()) {
-    active->second.voxels.rehash(0);
+void LidarPointCloudMap::enforceSubmapLimit(uint64_t activeId) {
+  if (!maxResidentSubmaps_) return;
+  size_t count = residentSubmapCount();
+  while (count > maxResidentSubmaps_) {
+    auto victim = submaps_.end();
+    for (auto it = submaps_.begin(); it != submaps_.end(); ++it) {
+      if (it->first == activeId || it->second.voxels.empty()) continue;
+      if (victim == submaps_.end()
+          || it->second.lastPointUpdate < victim->second.lastPointUpdate) victim = it;
+    }
+    if (victim == submaps_.end()) break;
+    if (archiveDirectory_.empty()) {
+      submaps_.erase(victim);
+    } else {
+      // Persist successfully before releasing the only resident copy.
+      archiveSubmap(victim->first, victim->second);
+    }
+    --count;
+    ++revision_;
   }
 }
 

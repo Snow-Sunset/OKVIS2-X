@@ -28,6 +28,7 @@
 
 #include <okvis/cameras/NCameraSystem.hpp>
 #include <okvis/Measurements.hpp>
+#include <okvis/LidarMeasurementBuffer.hpp>
 #include <okvis/Frontend.hpp>
 #include <okvis/MultiFrame.hpp>
 #include <okvis/Parameters.hpp>
@@ -110,10 +111,11 @@ class ThreadedSlam : public ViInterface {
    * \brief          Add a LiDAR measurement.
    * \param stamp    The measurement timestamp.
    * \param rayMeasurement The ray measurement (cartesian coordinates).
-   * \return Returns true normally. False if the previous one has not been processed yet.
+   * \return True if stored in the legacy pointwise stream; false if stopped or disabled.
    */
   virtual bool addLidarMeasurement(const okvis::Time & stamp,
                                    const Eigen::Vector3d & rayMeasurement) override final;
+  /// Submit a complete scan, replacing only the old waiting scan, never its active tail.
   bool addLidarMeasurements(const LidarMeasurementBatch& measurements) override final;
 
   /**
@@ -284,9 +286,8 @@ private:
   threadsafe::Queue<okvis::ImuMeasurement, Eigen::aligned_allocator<okvis::ImuMeasurement>>
       imuMeasurementsReceived_;
 
-  /// Lidar measurement input queue.
-  threadsafe::Queue<okvis::LidarMeasurement , Eigen::aligned_allocator<okvis::LidarMeasurement>>
-      lidarMeasurementsReceived_;
+  /// One active LiDAR scan plus one replaceable waiting scan.
+  LidarMeasurementBuffer lidarMeasurementsReceived_;
 
   /// Depth-sigma measurement input queue.
   threadsafe::Queue<okvis::CameraMeasurement, Eigen::aligned_allocator<okvis::CameraMeasurement>>

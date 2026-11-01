@@ -84,20 +84,19 @@ struct SubMapConfig{
     bool buildLidarPointCloudMap = true;
     double pointCloudMapVoxelSize = 0.1;       ///< metres, independent of plane voxels
     double pointCloudMapPublishInterval = 1.0; ///< wall-clock seconds; zero disables throttling
-    // Persistent history on disk, bounded local/cache payloads in RAM.
-    bool memoryBounded = true;
+    // Optional persistent history, with RAM retention controlled by submap count.
     std::string memoryArchiveDirectory = "./okvis-history"; ///< used only for explicitly enabled LiDAR spool/chunks
-    size_t pointCloudMemoryMb = 96;
-    size_t planeCacheMemoryMb = 32;
+    /// Shared retention target: cloud includes the active map; plane cache
+    /// counts completed maps and protects active/reference maps.
+    size_t maxSubmaps = 32;
     size_t planeActiveMaxCells = 8192;
     double planeWindowHalfExtent = 50.0; ///< metres in the current submap frame
-    size_t lidarQueueMaxPoints = 200000;
     /// Maximum spatial candidate budget for live point-to-plane association.
     /// Matching starts with a smaller pool and expands if weak; zero is unlimited.
     size_t lidarMaxPlaneCandidates = 8192;
-    /// Persist every accepted raw LiDAR ray for delayed/restart recovery.
-    /// Disabled by default: the bounded in-memory FIFO drops incoming rays on
-    /// overflow so camera and IMU callbacks remain live.
+    /// Persist every accepted raw LiDAR ray for delayed processing/export.
+    /// Disabled by default: RAM scan input retains one active scan and one
+    /// latest waiting scan, replacing the old waiting scan on overload.
     bool lidarSpoolEnabled = false;
     /// Persist completed voxel chunks for a full historical map. The realtime
     /// default keeps only the local RAM voxel map and evicts old cells.
@@ -188,13 +187,10 @@ struct SubMapConfig{
       se::yaml::subnode_as_bool(node, "use_point_to_plane_factors", usePointToPlaneFactors);
       se::yaml::subnode_as_bool(node, "lidar_plane_only", lidarPlaneOnly);
       se::yaml::subnode_as_bool(node, "build_lidar_pointcloud_map", buildLidarPointCloudMap);
-      se::yaml::subnode_as_bool(node, "memory_bounded", memoryBounded);
       se::yaml::subnode_as_string(node, "memory_archive_directory", memoryArchiveDirectory);
-      se::yaml::subnode_as_size_t(node, "pointcloud_memory_mb", pointCloudMemoryMb);
-      se::yaml::subnode_as_size_t(node, "plane_cache_memory_mb", planeCacheMemoryMb);
+      se::yaml::subnode_as_size_t(node, "max_submaps", maxSubmaps);
       se::yaml::subnode_as_size_t(node, "plane_active_max_cells", planeActiveMaxCells);
       if (!node["plane_window_half_extent"].empty()) node["plane_window_half_extent"] >> planeWindowHalfExtent;
-      se::yaml::subnode_as_size_t(node, "lidar_queue_max_points", lidarQueueMaxPoints);
       se::yaml::subnode_as_size_t(node, "lidar_max_plane_candidates", lidarMaxPlaneCandidates);
       se::yaml::subnode_as_bool(node, "lidar_spool_enabled", lidarSpoolEnabled);
       se::yaml::subnode_as_bool(node, "pointcloud_persistent_chunks", pointCloudPersistentChunks);
@@ -234,13 +230,10 @@ struct SubMapConfig{
       os << str_utils::bool_to_pretty_str(c.usePointToPlaneFactors, "use_point_to_plane_factors") << " \n";
       os << str_utils::bool_to_pretty_str(c.lidarPlaneOnly, "lidar_plane_only") << " \n";
       os << str_utils::bool_to_pretty_str(c.buildLidarPointCloudMap, "build_lidar_pointcloud_map") << " \n";
-      os << str_utils::bool_to_pretty_str(c.memoryBounded, "memory_bounded") << " \n";
       os << str_utils::value_to_pretty_str(c.memoryArchiveDirectory, "memory_archive_directory") << " \n";
-      os << str_utils::value_to_pretty_str(c.pointCloudMemoryMb, "pointcloud_memory_mb") << " \n";
-      os << str_utils::value_to_pretty_str(c.planeCacheMemoryMb, "plane_cache_memory_mb") << " \n";
+      os << str_utils::value_to_pretty_str(c.maxSubmaps, "max_submaps") << " \n";
       os << str_utils::value_to_pretty_str(c.planeActiveMaxCells, "plane_active_max_cells") << " \n";
       os << str_utils::value_to_pretty_str(c.planeWindowHalfExtent, "plane_window_half_extent") << " \n";
-      os << str_utils::value_to_pretty_str(c.lidarQueueMaxPoints, "lidar_queue_max_points") << " \n";
       os << str_utils::value_to_pretty_str(c.lidarMaxPlaneCandidates, "lidar_max_plane_candidates") << " \n";
       os << str_utils::bool_to_pretty_str(c.lidarSpoolEnabled, "lidar_spool_enabled") << " \n";
       os << str_utils::bool_to_pretty_str(c.pointCloudPersistentChunks, "pointcloud_persistent_chunks") << " \n";

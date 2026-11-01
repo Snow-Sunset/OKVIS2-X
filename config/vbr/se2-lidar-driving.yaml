@@ -26,15 +26,12 @@ general:
   lidar_plane_only: true
   build_lidar_pointcloud_map: true
   # Bound local registration and the sliding RAM point-cloud map.
-  memory_bounded: true
-  pointcloud_memory_mb: 96 # MiB; current local RAM point-cloud map budget
-  plane_cache_memory_mb: 32
-  plane_active_max_cells: 8192
-  plane_window_half_extent: 50.0 # m; local sliding plane window
-  lidar_queue_max_points: 200000 # bounded RAM FIFO cap
-  lidar_spool_enabled: false # keep raw rays in bounded RAM only; enable for durable input recovery
+  max_submaps: 32 # 点云和平面缓存共用的子地图保留目标
+  plane_active_max_cells: 50000 # 每张活动平面图最多容纳多少个体素单元
+  plane_window_half_extent: 50.0 # 活动平面图保留多远的空间范围
+  lidar_spool_enabled: false # RAM: one active scan + one latest waiting scan; true: lossless mapping spool
   pointcloud_persistent_chunks: false # local RAM map; no historical point-cloud files
-  pointcloud_window_half_extent: 50.0 # m; world-frame sliding point-cloud window half extent
+  pointcloud_window_half_extent: 50.0 # m; 点云地图在世界坐标系中，保留当前位置各轴约 ±50 m 的局部窗口
   mapping_queue_max_frames: 4
   state_queue_max_updates: 32
   pointcloud_map_voxel_size: 0.1        # m; accumulated XYZ map sampling
