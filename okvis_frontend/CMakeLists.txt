@@ -2,6 +2,7 @@ cmake_minimum_required(VERSION 3.8...3.30)
 
 find_package(Eigen3 REQUIRED)
 find_package(Glog REQUIRED)
+find_package(Threads REQUIRED)
 if(USE_SYSTEM_BRISK)
   find_package(brisk REQUIRED)
 endif()
@@ -29,6 +30,7 @@ add_library(${LIB_NAME}
   src/FrameNoncentralAbsoluteAdapter.cpp
   src/FrameRelativeAdapter.cpp
   src/Frontend.cpp
+  src/FrontendPlaceRecognition.cpp
   src/LoopclosureNoncentralAbsoluteAdapter.cpp
   src/stereo_triangulation.cpp
 )
@@ -54,6 +56,7 @@ target_link_libraries(${LIB_NAME}
     ${DBoW2_LIBRARIES}
   PRIVATE
     ${GLOG_LIBRARIES}
+    Threads::Threads
     ${OPENGV_LIBRARIES}
     ${OpenCV_LIBS}
     ${TORCH_LIBRARIES}
@@ -92,3 +95,12 @@ install(TARGETS ${LIB_NAME} EXPORT okvisTargets
   LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
 )
 install(DIRECTORY include/okvis DESTINATION ${CMAKE_INSTALL_INCLUDEDIR} FILES_MATCHING PATTERN "*.hpp")
+
+if(BUILD_TESTS OR BUILD_POINT_TO_PLANE_TESTS)
+  add_executable(okvis_async_place_recognition_test test/TestAsyncPlaceRecognition.cpp)
+  target_link_libraries(okvis_async_place_recognition_test PRIVATE okvis::Frontend Threads::Threads)
+  target_include_directories(okvis_async_place_recognition_test PRIVATE ${DBoW2_INCLUDE_DIRS})
+  add_test(NAME okvis_async_place_recognition COMMAND okvis_async_place_recognition_test
+    "${CMAKE_CURRENT_SOURCE_DIR}/../resources")
+  set_tests_properties(okvis_async_place_recognition PROPERTIES TIMEOUT 30)
+endif()

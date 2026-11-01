@@ -240,7 +240,48 @@ class Frontend : public ViFrontendInterface {
   /// \brief Clears and resets everything (so you can re-start).
   void clear();
 
+  /// Apply optional background place-recognition proposals at an estimator safe point.
+  /// The caller must have joined the local optimiser. Never called by the worker.
+  bool processPendingLoopClosures(Estimator& estimator, const ViParameters& params);
+  /// Finish accepted keyframe queries before normal estimator shutdown.
+  void finishPlaceRecognition();
+  struct PlaceRecognitionStatistics {
+    uint64_t submitted = 0, processed = 0, skipped = 0, verified = 0;
+    size_t pending = 0;
+    bool active = false;
+    double queryMaxMs = 0.0, verificationMaxMs = 0.0;
+  };
+  PlaceRecognitionStatistics placeRecognitionStatistics() const;
+
 private:
+  friend struct FrontendPlaceRecognitionTest;
+  struct VerifiedPlace {
+    EIGEN_MAKE_ALIGNED_OPERATOR_NEW
+    StateId queryId, candidateId;
+    int component = -1;
+    double score = 0.0;
+    kinematics::Transformation relativePose;
+    Eigen::Matrix<double, 6, 6> information;
+  };
+  class PlaceRecognition;
+  std::shared_ptr<PlaceRecognition> placeRecognition_;
+  std::set<StateId> pendingPlaceRecognitionFrames_;
+  static MultiFramePtr snapshotPlaceRecognitionFrame(const MultiFrame& source, bool landmarks,
+      bool filterClassification = false);
+  bool enqueuePlaceRecognition(const ViParameters& params, MultiFramePtr query,
+      std::vector<MultiFramePtr> historicalFrames);
+  void submitPlaceRecognitionKeyframe(Estimator& estimator, const ViParameters& params,
+      const MultiFramePtr& frame);
+  AlignedVector<VerifiedPlace> takePlaceRecognitionResults();
+  void stopPlaceRecognition(bool drain);
+  void excludePlaceRecognitionFrame(StateId id);
+  bool applyPlaceRecognitionResults(Estimator& estimator, const ViParameters& params,
+      const MultiFramePtr& currentFrame, bool kfPrior, bool* asKeyframe);
+  bool verifyPlaceRecognitionSnapshot(const ViParameters& params,
+      const std::shared_ptr<const MultiFrame>& query, const std::shared_ptr<const MultiFrame>& reference,
+      const AlignedVector<kinematics::Transformation>& extrinsics, double matchingThreshold,
+      kinematics::Transformation& relativePose, Eigen::Matrix<double, 6, 6>& information,
+      int minInliers, bool recordTiming = true);
 
   /**
    * @brief   feature detectors with the current settings.

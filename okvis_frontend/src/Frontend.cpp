@@ -18,6 +18,7 @@
  */
 
 #include "okvis/assert_macros.hpp"
+#include "PlaceRecognitionDb.hpp"
 #include <opencv2/imgcodecs.hpp>
 #include <pthread.h>
 #include <sched.h>
@@ -87,33 +88,6 @@ namespace okvis {
 static const double kptrad = 0.09;
 //cv::Ptr<cv::CLAHE> mClahe;
 
-/// \brief Opaque stuct to use DBoW for loop closure.
-class Frontend::DBoW {
- public:
-  /// \brief Constructor with Vocabulary directory.
-  /// \param dBowVocDir Vocabulary directory.
-  DBoW(const std::string& dBowVocDir)
-      : vocabulary(dBowVocDir+"/small_voc.yml.gz"),
-        // false = do not use direct index.
-        database(vocabulary, false, 0)
-  {
-  }
-  /// \brief Constructor with Vocabulary.
-  /// \param dBowVoc Vocabulary.
-  DBoW(const DBoW2::TemplatedVocabulary<DBoW2::FBrisk::TDescriptor, DBoW2::FBrisk>& dBowVoc)
-      : vocabulary(dBowVoc),
-      // false = do not use direct index.
-      database(vocabulary, false, 0)
-  {
-  }
-
-  DBoW2::TemplatedVocabulary<DBoW2::FBrisk::TDescriptor, DBoW2::FBrisk> vocabulary; ///< BRISK Voc.
-  DBoW2::TemplatedDatabase<DBoW2::FBrisk::TDescriptor, DBoW2::FBrisk> database; ///< BRISK Database.
-  std::vector<uint64> poseIds; ///< The multiframe IDs corresponding to the dBow ones.
-
-  EIGEN_MAKE_ALIGNED_OPERATOR_NEW
-};
-
 // Constructor.
 Frontend::Frontend(size_t numCameras, std::string dBowVocDir)
     : isInitialized_(false),
@@ -157,6 +131,7 @@ Frontend::Frontend(size_t numCameras, std::string dBowVocDir)
 }
 
 Frontend::~Frontend() {
+  stopPlaceRecognition(false);
   endCnnThreads();
 }
 
@@ -165,6 +140,7 @@ bool Frontend::loadComponent(std::string filename,
                              const cameras::NCameraSystem &nCameraSystem,
                              bool componentFixed)
 {
+  if (placeRecognition_) throw Exception("Load components before starting place recognition");
   // create component
   components_.emplace_back(Component(imuParameters, nCameraSystem));
   componentsFixed_.push_back(componentFixed);
@@ -263,6 +239,23 @@ bool Frontend::verifyRecognisedPlace(const Estimator &estimator,
                                      Eigen::Matrix<double, 6, 6>& H,
                                      int minInliers)
 {
+  AlignedVector<kinematics::Transformation> extrinsics;
+  for (size_t im = 0; im < framesInOut->numFrames(); ++im)
+    extrinsics.push_back(estimator.extrinsics(StateId(framesInOut->id()), uchar(im)));
+  return verifyPlaceRecognitionSnapshot(params, framesInOut, oldFrame, extrinsics,
+      briskMatchingThreshold_, T_Sold_Snew, H, minInliers);
+}
+
+bool Frontend::verifyPlaceRecognitionSnapshot(const ViParameters& params,
+    const std::shared_ptr<const MultiFrame>& framesInOut,
+    const std::shared_ptr<const MultiFrame>& oldFrame,
+    const AlignedVector<kinematics::Transformation>& cameraExtrinsics, double matchingThreshold,
+    kinematics::Transformation& T_Sold_Snew, Eigen::Matrix<double, 6, 6>& H, int minInliers, bool recordTiming) {
+  // The legacy global timer accumulator is not safe for concurrent updates.
+  // Background timings are recorded by the actor instead.
+  const auto timer = [recordTiming](const char* tag) {
+    return recordTiming ? std::make_unique<TimerSwitchable>(tag) : nullptr;
+  };
   // geometric verification:
   cameras::NCameraSystem::DistortionType distortionType = params.nCameraSystem.distortionType(0);
   std::map<LandmarkId, std::vector<const uchar *>> descriptors;
@@ -272,7 +265,7 @@ bool Frontend::verifyRecognisedPlace(const Estimator &estimator,
   std::map<KeypointIdentifier, uint64_t> matches;
 
   // find matchable points
-  TimerSwitchable loopClosureDescriptorMatchingTimer("2.04 loop closure descriptor matching");
+  auto loopClosureDescriptorMatchingTimer = timer("2.04 loop closure descriptor matching");
   for (size_t im = 0; im < params.nCameraSystem.numCameras(); ++im) {
     for (size_t kOld = 0; kOld < oldFrame->numKeypoints(im); ++kOld) {
       uint64_t lmId = oldFrame->landmarkId(im, kOld);
@@ -323,7 +316,7 @@ bool Frontend::verifyRecognisedPlace(const Estimator &estimator,
       
       const uchar *ddata = framesInOut->keypointDescriptor(im, 0);
       const size_t K = framesInOut->numKeypoints(im);
-      uint32_t distMin = briskMatchingThreshold_;
+      uint32_t distMin = matchingThreshold;
       size_t kMin = 0;
       for (const unsigned char* oldDescripor : descriptors.at(iter->first)) {
         for (size_t k = 0; k < K; ++k) {
@@ -335,7 +328,7 @@ bool Frontend::verifyRecognisedPlace(const Estimator &estimator,
         }
       }
       // now get best match
-      if (distMin < briskMatchingThreshold_) {
+      if (distMin < matchingThreshold) {
         ctr++;
         const KeypointIdentifier kid(framesInOut->id(), im, kMin);
         points[iter->first.value()] = iter->second;
@@ -344,7 +337,7 @@ bool Frontend::verifyRecognisedPlace(const Estimator &estimator,
     }
   }
 
-  loopClosureDescriptorMatchingTimer.stop();
+  if (loopClosureDescriptorMatchingTimer) loopClosureDescriptorMatchingTimer->stop();
 
   if (ctr < minInliers || points.size() < 8) {
     return false;
@@ -370,13 +363,13 @@ bool Frontend::verifyRecognisedPlace(const Estimator &estimator,
   if (adapter.getNumberCorrespondences() < 7) {
     return false;
   }
-  TimerSwitchable ransacLoopClosureTimer("2.05 loop closure ransacking");
+  auto ransacLoopClosureTimer = timer("2.05 loop closure ransacking");
   ransac.computeModel(0);
   const int numInliers = int(ransac.inliers_.size());
   const double inlierRatio = double(ransac.inliers_.size())
                              / double(adapter.getNumberCorrespondences());
 
-  ransacLoopClosureTimer.stop();
+  if (ransacLoopClosureTimer) ransacLoopClosureTimer->stop();
   if (numInliers < minInliers || inlierRatio < 0.7) {
     return false;
   }
@@ -432,7 +425,7 @@ bool Frontend::verifyRecognisedPlace(const Estimator &estimator,
   }
 
   // refine
-  TimerSwitchable loopClosureRefinementTimer("2.06 loop closure pose refinement");
+  auto loopClosureRefinementTimer = timer("2.06 loop closure pose refinement");
   const uint64_t frameId = framesInOut->id();
   Eigen::Matrix4d T_Sold_Snew_mat = Eigen::Matrix4d::Identity();
   T_Sold_Snew_mat.topLeftCorner<3, 4>() = ransac.model_coefficients_;
@@ -453,7 +446,7 @@ bool Frontend::verifyRecognisedPlace(const Estimator &estimator,
   quickSolver.AddParameterBlock(pose->parameters(), 7, &pose6dParameterisation);
   std::vector<std::shared_ptr<ceres::PoseParameterBlock>> extrinsics;
   for (size_t i = 0; i < framesInOut->numFrames(); ++i) {
-    kinematics::Transformation T_SC = estimator.extrinsics(StateId(frameId), uchar(i));
+    kinematics::Transformation T_SC = cameraExtrinsics.at(i);
     extrinsics.push_back(
       std::shared_ptr<ceres::PoseParameterBlock>(new ceres::PoseParameterBlock(T_SC, i + 2)));
     quickSolver.AddParameterBlock(extrinsics.back()->parameters(), 7, &pose6dParameterisation);
@@ -597,7 +590,7 @@ bool Frontend::verifyRecognisedPlace(const Estimator &estimator,
     return false;
   }
 
-  loopClosureRefinementTimer.stop();
+  if (loopClosureRefinementTimer) loopClosureRefinementTimer->stop();
   return true;
 }
 
@@ -606,68 +599,161 @@ int Frontend::getFilteredDBoWResult(const std::unique_ptr<DBoW> &dBow,
                                     const std::vector<std::vector<uchar>> &features,
                                     std::vector<std::pair<StateId, double>> &stateIds) const
 {
-  DBoW2::QueryResults dBoWResult;
-  dBow->database.query(features, dBoWResult, -1); // get all matches
-  DBoW2::QueryResults dBoWResultOrig = dBoWResult;
-  // sort ascending -- we want to match oldest...
-  std::sort(dBoWResult.begin(),
-            dBoWResult.end(),
-            [](const DBoW2::Result &lhs, const DBoW2::Result &rhs) { return lhs.Id < rhs.Id; });
+  DBoW2::QueryResults matches;
+  dBow->database.query(features, matches, -1);
+  std::map<unsigned int, double> scores;
+  for (const auto& match : matches) scores.emplace(match.Id, match.Score);
+  std::set<unsigned int> selected, suppressed;
+  constexpr unsigned int radius = 5;
+  for (const auto& match : matches) {
+    if (match.Score < 0.375) break;
+    if (suppressed.count(match.Id)) continue;
+    const auto lower = match.Id > radius ? match.Id - radius : 0;
+    const auto upper = match.Id + radius;
+    bool maximum = true;
+    for (auto it = scores.lower_bound(lower); it != scores.end() && it->first <= upper; ++it)
+      if (it->second > match.Score) { maximum = false; break; }
+    if (!maximum) continue;
+    selected.insert(match.Id);
+    for (auto it = scores.lower_bound(lower); it != scores.end() && it->first <= upper; ++it)
+      suppressed.insert(it->first);
+  }
+  stateIds.clear();
+  for (const auto id : selected) {
+    if (id < dBow->poseIds.size())
+      stateIds.emplace_back(StateId(dBow->poseIds.at(id)), scores.at(id));
+  }
+  return int(stateIds.size());
+}
 
-  // nonmax suppression
-  std::set<uint64_t> ids;
-  std::set<uint64_t> suppressedIds;
-  const size_t numKeyframes = dBoWResultOrig.size();
-  int nonmaxRadius = 5;
-  for (size_t f = 0; f < numKeyframes; ++f) {
-    const double score = dBoWResultOrig[f].Score;
-    const uint64_t id = dBoWResultOrig[f].Id;
-    if (id >= dBoWResult.size())
-      continue;
-    if (score < 0.375) {
-      break;
-    }
-    // check suppressed:
-    if (suppressedIds.count(f)) {
-      continue;
-    }
-    // check maximum
-    bool isMax = true;
-    for (int a = std::max(0, int(id) - nonmaxRadius);
-         a <= (std::min(int(numKeyframes-1), int(id) + nonmaxRadius));
-         ++a) {
-      if (dBoWResult[a].Score > score) {
-        isMax = false;
+
+bool Frontend::applyPlaceRecognitionResults(Estimator& estimator, const ViParameters& params,
+    const MultiFramePtr& framesInOut, bool kfPrior, bool* asKeyframe) {
+  if (estimator.isLoopClosing() || estimator.isLoopClosureAvailable()
+      || estimator.needsFullGraphOptimisation()) return false;
+  auto results = takePlaceRecognitionResults();
+  const auto distortionType = params.nCameraSystem.distortionType(0);
+  bool applied = false;
+  for (const auto& result : results) {
+    if (result.component >= 0) {
+      const size_t c = size_t(result.component);
+      kinematics::Transformation relativePose;
+      Eigen::Matrix<double, 6, 6> information;
+      // Revalidate against the current image rather than transplanting the old
+      // query's transform/information matrix onto a different graph endpoint.
+      if (verifyRecognisedPlace(estimator, params, framesInOut,
+          components_.at(c).multiFrames_.at(result.candidateId), relativePose, information, 40)) {
+        estimator.T_AiS_[StateId(framesInOut->id())][c] =
+            components_.at(c).fullGraph_->pose(result.candidateId) * relativePose;
+        applied = true;
       }
-    }
-    if (!isMax) {
       continue;
     }
-
-    // suppress
-    for (int a = std::max(0, int(id) - nonmaxRadius);
-         a <= (std::min(int(numKeyframes-1), int(id) + nonmaxRadius));
-         ++a) {
-      suppressedIds.insert(a);
-    }
-
-    // use
-    ids.insert(id);
-  }
-
-  for (size_t id : ids) {
-
+    if (!params.estimator.do_loop_closures) continue;
+    const auto id = std::make_pair(result.candidateId, result.score);
+    // Previous candidate references have expired; bound reloaded historical payloads.
+    estimator.trimFramePayloadCache();
     // start with oldest keyframe match
-    const double p = dBoWResult.at(id).Score;
-
+    const double p = id.second;
     // get old multiframe
-    uint64_t poseId = dBow->poseIds.at(id);
+    if (id.first.value() >= framesInOut->id()) continue;
+    if(p > params.estimator.p_dbow) {
 
-    // output
-    stateIds.push_back(std::make_pair(StateId(poseId),p));
+      const std::shared_ptr<const MultiFrame> oldFrame = estimator.multiFrame(id.first);
+      // Recheck graph eligibility without exposing graph containers to the worker.
+      if (!estimator.isPoseGraphFrame(id.first) || estimator.isLoopClosureFrame(id.first)
+          || estimator.isRecentLoopClosureFrame(id.first) || !estimator.isPlaceRecognitionFrame(id.first)) {
+        excludePlaceRecognitionFrame(id.first);
+        if (estimator.isPlaceRecognitionFrame(id.first)) pendingPlaceRecognitionFrames_.insert(id.first);
+        continue;
+      }
+      // A query proposal can be older than this graph endpoint. Revalidate it
+      // against the current image instead of reusing its old transform.
+      TimerSwitchable revalidationTimer("2.11 revalidate loop proposal");
+      kinematics::Transformation T_Sold_Snew;
+      Eigen::Matrix<double, 6, 6> H;
+      if (!verifyRecognisedPlace(estimator, params, framesInOut, oldFrame, T_Sold_Snew, H, 10)) {
+        continue;
+      }
+      revalidationTimer.stop();
+      // enforce relative transformation
+      TimerSwitchable attemptLoopClosureTimer("2.07 attempt loop closure");
+      bool skipFullGraphOptimisation = false;
+      const uint64_t frameId = framesInOut->id();
+      bool loopClosureAttemptSuccessful =
+          estimator.attemptLoopClosure(
+            StateId(oldFrame->id()), StateId(frameId), T_Sold_Snew, H,
+            skipFullGraphOptimisation,
+            params.estimator.drift_percentage_heuristic);
+      if(!loopClosureAttemptSuccessful) {
+        LOG(INFO) << "unsuccessful loop closure frame "<< id.first.value();
+        attemptLoopClosureTimer.stop();
+        continue;
+      }
+      attemptLoopClosureTimer.stop();
+      // bring back old landmarks
+      TimerSwitchable addLoopClosureTimer("2.08 add loop closure");
+      std::set<LandmarkId> loopClosureLandmarks;
+      estimator.addLoopClosureFrame(StateId(oldFrame->id()), loopClosureLandmarks,
+                                    skipFullGraphOptimisation);
+      addLoopClosureTimer.stop();
+      excludePlaceRecognitionFrame(id.first);
+      pendingPlaceRecognitionFrames_.insert(id.first);
+      // properly match against all loopClosure frame points
+      TimerSwitchable matchLoopClosureTimer("2.09 match loop closure");
+      int loopClosureMatches = 0;
+      switch (distortionType) {
+        case okvis::cameras::NCameraSystem::RadialTangential: {
+          loopClosureMatches =
+              matchToMap<cameras::PinholeCamera<cameras::RadialTangentialDistortion>>(
+                  estimator, params, framesInOut->id(), &loopClosureLandmarks);
+          break;
+        }
+        case okvis::cameras::NCameraSystem::Equidistant: {
+          loopClosureMatches = matchToMap<cameras::PinholeCamera<cameras::EquidistantDistortion>>(
+              estimator, params, framesInOut->id(), &loopClosureLandmarks);
+          break;
+        }
+        case okvis::cameras::NCameraSystem::RadialTangential8: {
+          loopClosureMatches =
+              matchToMap<cameras::PinholeCamera<cameras::RadialTangentialDistortion8>>(
+                  estimator, params, framesInOut->id(), &loopClosureLandmarks);
+          break;
+        }
+        case okvis::cameras::NCameraSystem::NoDistortion: {
+          loopClosureMatches = matchToMap<cameras::EucmCamera>(
+                  estimator, params, framesInOut->id(), &loopClosureLandmarks);
+          break;
+        }
+        default:
+          OKVIS_THROW(Exception, "Unsupported distortion type.")
+          break;
+      }
+      LOG(INFO) << "LOOP CLOSURE: current frame " << framesInOut->id()
+                << ", matching to keyframe " << oldFrame->id() << ", "
+                << loopClosureMatches << " matches, p=" << p << ".";
+
+      matchLoopClosureTimer.stop();
+      // re-decide keyframe:
+      if(kfPrior){
+        *asKeyframe = true;
+      }
+      else{
+        *asKeyframe = doWeNeedANewKeyframe(estimator, framesInOut);
+      }
+
+      applied = true;
+      break; // Apply at most one local loop per estimator safe point.
+    }
   }
+  return applied;
+}
 
-  return stateIds.size();
+bool Frontend::processPendingLoopClosures(Estimator& estimator, const ViParameters& params) {
+  if (!estimator.numFrames()) return false;
+  auto frame = estimator.multiFrame(estimator.currentStateId());
+  bool asKeyframe = estimator.isKeyframe(estimator.currentStateId());
+  return applyPlaceRecognitionResults(estimator, params, frame, true, &asKeyframe);
 }
 
 // Matching as well as initialization of landmarks and state.
@@ -787,181 +873,9 @@ bool Frontend::dataAssociationAndInitialization(
     *asKeyframe = true;  // first frame needs to be keyframe
   }
 
-  // prepare features for place recognition
-  std::vector<std::vector<uchar>> features(framesInOut->numKeypoints());
-  // first, we are trying to match the database for loop closures
-  int offset = 0;
-  for (size_t im = 0; im < numCameras_; ++im) {
-    for (size_t k = 0; k < framesInOut->numKeypoints(im); ++k) {
-      features.at(k + offset).resize(48); // TODO: get 48 from feature
-      memcpy(features.at(k + offset).data(),
-             framesInOut->keypointDescriptor(im, k),
-             48 * sizeof(uchar));
-    }
-    offset += framesInOut->numKeypoints(im);
-  }
-
-  /*MULTI-SESSION AND MULTI-AGENT*/
-  if (!estimator.isLoopClosing() && !estimator.isLoopClosureAvailable()
-      && !estimator.needsFullGraphOptimisation() && isInitialized_) {
-    for (uint64_t c = 0; c < componentDBows_.size(); ++c) {
-      TimerSwitchable matchDBoWTimer0("2.3.0 multi-session and multi-agent place recognition");
-      std::vector<std::pair<StateId, double>> stateIds;
-      getFilteredDBoWResult(componentDBows_.at(c), features, stateIds);
-      matchDBoWTimer0.stop();
-
-      int attempts = 0;
-
-      for (const auto & id : stateIds) {
-
-        double p = id.second;
-
-        // get old multiframe
-        MultiFramePtr oldMultiFrame = components_.at(c).multiFrames_.at(id.first);
-
-        // stop after some amount of attempts
-        if (attempts > std::max(10, int(componentDBows_.at(c)->poseIds.size() / 20)))
-          break;
-        if (p > 0.4) {
-          kinematics::Transformation T_Sold_Snew;
-          Eigen::Matrix<double, 6, 6> H;
-          if (!verifyRecognisedPlace(estimator,
-                                     params,
-                                     framesInOut,
-                                     oldMultiFrame,
-                                     T_Sold_Snew,
-                                     H,
-                                     40)) {
-            attempts++;
-            continue;
-          }
-          attempts++;
-
-          estimator.T_AiS_[StateId(framesInOut->id())][c] =
-            components_.at(c).fullGraph_->pose(id.first) * T_Sold_Snew;
-
-          break;
-        }
-      }
-    }
-  }
-
-  /*LOOP CLOSURES*/
-  if(params.estimator.do_loop_closures && !estimator.isLoopClosing()
-      && !estimator.isLoopClosureAvailable()
-      && !estimator.needsFullGraphOptimisation() && isInitialized_) {
-    TimerSwitchable matchDBoWTimer("2.03 loop closure query");
-    std::vector<std::pair<StateId, double>> stateIds;
-    getFilteredDBoWResult(dBow_, features, stateIds);
-    matchDBoWTimer.stop();
-    TimerSwitchable attemptLoopClosureTimer("2.07 attempt loop closure", true);
-    // nonmax suppression
-    size_t attempts = 0;
-    for(const auto & id : stateIds) {
-      // Previous candidate references have expired; bound reloaded historical payloads.
-      estimator.trimFramePayloadCache();
-      // start with oldest keyframe match
-      const double p = id.second;
-      // get old multiframe
-      if(attempts > std::max(size_t(10),dBow_->poseIds.size()/20)) break;
-      if(p > params.estimator.p_dbow) {
-
-        const std::shared_ptr<const MultiFrame> oldFrame = estimator.multiFrame(id.first);
-        /// \todo move to separate thread
-        // check if already existing loop closure or matching against current frame
-        if(!estimator.isPoseGraphFrame(id.first)) {
-          continue;
-        }
-        if(estimator.isLoopClosureFrame(id.first)) {
-          continue;
-        }
-        if(estimator.isRecentLoopClosureFrame(id.first)) {
-          continue;
-        }
-        if(!estimator.isPlaceRecognitionFrame(id.first)) {
-          continue;
-        }
-        // verify with RANSAC and refine
-        kinematics::Transformation T_Sold_Snew;
-        Eigen::Matrix<double, 6, 6> H;
-        if (!verifyRecognisedPlace(estimator, params, framesInOut, oldFrame, T_Sold_Snew, H, 10)) {
-          attempts++;
-          continue;
-        }
-        attempts++;
-        // enforce relative transformation
-        attemptLoopClosureTimer.start();
-        bool skipFullGraphOptimisation = false;
-        const uint64_t frameId = framesInOut->id();
-        bool loopClosureAttemptSuccessful =
-            estimator.attemptLoopClosure(
-              StateId(oldFrame->id()), StateId(frameId), T_Sold_Snew, H,
-              skipFullGraphOptimisation,
-              params.estimator.drift_percentage_heuristic);
-        if(!loopClosureAttemptSuccessful) {
-          LOG(INFO) << "unsuccessful loop closure frame "<< id.first.value();
-          attemptLoopClosureTimer.stop();
-          continue;
-        }
-        attemptLoopClosureTimer.stop();
-        // bring back old landmarks
-        TimerSwitchable addLoopClosureTimer("2.08 add loop closure");
-        std::set<LandmarkId> loopClosureLandmarks;
-        estimator.addLoopClosureFrame(StateId(oldFrame->id()), loopClosureLandmarks,
-                                      skipFullGraphOptimisation);
-        addLoopClosureTimer.stop();
-        // properly match against all loopClosure frame points
-        TimerSwitchable matchLoopClosureTimer("2.09 match loop closure");
-        int loopClosureMatches = 0;
-        switch (distortionType) {
-          case okvis::cameras::NCameraSystem::RadialTangential: {
-            loopClosureMatches =
-                matchToMap<cameras::PinholeCamera<cameras::RadialTangentialDistortion>>(
-                    estimator, params, framesInOut->id(), &loopClosureLandmarks);
-            break;
-          }
-          case okvis::cameras::NCameraSystem::Equidistant: {
-            loopClosureMatches = matchToMap<cameras::PinholeCamera<cameras::EquidistantDistortion>>(
-                estimator, params, framesInOut->id(), &loopClosureLandmarks);
-            break;
-          }
-          case okvis::cameras::NCameraSystem::RadialTangential8: {
-            loopClosureMatches =
-                matchToMap<cameras::PinholeCamera<cameras::RadialTangentialDistortion8>>(
-                    estimator, params, framesInOut->id(), &loopClosureLandmarks);
-            break;
-          }
-          case okvis::cameras::NCameraSystem::NoDistortion: {
-            loopClosureMatches = matchToMap<cameras::EucmCamera>(
-                    estimator, params, framesInOut->id(), &loopClosureLandmarks);
-            break;
-          }
-          default:
-            OKVIS_THROW(Exception, "Unsupported distortion type.")
-            break;
-        }
-        LOG(INFO) << "LOOP CLOSURE: current frame " << framesInOut->id()
-                  << ", matching to keyframe " << oldFrame->id() << ", "
-                  << loopClosureMatches << " matches, p=" << p << ".";
-
-        matchLoopClosureTimer.stop();
-        // re-decide keyframe:
-        if(kfPrior){
-          *asKeyframe = true;
-        }
-        else{
-          *asKeyframe = doWeNeedANewKeyframe(estimator, framesInOut);
-        }
-
-        break; // only consider oldest keyframe match.
-      }
-    }
-    // if keyframe, we add to relocalisation database
-    if(*asKeyframe && !kfPrior) {
-      dBow_->database.add(features);
-      dBow_->poseIds.push_back(framesInOut->id());
-    }
-  }
+  // Results contain no graph references. Only this owner thread applies them,
+  // after fresh geometric verification against the current camera frame.
+  applyPlaceRecognitionResults(estimator, params, framesInOut, kfPrior, asKeyframe);
 
 
 #ifdef OKVIS_USE_NN
@@ -1128,6 +1042,10 @@ bool Frontend::dataAssociationAndInitialization(
 #endif
   estimator.cleanUnobservedLandmarks();
 
+  if (*asKeyframe && isInitialized_
+      && (params.estimator.do_loop_closures || !componentDBows_.empty()))
+    submitPlaceRecognitionKeyframe(estimator, params, framesInOut);
+
   return trackingQuality >= 0.01;
 }
 
@@ -1164,6 +1082,9 @@ void Frontend::endCnnThreads() {
 
 void Frontend::clear()
 {
+  stopPlaceRecognition(false);
+  placeRecognition_.reset();
+  pendingPlaceRecognitionFrames_.clear();
   endCnnThreads();
   isInitialized_ = false;        // Is the pose initialised?
   dBow_->database.clear();

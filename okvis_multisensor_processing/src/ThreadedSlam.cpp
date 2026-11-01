@@ -619,7 +619,10 @@ bool ThreadedSlam::processFrame() {
         // in the very beginning, we can't join because it was not started
         optimisationThread_.join();
       }
-
+      if (frontend_.processPendingLoopClosures(estimator_, parameters_)) {
+        hasAlignmentUpdates_ = true;
+        return true;
+      }
       return false;
     }
     // now get all relevant IMU measurements we have received thus far
@@ -1383,6 +1386,12 @@ void ThreadedSlam::stopThreading() {
   }
 
   flushPendingUpdates();
+
+  // Optional queries run on immutable snapshots. Drain/join their worker
+  // before estimator teardown and apply any ready proposal on this owner.
+  frontend_.finishPlaceRecognition();
+  if (frontend_.processPendingLoopClosures(estimator_, parameters_))
+    hasAlignmentUpdates_ = true;
 
   // stop CNN stuff
   frontend_.endCnnThreads();
