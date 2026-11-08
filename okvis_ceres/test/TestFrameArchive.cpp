@@ -52,6 +52,7 @@ void testPayload(const std::filesystem::path& directory) {
   cv::randu(descriptors, 0, 255);
   frame.resetDescriptors(descriptors.clone());
   frame.setLandmarkId(1, 123);
+  frame.setFeatureTrack(1, okvis::FeatureTrack{98765, 42});
   frame.setLandmark(1, Eigen::Vector4d(1, 2, 3, 1), true);
   Eigen::Vector3d ray;
   frame.getBackProjection(1, ray);
@@ -79,6 +80,8 @@ void testPayload(const std::filesystem::path& directory) {
   frame.archivePayload(file);
   check(frame.landmarkId(1) == 456, "Dirty landmark mutation was lost on page-out");
   okvis::Frame copy(frame);
+  check(copy.featureTrack(1).id == 98765 && copy.featureTrack(1).length == 42,
+      "Frame archive/copy lost temporal track identity or length");
   frame.archivePayload(file);
   check(copy.landmarkId(1) == 456 && copy.numKeypoints() == 4, "Frame copy lost feature payload");
 

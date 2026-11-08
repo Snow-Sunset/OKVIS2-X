@@ -135,6 +135,7 @@ int Frame::detect()
 
   // resizing and filling in zeros in Frame::describe() as some keypoints are removed there:
   landmarkIds_.clear();
+  featureTracks_.clear();
 
   // run the detector
   OKVIS_ASSERT_TRUE_DBG(Exception, detector_ != nullptr,
@@ -160,6 +161,7 @@ int Frame::describe()
 
   // resizing
   landmarkIds_ = std::vector<uint64_t>(keypoints_.size(),0);
+  featureTracks_.assign(keypoints_.size(), FeatureTrack{});
   landmarks_ = std::vector<Eigen::Vector4d, Eigen::aligned_allocator<Eigen::Vector4d>>(
         keypoints_.size(), Eigen::Vector4d(0,0,0,0));
   landmarkInitialisations_ = std::vector<bool>(keypoints_.size(), false);
@@ -291,10 +293,11 @@ const unsigned char * Frame::keypointDescriptor(size_t keypointIdx) const
 }
 
 // Set the landmark ID
-bool Frame::setLandmarkId(size_t keypointIdx, uint64_t landmarkId)
+bool Frame::setLandmarkId(size_t keypointIdx, uint64_t landmarkId, FeatureAssociation association)
 {
   ensurePayload();
   payloadDirty_ = true;
+  featureTracks_.at(keypointIdx).association = landmarkId ? association : FeatureAssociation::None;
 #ifndef NDEBUG
   OKVIS_ASSERT_TRUE(
       Exception,
@@ -368,6 +371,7 @@ inline bool Frame::resetKeypoints(const std::vector<cv::KeyPoint> & keypoints) {
   ensurePayload();
   payloadDirty_ = true;
   keypoints_ = keypoints;
+  featureTracks_.assign(keypoints_.size(), FeatureTrack{});
 
   // resizing
   landmarkIds_ = std::vector<uint64_t>(keypoints_.size(),0);

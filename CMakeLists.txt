@@ -503,6 +503,7 @@ if(BUILD_ROS2)
   find_package(tf2_ros REQUIRED)
   find_package(image_transport REQUIRED)
   find_package(message_filters REQUIRED)
+  find_package(CUDAToolkit QUIET)
 
   # incldues and lib directories
   include_directories(${OpenCV_INCLUDE_DIRS})
@@ -519,6 +520,14 @@ if(BUILD_ROS2)
     okvis_ros2/src/Publisher.cpp
     okvis_ros2/src/RePublisher.cpp
   )
+  if(CUDAToolkit_FOUND AND TARGET CUDA::nvjpeg)
+    target_sources(${LIB_NAME} PRIVATE okvis_ros2/src/NvJpegDecoder.cpp)
+    target_compile_definitions(${LIB_NAME} PRIVATE OKVIS_HAS_NVJPEG)
+    target_link_libraries(${LIB_NAME} CUDA::nvjpeg CUDA::cudart)
+    message(STATUS "nvJPEG CUDA compressed-image decoding enabled")
+  else()
+    message(STATUS "nvJPEG not found; image_transport:=compressed_cuda will be unavailable")
+  endif()
   target_include_directories(${LIB_NAME}
     PUBLIC
       $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/okvis_ros2/include>

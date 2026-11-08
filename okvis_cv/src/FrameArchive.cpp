@@ -15,7 +15,7 @@
 
 namespace okvis {
 namespace {
-constexpr uint64_t kMagic = 0x4f4b5646524d3031ULL; // OKVFRM01; same-build session format.
+constexpr uint64_t kMagic = 0x4f4b5646524d3032ULL; // OKVFRM02; same-build session format.
 constexpr uint64_t kMaxArrayBytes = 512ULL * 1024 * 1024;
 
 template<class T> void put(std::ostream& out, const T& value) {
@@ -86,6 +86,24 @@ void getBools(std::istream& in, std::vector<bool>& values) {
     values[i] = value != 0;
   }
 }
+void putTracks(std::ostream& out, const std::vector<FeatureTrack>& tracks) {
+  put(out, uint64_t(tracks.size()));
+  for (const auto& track : tracks) { put(out, track.id); put(out, track.length); }
+}
+void getTracks(std::istream& in, std::vector<FeatureTrack>& tracks) {
+  uint64_t count;
+  get(in, count);
+  constexpr uint64_t bytesPerTrack = sizeof(uint64_t) + sizeof(uint32_t);
+  if (count > kMaxArrayBytes / sizeof(FeatureTrack))
+    throw std::runtime_error("Oversized track vector in frame archive");
+  checkRemaining(in, count * bytesPerTrack);
+  tracks.resize(count);
+  for (auto& track : tracks) {
+    get(in, track.id); get(in, track.length);
+    if ((track.id == 0) != (track.length == 0))
+      throw std::runtime_error("Invalid track identity/length in frame archive");
+  }
+}
 void syncFile(const std::string& filename) {
   const int fd = ::open(filename.c_str(), O_RDONLY);
   if (fd < 0) throw std::runtime_error("Cannot open frame archive for sync: " + filename);
@@ -114,6 +132,7 @@ size_t Frame::residentPayloadBytes() const {
       keypoints_.capacity() * sizeof(cv::KeyPoint) +
       backProjections_.capacity() * sizeof(Eigen::Vector3d) + backProjectionsValid_.capacity() / 8 +
       landmarkIds_.capacity() * sizeof(uint64_t) + landmarks_.capacity() * sizeof(Eigen::Vector4d) +
+      featureTracks_.capacity() * sizeof(FeatureTrack) +
       landmarkInitialisations_.capacity() / 8;
 }
 
@@ -131,6 +150,7 @@ bool Frame::archivePayload(const std::string& filename, bool release) {
       put(out, kMagic);
       putMat(out, image_); putMat(out, depthImage_); putMat(out, descriptors_); putMat(out, classifications_);
       putVector(out, keypoints_); putVector(out, backProjections_); putBools(out, backProjectionsValid_);
+      putTracks(out, featureTracks_);
       putVector(out, landmarkIds_); putVector(out, landmarks_); putBools(out, landmarkInitialisations_);
       put(out, uint8_t(isClassified_));
       put(out, kMagic);
@@ -155,6 +175,7 @@ bool Frame::archivePayload(const std::string& filename, bool release) {
     decltype(backProjections_)().swap(backProjections_);
     decltype(backProjectionsValid_)().swap(backProjectionsValid_);
     decltype(landmarkIds_)().swap(landmarkIds_);
+    decltype(featureTracks_)().swap(featureTracks_);
     decltype(landmarks_)().swap(landmarks_);
     decltype(landmarkInitialisations_)().swap(landmarkInitialisations_);
     payloadResident_ = false;
@@ -178,13 +199,20 @@ void Frame::ensurePayload() const {
     getMat(in, loaded.image_); getMat(in, loaded.depthImage_);
     getMat(in, loaded.descriptors_); getMat(in, loaded.classifications_);
     getVector(in, loaded.keypoints_); getVector(in, loaded.backProjections_);
-    getBools(in, loaded.backProjectionsValid_); getVector(in, loaded.landmarkIds_);
+    getBools(in, loaded.backProjectionsValid_);
+    getTracks(in, loaded.featureTracks_);
+    getVector(in, loaded.landmarkIds_);
     getVector(in, loaded.landmarks_); getBools(in, loaded.landmarkInitialisations_);
+    // Provenance is diagnostic for the current observation and is not persisted.
+    for (size_t k = 0; k < loaded.featureTracks_.size() && k < loaded.landmarkIds_.size(); ++k)
+      loaded.featureTracks_[k].association = loaded.landmarkIds_[k]
+          ? FeatureAssociation::Unknown : FeatureAssociation::None;
     uint8_t classified; get(in, classified); get(in, magic);
     const size_t n = loaded.keypoints_.size();
     if (magic != kMagic || classified > 1 || bool(classified) != isClassified_.load() ||
         n != archivedNumKeypoints_ ||
         loaded.landmarkIds_.size() != n || loaded.landmarks_.size() != n ||
+        loaded.featureTracks_.size() != n ||
         loaded.landmarkInitialisations_.size() != n ||
         loaded.backProjections_.size() != loaded.backProjectionsValid_.size() ||
         (!loaded.backProjections_.empty() && loaded.backProjections_.size() != n) ||
@@ -201,6 +229,7 @@ void Frame::ensurePayload() const {
     keypoints_.swap(loaded.keypoints_); backProjections_.swap(loaded.backProjections_);
     backProjectionsValid_.swap(loaded.backProjectionsValid_); landmarkIds_.swap(loaded.landmarkIds_);
     landmarks_.swap(loaded.landmarks_); landmarkInitialisations_.swap(loaded.landmarkInitialisations_);
+    featureTracks_.swap(loaded.featureTracks_);
     payloadResident_ = true;
     if (payloadLoadedCallback_) payloadLoadedCallback_();
   } catch (const std::exception& error) {

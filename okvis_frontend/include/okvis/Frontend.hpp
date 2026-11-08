@@ -27,6 +27,7 @@
 #include <okvis/ViSlamBackend.hpp>
 #include <okvis/assert_macros.hpp>
 #include <okvis/timing/Timer.hpp>
+#include <okvis/TemporalFeatureTracker.hpp>
 #include <thread>
 
 /// \brief okvis Main namespace of this package.
@@ -81,6 +82,9 @@ class Frontend : public ViFrontendInterface {
 
   /// Attach immutable inference resources to an owned feature copy without extracting again.
   void prepareFrameForBackend(const std::shared_ptr<MultiFrame>& frame) const;
+
+  /// Configure before starting image/backend workers.
+  void configureTemporalTracking(const FrontendParameters& parameters);
 
   /**
    * @brief Matching as well as initialization of landmarks and state.
@@ -561,6 +565,13 @@ private:
       AlignedVector<Eigen::Vector4d>& hps_W, std::vector<size_t>& ctrs) const;
 
   std::atomic_bool trackingLost_; ///< Is the tracking currently lost?
+
+  FrontendParameters temporalParameters_{};
+  std::vector<std::unique_ptr<TemporalFeatureTracker>> temporalTrackers_;
+
+  template<class CAMERA_GEOMETRY>
+  int matchTemporalTracks(Estimator& estimator, const ViParameters& params,
+                          uint64_t currentFrameId, bool& rotationOnly);
 
   /// \brief Hacky: remember which CNNs are running on what frame.
   std::map<StateId,std::vector<std::thread*>> cnnThreads_;

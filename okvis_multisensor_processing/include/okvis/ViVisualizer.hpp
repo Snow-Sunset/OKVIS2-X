@@ -55,6 +55,8 @@ class ViVisualizer {
     bool isKeyframe = false; ///< Is it a keyframe?
     bool recognisedPlace = false; ///< is it a place recognition frame?
     TrackingQuality trackingQuality = TrackingQuality::Good; ///< The tracking quality.
+    bool frontendTracking = false; ///< Image-rate tracker snapshot; backend owns separate observations.
+    uint64_t feedbackVersion = 0;
   };
 
   OKVIS_DEFINE_EXCEPTION(Exception, std::runtime_error)

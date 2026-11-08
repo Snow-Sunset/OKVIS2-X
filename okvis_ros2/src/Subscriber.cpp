@@ -20,10 +20,14 @@
 #include <algorithm>
 #include <iterator>
 #include <stdexcept>
+#include <utility>
 
 #include <glog/logging.h>
 #include <okvis/ros2/Subscriber.hpp>
 #include <okvis/ros2/PointCloudUtilities.hpp>
+#ifdef OKVIS_HAS_NVJPEG
+#include <okvis/ros2/NvJpegDecoder.hpp>
+#endif
 
 #ifdef OKVIS_USE_NN
 #include <okvis/Processor.hpp>
@@ -61,6 +65,7 @@ void Subscriber::setNodeHandle(std::shared_ptr<rclcpp::Node> node,
   node_ = node;
 
   imageSubscribers_.resize(parameters_.nCameraSystem.numCameras());
+  compressedImageSubscribers_.resize(parameters_.nCameraSystem.numCameras());
   depthImageSubscribers_.resize(parameters_.nCameraSystem.numCameras());
   imagesReceived_.resize(parameters_.nCameraSystem.numCameras());
   depthImagesReceived_.resize(parameters_.nCameraSystem.numCameras());
@@ -68,15 +73,39 @@ void Subscriber::setNodeHandle(std::shared_ptr<rclcpp::Node> node,
   // set up image reception
   if (imgTransport_ != nullptr)
     imgTransport_.reset();
+  if (!node_->has_parameter("image_transport"))
+    node_->declare_parameter<std::string>("image_transport", "raw");
+  const bool useCudaJpeg = node_->get_parameter("image_transport").as_string() == "compressed_cuda";
   imgTransport_ = std::make_shared<image_transport::ImageTransport>(node_);
 
   // set up callbacks
+#ifdef OKVIS_HAS_NVJPEG
+  if (useCudaJpeg) {
+    cudaJpegDecoders_.clear();
+    cudaJpegDecoders_.reserve(parameters_.nCameraSystem.numCameras());
+    for (size_t i = 0; i < parameters_.nCameraSystem.numCameras(); ++i)
+      cudaJpegDecoders_.emplace_back(std::make_unique<NvJpegDecoder>());
+  }
+#else
+  if (useCudaJpeg)
+    throw std::runtime_error("image_transport:=compressed_cuda requested, but this build has no nvJPEG support");
+#endif
   for (size_t i = 0; i < parameters_.nCameraSystem.numCameras(); ++i) {
-    imageSubscribers_[i] = imgTransport_->subscribe(
-        "/okvis/cam" + std::to_string(i) +"/image_raw",
-        30 * parameters_.nCameraSystem.numCameras(),
-        std::bind(&Subscriber::imageCallback, this, std::placeholders::_1, i,
-          parameters_.nCameraSystem.cameraType(i).isColour));
+    const std::string topic = "/okvis/cam" + std::to_string(i) + "/image_raw";
+    const bool isColour = parameters_.nCameraSystem.cameraType(i).isColour;
+    const auto queueSize = 30 * parameters_.nCameraSystem.numCameras();
+    if (useCudaJpeg) {
+      auto imageQos = rclcpp::SensorDataQoS();
+      imageQos.keep_last(queueSize);
+      compressedImageSubscribers_[i] = node_->create_subscription<sensor_msgs::msg::CompressedImage>(
+          topic + "/compressed", imageQos,
+          [this, i, isColour](const sensor_msgs::msg::CompressedImage::ConstSharedPtr message) {
+            compressedImageCallback(message, i, isColour);
+          });
+    } else {
+      imageSubscribers_[i] = imgTransport_->subscribe(topic, queueSize,
+          std::bind(&Subscriber::imageCallback, this, std::placeholders::_1, i, isColour));
+    }
   }
 
   subImu_ = node_->create_subscription<sensor_msgs::msg::Imu>(
@@ -87,11 +116,14 @@ void Subscriber::setNodeHandle(std::shared_ptr<rclcpp::Node> node,
     syncDepthImages_ = true;
 
     // set up callbacks
+    const image_transport::TransportHints depthTransportHints(
+        node_.get(), "raw", "okvis_depth_image_transport");
     for (size_t i = 0; i < parameters_.nCameraSystem.numCameras(); ++i) {
       depthImageSubscribers_[i] = imgTransport_->subscribe(
         "/okvis/depth" + std::to_string(i) + "/image_raw",
         30 * parameters_.nCameraSystem.numCameras(),
-        std::bind(&Subscriber::depthCallback, this, std::placeholders::_1, i));
+        std::bind(&Subscriber::depthCallback, this, std::placeholders::_1, i),
+        image_transport::ImageTransport::VoidPtr(), &depthTransportHints);
     }
   }
 
@@ -120,6 +152,7 @@ void Subscriber::shutdown() {
   // stop callbacks
   for (size_t i = 0; i < parameters_.nCameraSystem.numCameras(); ++i) {
     imageSubscribers_[i].shutdown();
+    compressedImageSubscribers_[i].reset();
     depthImageSubscribers_[i].shutdown();
   }
   subImu_.reset();
@@ -164,6 +197,29 @@ void Subscriber::imageCallback(const sensor_msgs::msg::Image::ConstSharedPtr& ms
   
   // try sync
   synchronizeData();
+}
+
+void Subscriber::compressedImageCallback(
+    const sensor_msgs::msg::CompressedImage::ConstSharedPtr& msg,
+    unsigned int cameraIndex, bool isColour) {
+#ifdef OKVIS_HAS_NVJPEG
+  try {
+    cv::Mat decoded = cudaJpegDecoders_.at(cameraIndex)->decode(*msg, isColour);
+    const okvis::Time timestamp(msg->header.stamp.sec, msg->header.stamp.nanosec);
+    std::lock_guard<std::mutex> lock(time_mutex_);
+    imagesReceived_.at(cameraIndex)[timestamp.toNSec()] = std::move(decoded);
+    synchronizeData();
+  } catch (const std::exception& error) {
+    RCLCPP_ERROR_THROTTLE(node_->get_logger(), *node_->get_clock(), 5000,
+        "nvJPEG decode failed for camera %u: %s", cameraIndex, error.what());
+  }
+#else
+  (void)msg;
+  (void)cameraIndex;
+  (void)isColour;
+  RCLCPP_ERROR(node_->get_logger(),
+      "CUDA compressed-image callback reached without nvJPEG support in this build");
+#endif
 }
 
 void Subscriber::imuCallback(const sensor_msgs::msg::Imu& msg)
@@ -279,11 +335,15 @@ void Subscriber::lidarWorkerLoop() {
       if (lidarPointTimeReference_ == "scan_end") reference = pointcloud_ros::OusterTimeReference::ScanEnd;
       if (lidarPointTimeReference_ == "header") reference = pointcloud_ros::OusterTimeReference::Header;
       const auto decodeBegin = std::chrono::steady_clock::now();
-      const auto invalidPoints = pointcloud_ros::lidar2batch(*msg, lidarBatch, reference);
+      size_t rangeFilteredPoints = 0;
+      const double maximumRange = parameters_.lidar ? parameters_.lidar->maximum_range : 50.0;
+      const auto invalidPoints = pointcloud_ros::lidar2batch(
+          *msg, lidarBatch, reference, maximumRange, &rangeFilteredPoints);
       pureDecodeMaxMs = std::max(pureDecodeMaxMs,
           std::chrono::duration<double, std::milli>(
               std::chrono::steady_clock::now() - decodeBegin).count());
       lidarInvalidPoints_.fetch_add(invalidPoints, std::memory_order_relaxed);
+      lidarRangeFilteredPoints_.fetch_add(rangeFilteredPoints, std::memory_order_relaxed);
       // Report the decoded scan before trimming overlapping input, so an unusual
       // point-time span remains visible rather than being hidden by the watermark.
       latestScanSpanMs = lidarBatch.empty() ? 0.0
@@ -359,6 +419,9 @@ void Subscriber::lidarWorkerLoop() {
                   << lidarScansProcessed_.load(std::memory_order_relaxed)
                   << ", points " << lidarPointsReceived_.load(std::memory_order_relaxed)
                   << ", invalid " << lidarInvalidPoints_.load(std::memory_order_relaxed)
+                  << ", range-filtered " << lidarRangeFilteredPoints_.load(std::memory_order_relaxed)
+                  << " points (max " << (parameters_.lidar ? parameters_.lidar->maximum_range : 50.0)
+                  << " m)"
                   << ", time-regressing " << lidarRegressingPoints_.load(std::memory_order_relaxed)
                   << ", estimator rejected batches "
                   << lidarEstimatorRejectedBatches_.load(std::memory_order_relaxed)

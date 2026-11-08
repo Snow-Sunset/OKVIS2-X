@@ -54,7 +54,7 @@ GlobalLidarPcdMapper::GlobalLidarPcdMapper(const std::shared_ptr<rclcpp::Node>& 
         && inputReliability_ != "best_effort")
       throw std::invalid_argument("global_lidar_pcd.input_reliability must be auto, reliable or best_effort");
     minimumRange_ = parameter("minimum_range", .5);
-    maximumRange_ = parameter("maximum_range", 150.0);
+    maximumRange_ = parameter("maximum_range", parameters.lidar->maximum_range);
     workerCpuBudget_ = parameter("worker_cpu_budget", .35);
     if (!std::isfinite(workerCpuBudget_) || workerCpuBudget_ <= 0 || workerCpuBudget_ > 1)
       throw std::invalid_argument("global_lidar_pcd.worker_cpu_budget must be in (0, 1]");
@@ -397,7 +397,10 @@ bool GlobalLidarPcdMapper::prepareScan(bool draining) {
       }
       if (candidate) {
         ++decodedScans_;
-        invalidPoints_ += pointcloud_ros::lidar2batch(*activeRawScan_, activeScan_, reference);
+        size_t rangeFiltered = 0;
+        invalidPoints_ += pointcloud_ros::lidar2batch(
+            *activeRawScan_, activeScan_, reference, maximumRange_, &rangeFiltered);
+        rangeFilteredPoints_ += rangeFiltered;
         if (lastConsumedTime_) {
           const auto begin = std::upper_bound(activeScan_.begin(), activeScan_.end(),
               *lastConsumedTime_, [](const Time& time, const LidarMeasurement& point) {
@@ -555,9 +558,10 @@ bool GlobalLidarPcdMapper::integrateScan(bool draining) {
   activeOffset_ = 0;
   ++integratedScans_;
   if (integratedScans_ % 100 == 0) {
-    RCLCPP_INFO(node_->get_logger(), "Global PCD: %lu keyframe scans, %lu replaced/rejected scans, %lu invalid/uncovered points; resident cloud estimate %.1f MiB, archived points %lu",
+    RCLCPP_INFO(node_->get_logger(), "Global PCD: %lu keyframe scans, %lu replaced/rejected scans, %lu invalid/uncovered points, %lu beyond %.1f m; resident cloud estimate %.1f MiB, archived points %lu",
         static_cast<unsigned long>(integratedScans_), static_cast<unsigned long>(droppedScans_.load()),
-        static_cast<unsigned long>(invalidPoints_), double(map_->residentBytes()) / (1024.0*1024.0),
+        static_cast<unsigned long>(invalidPoints_), static_cast<unsigned long>(rangeFilteredPoints_), maximumRange_,
+        double(map_->residentBytes()) / (1024.0*1024.0),
         static_cast<unsigned long>(map_->archivedPointCount()));
   }
   return true;
@@ -884,10 +888,11 @@ void GlobalLidarPcdMapper::run() {
   // On a sidecar failure also release its DDS reader: merely ignoring callbacks
   // would keep deserializing large scans after mapping had already stopped.
   stopInputSubscription();
-  RCLCPP_INFO(node_->get_logger(), "Global PCD complete: %lu keyframe scans, %lu non-keyframe scans skipped, %lu duplicate-keyframe scans skipped, %lu replaced/rejected scans, %lu invalid/uncovered points, %lu rejected pose updates",
+  RCLCPP_INFO(node_->get_logger(), "Global PCD complete: %lu keyframe scans, %lu non-keyframe scans skipped, %lu duplicate-keyframe scans skipped, %lu replaced/rejected scans, %lu invalid/uncovered points, %lu beyond %.1f m, %lu rejected pose updates",
       static_cast<unsigned long>(integratedScans_), static_cast<unsigned long>(skippedNonKeyframeScans_),
       static_cast<unsigned long>(skippedDuplicateKeyframeScans_), static_cast<unsigned long>(droppedScans_.load()),
-      static_cast<unsigned long>(invalidPoints_), static_cast<unsigned long>(rejectedUpdates_.load()));
+      static_cast<unsigned long>(invalidPoints_), static_cast<unsigned long>(rangeFilteredPoints_), maximumRange_,
+      static_cast<unsigned long>(rejectedUpdates_.load()));
   RCLCPP_INFO(node_->get_logger(), "Global PCD final coverage: %lu received scans; %zu known SLAM keyframes, %zu with map points; DDS losses before receive are not counted",
       static_cast<unsigned long>(receivedScans_.load(std::memory_order_relaxed)),
       keyframesByTime_.size(), selectedKeyframes_.size());

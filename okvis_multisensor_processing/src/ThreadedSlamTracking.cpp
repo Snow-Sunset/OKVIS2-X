@@ -27,7 +27,7 @@ void ThreadedSlam::startBackend() {
     backendStarted_ = false;
     throw;
   }
-  LOG(INFO) << "Independent BRISK tracking enabled: immutable local map, one admitted backend "
+  LOG(INFO) << "Independent tracking enabled: temporal associations with BRISK recovery, immutable local map, one admitted backend "
                "frame at a time; busy candidates remain unadmitted";
 }
 
@@ -96,8 +96,13 @@ MultiFramePtr ThreadedSlam::copyTrackingFrame(const MultiFramePtr& frame) const 
       keys.push_back(key);
       std::memcpy(descriptors.ptr(int(k)), frame->keypointDescriptor(im, k), kBriskBytes);
     }
-    copy->resetKeypoints(im, keys); // Clears landmark IDs: backend associates original observations.
+    copy->resetKeypoints(im, keys); // Backend resolves track IDs against its authoritative graph.
     copy->resetDescriptors(im, descriptors);
+    for (size_t k = 0; k < keys.size(); ++k) {
+      auto track = frame->featureTrack(im, k);
+      track.association = FeatureAssociation::None; // Backend records its own association decision.
+      copy->setFeatureTrack(im, k, track);
+    }
     copy->computeBackProjections(im);
   }
   frontend_.prepareFrameForBackend(copy);
@@ -204,6 +209,38 @@ bool ThreadedSlam::processTrackingFrame() {
   if (!result.valid) trackingLostFrames_.fetch_add(1);
   if (result.valid && frontendStateCallback_)
     frontendStateCallback_(result.state, result.tracking, result.feedbackVersion);
+
+  if (parameters_.output.display_matches) {
+    auto data = std::make_shared<ViVisualizer::VisualizationData>();
+    data->currentFrames = frame; // This frontend-owned frame is immutable after track().
+    data->frontendTracking = true;
+    data->feedbackVersion = result.feedbackVersion;
+    data->T_WS = result.state.T_WS;
+    data->trackingQuality = result.tracking.trackingQuality == TrackingQuality::Good
+        ? ViVisualizer::VisualizationData::TrackingQuality::Good
+        : result.tracking.trackingQuality == TrackingQuality::Marginal
+            ? ViVisualizer::VisualizationData::TrackingQuality::Marginal
+            : ViVisualizer::VisualizationData::TrackingQuality::Lost;
+    data->observations.reserve(frame->numKeypoints());
+    for (size_t im = 0; im < frame->numFrames(); ++im) {
+      const auto extrinsics = result.state.extrinsics.find(im);
+      data->T_SCi.push_back(extrinsics == result.state.extrinsics.end()
+          ? *frame->T_SC(im) : extrinsics->second);
+      for (size_t k = 0; k < frame->numKeypoints(im); ++k) {
+        okvis::Observation observation;
+        observation.frameId = frame->id(); observation.cameraIdx = im; observation.keypointIdx = k;
+        frame->getKeypoint(im, k, observation.keypointMeasurement);
+        frame->getKeypointSize(im, k, observation.keypointSize);
+        observation.track = frame->featureTrack(im, k);
+        observation.landmarkId = frame->landmarkId(im, k);
+        frame->getLandmark(im, k, observation.landmark_W, observation.isInitialized);
+        cv::KeyPoint keypoint; frame->getCvKeypoint(im, k, keypoint);
+        observation.keypointAngle = keypoint.angle;
+        data->observations.push_back(observation);
+      }
+    }
+    trackingVisualisationData_.PushNonBlockingDroppingIfFull(std::move(data), 1);
+  }
 
   // A sparse visual keyframe cadence must not leave a completed LiDAR scan
   // waiting while the backend is idle. Submit an ordinary (non-forced-keyframe)
@@ -324,6 +361,7 @@ void ThreadedSlam::publishTrackingSnapshot() {
     for (auto it = neighbours.rbegin(); it != neighbours.rend() && frames.size() < maxFrames; ++it)
       if (*it != id) frames.push_back(*it);
     std::map<LandmarkId, size_t> pointIndices;
+    std::set<uint64_t> ambiguousTracks;
     const double radius2 = parameters_.frontend.tracking_map_radius
                          * parameters_.frontend.tracking_map_radius;
     const size_t maxPoints = size_t(parameters_.frontend.tracking_max_landmarks);
@@ -335,7 +373,8 @@ void ThreadedSlam::publishTrackingSnapshot() {
           const LandmarkId landmarkId(frame->landmarkId(im, k));
           const auto* descriptor = frame->keypointDescriptor(im, k);
           if (!landmarkId.isInitialised() || !descriptor
-              || !estimator_.isLandmarkAdded(landmarkId)) continue;
+              || !estimator_.isLandmarkAdded(landmarkId)
+              || !estimator_.isObserved(KeypointIdentifier{frameId.value(), im, k})) continue;
           auto existing = pointIndices.find(landmarkId);
           if (existing == pointIndices.end()) {
             if (snapshot->points.size() >= maxPoints) continue;
@@ -350,6 +389,14 @@ void ThreadedSlam::publishTrackingSnapshot() {
             const size_t index = snapshot->points.size();
             snapshot->points.push_back(std::move(copy));
             existing = pointIndices.emplace(landmarkId, index).first;
+          }
+          const auto track = frame->featureTrack(im, k);
+          if (track.id && !ambiguousTracks.count(track.id)) {
+            const auto bound = snapshot->trackLandmarks.emplace(track.id, landmarkId);
+            if (!bound.second && bound.first->second != landmarkId) {
+              snapshot->trackLandmarks.erase(track.id);
+              ambiguousTracks.insert(track.id);
+            }
           }
           auto& descriptors = snapshot->points[existing->second].descriptors;
           if (descriptors.size() >= 3) continue;

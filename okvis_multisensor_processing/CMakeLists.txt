@@ -92,6 +92,10 @@ install(DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/include/okvis DESTINATION ${CMAKE_
 
 if(BUILD_TESTS OR BUILD_POINT_TO_PLANE_TESTS)
   find_package(Threads REQUIRED)
+  add_executable(okvis_feature_track_visualization_test test/TestFeatureTrackVisualization.cpp)
+  target_link_libraries(okvis_feature_track_visualization_test PRIVATE okvis::MultisensorProcessing)
+  add_test(NAME okvis_feature_track_visualization COMMAND okvis_feature_track_visualization_test)
+  set_tests_properties(okvis_feature_track_visualization PROPERTIES TIMEOUT 20)
   add_executable(okvis_bounded_queue_test test/TestBoundedQueue.cpp)
   target_include_directories(okvis_bounded_queue_test PRIVATE include ${GLOG_INCLUDE_DIRS})
   target_link_libraries(okvis_bounded_queue_test PRIVATE ${GLOG_LIBRARIES} Threads::Threads)

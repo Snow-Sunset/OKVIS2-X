@@ -234,7 +234,8 @@ class MultiFrame
   /// @param[in] landmarkId The landmark Id.
   /// \return whether or not the operation was successful.
   inline bool setLandmarkId(size_t cameraIdx, size_t keypointIdx,
-                            uint64_t landmarkId);
+                            uint64_t landmarkId,
+                            FeatureAssociation association = FeatureAssociation::Unknown);
 
   /// \brief Set the landmark ID
   /// @param[in] cameraIdx The camera index.
@@ -250,6 +251,13 @@ class MultiFrame
   /// @param[in] keypointIdx The requested keypoint's index.
   /// \return The landmark Id.
   inline uint64_t landmarkId(size_t cameraIdx, size_t keypointIdx) const;
+
+  inline FeatureTrack featureTrack(size_t cameraIdx, size_t keypointIdx) const {
+    return frames_.at(cameraIdx).featureTrack(keypointIdx);
+  }
+  inline void setFeatureTrack(size_t cameraIdx, size_t keypointIdx, FeatureTrack track) {
+    frames_.at(cameraIdx).setFeatureTrack(keypointIdx, track);
+  }
 
   /// \brief Set the landmark ID
   /// @param[in] cameraIdx The camera index.

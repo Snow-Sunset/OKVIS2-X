@@ -232,6 +232,7 @@ void ViParametersReader::readConfigFile(const std::string& filename) {
       LOG(INFO) << "Parsed LiDAR with the following characteristics: \n" 
                 << "elevation_resolution_angle: " << std::to_string((*viParameters_.lidar).elevation_resolution_angle) << " \n"
                 << "azimuth_resolution_angle: " << std::to_string((*viParameters_.lidar).azimuth_resolution_angle) << "\n"
+                << "maximum_range: " << (*viParameters_.lidar).maximum_range << " m\n"
                 << "T_SL:\n " << s.str();
     }
   } else {
@@ -352,6 +353,23 @@ void ViParametersReader::readConfigFile(const std::string& filename) {
                    viParameters_.frontend.tracking_keyframe_translation);
   readPositiveReal("tracking_keyframe_rotation", frontendDefaults.tracking_keyframe_rotation,
                    viParameters_.frontend.tracking_keyframe_rotation);
+  viParameters_.frontend.use_temporal_tracking = frontendDefaults.use_temporal_tracking;
+  if (!frontendNode["use_temporal_tracking"].empty()) {
+    const auto node = frontendNode["use_temporal_tracking"];
+    OKVIS_ASSERT_TRUE(Exception, !node.isInt() || int(node) == 0 || int(node) == 1,
+                      "use_temporal_tracking must be a boolean")
+    parseEntry(frontendNode, "use_temporal_tracking", viParameters_.frontend.use_temporal_tracking);
+  }
+  readPositiveInteger("track_min_length", frontendDefaults.track_min_length,
+                      viParameters_.frontend.track_min_length);
+  OKVIS_ASSERT_TRUE(Exception, viParameters_.frontend.track_min_length >= 2,
+                    "track_min_length must be at least 2")
+  readPositiveReal("track_min_distance", frontendDefaults.track_min_distance,
+                   viParameters_.frontend.track_min_distance);
+  readPositiveReal("track_max_fb_error", frontendDefaults.track_max_fb_error,
+                   viParameters_.frontend.track_max_fb_error);
+  readPositiveReal("track_max_gap", frontendDefaults.track_max_gap,
+                   viParameters_.frontend.track_max_gap);
 
   // Parameters regarding the estimator.
   const auto estimatorNode = file["estimator_parameters"];
@@ -680,6 +698,13 @@ bool ViParametersReader::getLiDARCalibration(const cv::FileNode& calibrationNode
   lidarParameters.T_SL = okvis::kinematics::Transformation(T_SL);
   lidarParameters.elevation_resolution_angle = calibrationNode["elevation_resolution_angle"];
   lidarParameters.azimuth_resolution_angle = calibrationNode["azimuth_resolution_angle"];
+  const cv::FileNode maximumRangeNode = calibrationNode["maximum_range"];
+  if (!maximumRangeNode.empty()) {
+    if (!maximumRangeNode.isInt() && !maximumRangeNode.isReal()) return false;
+    maximumRangeNode >> lidarParameters.maximum_range;
+  }
+  if (!std::isfinite(lidarParameters.maximum_range) || lidarParameters.maximum_range <= 0.0)
+    return false;
 
   return true;
 }

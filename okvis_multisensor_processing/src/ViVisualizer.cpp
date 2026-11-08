@@ -19,6 +19,9 @@
  */
 
 
+#include <algorithm>
+#include <cmath>
+#include <string>
 #include <okvis/kinematics/Transformation.hpp>
 
 #include <okvis/cameras/NCameraSystem.hpp>
@@ -35,6 +38,42 @@
 
 /// \brief okvis Main namespace of this package.
 namespace okvis {
+namespace {
+
+cv::Scalar trackAgeColor(uint32_t age) {
+  if (age <= 3) return cv::Scalar(40, 40, 255);       // red: 1-3 frames
+  if (age <= 8) return cv::Scalar(0, 165, 255);       // orange: 4-8 frames
+  if (age <= 15) return cv::Scalar(0, 255, 255);      // yellow: 9-15 frames
+  if (age <= 30) return cv::Scalar(0, 255, 0);        // green: 16-30 frames
+  if (age <= 60) return cv::Scalar(255, 255, 0);      // cyan: 31-60 frames
+  return cv::Scalar(255, 0, 255);                     // magenta: 61+ frames
+}
+
+void drawTrackAgeLegend(cv::Mat& image) {
+  if (image.cols < 220 || image.rows < 52) return;
+
+  const int panelWidth = std::min(370, image.cols - 12);
+  const cv::Rect panel(6, 6, panelWidth, 40);
+  cv::Mat background = image(panel).clone();
+  cv::rectangle(background, cv::Rect(0, 0, panel.width, panel.height),
+      cv::Scalar(10, 10, 10), cv::FILLED);
+  cv::addWeighted(background, 0.68, image(panel), 0.32, 0.0, image(panel));
+
+  const char* labels[] = {"1-3", "4-8", "9-15", "16-30", "31-60", "61+"};
+  const uint32_t representativeAges[] = {2, 6, 12, 20, 45, 61};
+  const int cellWidth = panel.width / 3;
+  for (int i = 0; i < 6; ++i) {
+    const int column = i % 3;
+    const int row = i / 3;
+    const cv::Point swatch(panel.x + column * cellWidth + 9,
+        panel.y + 11 + row * 17);
+    cv::circle(image, swatch, 3, trackAgeColor(representativeAges[i]), cv::FILLED, cv::LINE_AA);
+    cv::putText(image, labels[i], cv::Point(swatch.x + 7, swatch.y + 4),
+        cv::FONT_HERSHEY_SIMPLEX, 0.30, cv::Scalar(245, 245, 245), 1, cv::LINE_AA);
+  }
+}
+
+}  // namespace
 
 ViVisualizer::ViVisualizer(ViParameters &parameters)
     : parameters_(parameters) {
@@ -50,174 +89,33 @@ void ViVisualizer::init(ViParameters &parameters) {
   parameters_ = parameters;
 }
 
-cv::Mat ViVisualizer::drawMatches(VisualizationData::Ptr& data,
-                                   size_t image_number) {
+cv::Mat ViVisualizer::drawMatches(VisualizationData::Ptr& data, size_t image_number) {
+  const auto& image = data->currentFrames->image(image_number);
+  if (image.empty()) return {};
+  cv::Mat output;
+  if (image.channels() == 1) cv::cvtColor(image, output, cv::COLOR_GRAY2BGR);
+  else output = image.clone();
 
-  const kinematics::Transformation T_WS = data->T_WS;
-  const kinematics::Transformation T_SC = data->T_SCi.at(image_number);
-  //const kinematics::Transformation T_SC = *parameters_.nCameraSystem.T_SC(image_number);
-  const kinematics::Transformation T_WC = T_WS*T_SC;
-  const kinematics::Transformation T_CW = T_WC.inverse();
-
-  std::shared_ptr<okvis::MultiFrame> frame = data->currentFrames;
-
-  // allocate an image
-  const int im_cols = frame->image(image_number).cols;
-  const int im_rows = frame->image(image_number).rows;
-
-  cv::Mat outimg(im_rows, im_cols, CV_8UC3);
-  cv::Mat current = outimg;
-
-  cv::cvtColor(frame->image(image_number), current, cv::COLOR_GRAY2BGR);
-
-  // loop-closure frame?
-  cv::Mat tmp(im_rows, im_cols, CV_8UC3);
-  if(data->recognisedPlace) {
-    cv::Scalar colour(255,0,0);
-    tmp.setTo(colour);
-    cv::addWeighted(tmp, 0.5, current, 1.0 - 0.5, 0, current);
-    cv::putText(current, "Place recognised", cv::Point2f(200,10), cv::FONT_HERSHEY_COMPLEX, 0.3,
-                colour, 1, cv::LINE_AA);
+  constexpr double fontScale = .35;
+  for (const auto& observation : data->observations) {
+    if (observation.cameraIdx != image_number) continue;
+    const auto& pixel = observation.keypointMeasurement;
+    if (!pixel.allFinite() || pixel.x() < 0 || pixel.y() < 0
+        || pixel.x() >= image.cols || pixel.y() >= image.rows) continue;
+    const cv::Scalar color = trackAgeColor(observation.track.length);
+    const cv::Point point(cvRound(pixel.x()), cvRound(pixel.y()));
+    cv::circle(output, point, 2, color, cv::FILLED, cv::LINE_AA);
+    const std::string label = std::to_string(observation.track.length);
+    int baseline;
+    const auto textSize = cv::getTextSize(label, cv::FONT_HERSHEY_SIMPLEX, fontScale, 1, &baseline);
+    const cv::Point origin(std::max(0, std::min(point.x + 4, image.cols - textSize.width - 2)),
+        std::min(image.rows - 3, std::max(textSize.height + 2, point.y - 4)));
+    cv::putText(output, label, origin, cv::FONT_HERSHEY_SIMPLEX, fontScale,
+        cv::Scalar(0, 0, 0), 2, cv::LINE_AA);
+    cv::putText(output, label, origin, cv::FONT_HERSHEY_SIMPLEX, fontScale, color, 1, cv::LINE_AA);
   }
-
-  // keyframe?
-  if(data->isKeyframe) {
-    cv::Scalar colour(255,255,0);
-    tmp.setTo(colour);
-    cv::addWeighted(tmp, 0.3, current, 1.0 - 0.3, 0, current);
-    cv::putText(current, "Keyframe", cv::Point2f(120,10), cv::FONT_HERSHEY_COMPLEX, 0.3, colour, 1,
-                cv::LINE_AA);
-  }
-
-  // Quality
-  cv::Scalar trackingColour;
-  if(data->trackingQuality == VisualizationData::TrackingQuality::Lost) {
-    trackingColour = cv::Scalar(0,0,255);
-    cv::putText(current, "TRACKING LOST", cv::Point2f(5,10), cv::FONT_HERSHEY_COMPLEX, 0.3,
-                trackingColour, 1, cv::LINE_AA);
-  } else if (data->trackingQuality == VisualizationData::TrackingQuality::Marginal) {
-    trackingColour = cv::Scalar(0,255,255);
-    cv::putText(current, "Tracking marginal", cv::Point2f(5,10), cv::FONT_HERSHEY_COMPLEX, 0.3,
-                trackingColour, 1, cv::LINE_AA);
-  } else {
-    trackingColour = cv::Scalar(0,255,0);
-    cv::putText(current, "Tracking good", cv::Point2f(5,10), cv::FONT_HERSHEY_COMPLEX, 0.3,
-                trackingColour, 1, cv::LINE_AA);
-  }
-
-  // find distortion type
-  okvis::cameras::NCameraSystem::DistortionType distortionType = parameters_.nCameraSystem
-      .distortionType(0);
-  for (size_t i = 1; i < parameters_.nCameraSystem.numCameras(); ++i) {
-    OKVIS_ASSERT_TRUE(Exception,
-                      distortionType == parameters_.nCameraSystem.distortionType(i),
-                      "mixed frame types are not supported yet")
-  }
-
-  for (auto it = data->observations.begin(); it != data->observations.end();
-      ++it) {
-    if (it->cameraIdx != image_number)
-      continue;
-
-    cv::Scalar color;
-
-    if (it->landmarkId != 0) {
-      color = cv::Scalar(255, 0, 0);  // blue
-    } else {
-      color = cv::Scalar(0, 0, 255);  // red
-    }
-
-    // draw matches
-    auto keypoint = it->keypointMeasurement;
-    if (fabs(it->landmark_W[3]) > 1.0e-8) {
-      Eigen::Vector4d hPoint = it->landmark_W;
-      if (it->isInitialized) {
-        color = cv::Scalar(0, 255, 0);  // green
-        if (it->classification == 10 || it->classification == 11) {
-            color = cv::Scalar(0, 80, 0);  // dark green
-        }
-      } else {
-        color = cv::Scalar(0, 255, 255);  // yellow
-        if (it->classification == 10 || it->classification == 11) {
-            color = cv::Scalar(0, 50, 50);  // dark yellew -> olive
-        }
-      }
-      Eigen::Vector2d projection;
-      bool isVisible = false;
-      Eigen::Vector4d hP_C = T_CW * hPoint;
-      switch (distortionType) {
-        case okvis::cameras::NCameraSystem::RadialTangential: {
-          if (frame
-              ->geometryAs<
-                  okvis::cameras::PinholeCamera<
-                      okvis::cameras::RadialTangentialDistortion>>(image_number)
-              ->projectHomogeneous(hP_C, &projection)
-              == okvis::cameras::ProjectionStatus::Successful)
-            isVisible = true;
-          break;
-        }
-        case okvis::cameras::NCameraSystem::Equidistant: {
-          if (frame
-              ->geometryAs<
-                  okvis::cameras::PinholeCamera<
-                      okvis::cameras::EquidistantDistortion>>(image_number)
-              ->projectHomogeneous(hP_C, &projection)
-              == okvis::cameras::ProjectionStatus::Successful)
-            isVisible = true;
-          break;
-        }
-        case okvis::cameras::NCameraSystem::RadialTangential8: {
-          if (frame
-              ->geometryAs<
-                  okvis::cameras::PinholeCamera<
-                      okvis::cameras::RadialTangentialDistortion8>>(
-              image_number)->projectHomogeneous(hP_C, &projection)
-              == okvis::cameras::ProjectionStatus::Successful)
-            isVisible = true;
-          break;
-        }
-        case okvis::cameras::NCameraSystem::NoDistortion: {
-          if (frame->geometryAs<okvis::cameras::EucmCamera>(image_number)->projectHomogeneous(hP_C, &projection)
-          == okvis::cameras::ProjectionStatus::Successful)
-            isVisible = true;
-          break;
-        }
-        default:
-          OKVIS_THROW(Exception, "Unsupported distortion type.")
-          break;
-      }
-      if (fabs(hP_C[3]) > 1.0e-8) {
-        if (hP_C[2] / hP_C[3] < 0.03) {
-          isVisible = false;
-        }
-      }
-
-      // draw projection
-      if(isVisible) {
-        cv::Point2f projectionCv(projection[0], projection[1]);
-        cv::line(current, projectionCv,
-            cv::Point2f(float(keypoint[0]), float(keypoint[1])), color, 1, cv::LINE_AA);
-        cv::circle(current, projectionCv, 2,
-            cv::Scalar(255,255,0), cv::FILLED, cv::LINE_AA);
-        std::stringstream idText;
-        idText << it->landmarkId;
-        cv::putText(current, idText.str(),
-                    cv::Point2f(float(projection[0]), float(projection[1])) + cv::Point2f(10,5),
-                     cv::FONT_HERSHEY_COMPLEX, 0.35, cv::Scalar(255,255,0), 1, cv::LINE_AA);
-      }
-    }
-    // draw keypoint
-    const double r = 0.5 * it->keypointSize;
-    cv::circle(current, cv::Point2f(float(keypoint[0]), float(keypoint[1])), int(r), color, 1,
-        cv::LINE_AA);
-    cv::KeyPoint cvKpt;
-    frame->getCvKeypoint(it->cameraIdx, it->keypointIdx, cvKpt);
-    const float angle = cvKpt.angle / 180.0f * float(M_PI);
-    cv::line(outimg, cvKpt.pt,
-             cv::Point2f(cvKpt.pt.x + float(r) * cos(angle), cvKpt.pt.y + float(r) * sin(angle)),
-             color, 1, cv::LINE_AA);
-  }
-  return outimg;
+  drawTrackAgeLegend(output);
+  return output;
 }
 
 

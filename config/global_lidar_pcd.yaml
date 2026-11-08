@@ -23,7 +23,7 @@
       height_min: -2.0
       height_max: 5.0
       minimum_range: 0.5
-      maximum_range: 150.0
+      maximum_range: 50.0
       max_scan_points: 262144
       max_scan_bytes: 16777216
       max_pending_scan_bytes: 33554432

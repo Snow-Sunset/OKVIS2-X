@@ -91,6 +91,7 @@ void ThreadedSlam::init()
   frontend_.setBriskMatchingThreshold(parameters_.frontend.matching_threshold);
   frontend_.setBriskDetectionMaximumKeypoints(size_t(parameters_.frontend.max_num_keypoints));
   frontend_.setKeyframeInsertionOverlapThreshold(float(parameters_.frontend.keyframe_overlap));
+  frontend_.configureTemporalTracking(parameters_.frontend);
 
   if (parameters_.estimator.memory_bounded) {
     estimator_.configureInMemoryHistory();
@@ -184,7 +185,8 @@ void ThreadedSlam::startThreads()
 
   // visualisation
   if(parameters_.output.display_matches) {
-    visualisationThread_ = std::thread(&ThreadedSlam::visualisationLoop, this);
+    visualisationThread_ = std::thread(&ThreadedSlam::visualisationLoop, this, false);
+    trackingVisualisationThread_ = std::thread(&ThreadedSlam::visualisationLoop, this, true);
   }
 
   //setMainThreadPriority(SCHED_RR, 99);
@@ -1378,6 +1380,10 @@ void ThreadedSlam::optimisePublishMarginalise(MultiFramePtr multiFrame,
         it->cameraIdx = camIndex;
         it->frameId = multiFrame->id();
         it->landmarkId = multiFrame->landmarkId(camIndex, k);
+        it->track = multiFrame->featureTrack(camIndex, k);
+        cv::KeyPoint keypoint;
+        multiFrame->getCvKeypoint(camIndex, k, keypoint);
+        it->keypointAngle = keypoint.angle;
         if (estimator_.isLandmarkAdded(LandmarkId(it->landmarkId)) &&
             estimator_.isObserved(KeypointIdentifier(it->frameId, camIndex, k))) {
           estimator_.getLandmark(LandmarkId(it->landmarkId), landmark);
@@ -1389,6 +1395,8 @@ void ThreadedSlam::optimisePublishMarginalise(MultiFramePtr multiFrame,
             it->isInitialized = false;
         } else {
           it->landmark_W = Eigen::Vector4d(0, 0, 0, 0);
+          it->landmarkId = 0;
+          it->track.association = FeatureAssociation::None;
           // set to infinity to tell visualizer that landmark is not added...
         }
         ++it;
@@ -1449,11 +1457,13 @@ bool ThreadedSlam::needsNewLidarKeyframe()
 
 
 // Loop to process visualisations.
-void ThreadedSlam::visualisationLoop()
+void ThreadedSlam::visualisationLoop(bool frontendTracking)
 {
+  auto& input = frontendTracking ? trackingVisualisationData_ : visualisationData_;
+  auto& output = frontendTracking ? trackingVisualisationImages_ : visualisationImages_;
   while (!shutdown_) {
     ViVisualizer::VisualizationData::Ptr visualisationData;
-    if(visualisationData_.PopBlocking(&visualisationData)) {
+    if(input.PopBlocking(&visualisationData)) {
       std::vector<cv::Mat> outImages(parameters_.nCameraSystem.numCameras());
       for (size_t i = 0; i < parameters_.nCameraSystem.numCameras(); ++i) {
         if(parameters_.nCameraSystem.cameraType(i).isUsed
@@ -1461,7 +1471,7 @@ void ThreadedSlam::visualisationLoop()
           outImages[i] = visualizer_.drawMatches(visualisationData, i);
         }
       }
-      visualisationImages_.PushNonBlockingDroppingIfFull(outImages,1);
+      output.PushNonBlockingDroppingIfFull(outImages,1);
     } else {
       return;
     }
@@ -1503,6 +1513,14 @@ void ThreadedSlam::display(std::map<std::string, cv::Mat> &images)
       if(!outImages[i].empty()) {
         images[name] = outImages[i];
       }
+    }
+  }
+
+  // Image-rate frontend diagnostics have their own bounded queue and topic names.
+  if (trackingVisualisationImages_.PopNonBlocking(&outImages)) {
+    for (size_t i = 0; i < outImages.size(); ++i) {
+      const std::string name = parameters_.nCameraSystem.cameraType(i).isColour ? "rgb" : "cam";
+      if (!outImages[i].empty()) images["tracks_" + name + std::to_string(i)] = outImages[i];
     }
   }
 
@@ -1558,6 +1576,8 @@ void ThreadedSlam::stopThreading() {
   submapAlignmentFactorsReceived_.Shutdown();
   visualisationImages_.Shutdown();
   visualisationData_.Shutdown();
+  trackingVisualisationImages_.Shutdown();
+  trackingVisualisationData_.Shutdown();
   publicationQueue_.Shutdown();
   lastOptimisedQueue_.Shutdown();
 
@@ -1688,6 +1708,7 @@ void ThreadedSlam::stopThreading() {
   if(visualisationThread_.joinable()) {
     visualisationThread_.join();
   }
+  if (trackingVisualisationThread_.joinable()) trackingVisualisationThread_.join();
   if(publishingThread_.joinable()) {
     publishingThread_.join();
   }

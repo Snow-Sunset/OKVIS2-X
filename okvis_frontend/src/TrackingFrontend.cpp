@@ -68,6 +68,7 @@ struct Observation {
   Eigen::Vector2d pixel = Eigen::Vector2d::Zero();
   double information = 1.0;
   unsigned distance = 0;
+  FeatureAssociation association = FeatureAssociation::BriskMap;
 };
 
 struct ImageCoverage {
@@ -157,15 +158,47 @@ std::shared_ptr<ceres::ReprojectionError2dBase> makeError(
 
 AlignedVector<Observation> findMatches(const MultiFrame& frame,
                                       const TrackingSnapshot& snapshot,
-                                      const State& predicted, double threshold) {
+                                      const State& predicted, const FrontendParameters& params,
+                                      const std::map<uint64_t, LandmarkId>& bindings) {
   AlignedVector<Observation> proposals;
+  const double threshold = params.matching_threshold;
+  std::map<LandmarkId, size_t> pointIndices;
+  if (params.use_temporal_tracking)
+    for (size_t i = 0; i < snapshot.points.size(); ++i) pointIndices.emplace(snapshot.points[i].id, i);
   for (size_t camera = 0; camera < frame.numFrames(); ++camera) {
     if (!snapshot.cameras.cameraType(camera).isUsed || frame.image(camera).empty()
         || frame.numKeypoints(camera) == 0)
       continue;
     const auto geometry = snapshot.cameras.cameraGeometry(camera);
+    std::set<size_t> linkedKeypoints, linkedPoints;
+    if (params.use_temporal_tracking) {
+      for (size_t k = 0; k < frame.numKeypoints(camera); ++k) {
+        const auto track = frame.featureTrack(camera, k);
+        if (!track.mature(params.track_min_length)) continue;
+        const auto bound = bindings.find(track.id);
+        if (bound == bindings.end()) continue;
+        const auto point = pointIndices.find(bound->second);
+        if (point == pointIndices.end() || linkedPoints.count(point->second)) continue;
+        Eigen::Vector2d pixel, projection;
+        double size = 0;
+        if (!frame.getKeypoint(camera, k, pixel) || !pixel.allFinite()
+            || pixel.x() < 0 || pixel.y() < 0 || pixel.x() >= geometry->imageWidth()
+            || pixel.y() >= geometry->imageHeight()
+            || !frame.getKeypointSize(camera, k, size) || !std::isfinite(size) || size <= 0
+            || !project(snapshot.cameras, predicted.T_WS, camera, snapshot.points[point->second].point, &projection)
+            || (pixel - projection).norm() > kSearchRadiusPixels) continue;
+        Observation observation;
+        observation.camera = camera; observation.keypoint = k; observation.point = point->second;
+        observation.pixel = pixel; observation.information = 64.0 / (size * size);
+        observation.association = FeatureAssociation::TemporalTrack;
+        proposals.push_back(observation);
+        linkedKeypoints.insert(k); linkedPoints.insert(point->second);
+      }
+    }
     std::map<std::pair<int, int>, std::vector<size_t>> grid;
     for (size_t keypoint = 0; keypoint < frame.numKeypoints(camera); ++keypoint) {
+      if (linkedKeypoints.count(keypoint) || (params.use_temporal_tracking
+          && frame.featureTrack(camera, keypoint).reserved(params.track_min_length))) continue;
       Eigen::Vector2d pixel;
       double size = 0.0;
       if (!frame.getKeypoint(camera, keypoint, pixel) || !pixel.allFinite()
@@ -181,6 +214,7 @@ AlignedVector<Observation> findMatches(const MultiFrame& frame,
     // detectAndDescribe guarantees complete 48-byte BRISK descriptor rows.
     if (!frame.keypointDescriptor(camera, 0)) continue;
     for (size_t pointIndex = 0; pointIndex < snapshot.points.size(); ++pointIndex) {
+      if (linkedPoints.count(pointIndex)) continue;
       const auto& point = snapshot.points[pointIndex];
       if (!point.id.isInitialised() || point.descriptors.empty() || !point.point.allFinite()
           || std::abs(point.point.w()) < 1.0e-12) continue;
@@ -258,6 +292,7 @@ bool TrackingFrontend::selectFeedback(const Time& timestamp,
       // as a watermark so a delayed valid snapshot cannot resurrect the old map.
       feedback_ = std::move(feedback);
       haveAcceptedKeyframe_ = false;
+      trackLandmarks_.clear();
       acceptedKeyframe_ = emptyState(Time(0));
     } else if (feedback->state.timestamp <= timestamp && finiteState(feedback->state)
                && (!feedback_ || !feedback_->initialized
@@ -348,6 +383,19 @@ TrackingFrontend::Result TrackingFrontend::track(
   result.feedbackVersion = feedback_ ? feedback_->version : 0;
   if (!havePrediction) return result;
   result.state.id = StateId(frame->id());
+  if (params_.frontend.use_temporal_tracking) {
+    std::map<uint64_t, LandmarkId> liveBindings;
+    for (size_t im = 0; im < frame->numFrames(); ++im)
+      for (size_t k = 0; k < frame->numKeypoints(im); ++k) {
+        const auto track = frame->featureTrack(im, k);
+        if (!track.id) continue;
+        const auto authoritative = feedback_->trackLandmarks.find(track.id);
+        const auto old = trackLandmarks_.find(track.id);
+        if (authoritative != feedback_->trackLandmarks.end()) liveBindings.emplace(*authoritative);
+        else if (old != trackLandmarks_.end()) liveBindings.emplace(*old);
+      }
+    trackLandmarks_.swap(liveBindings);
+  }
   result.tracking.currentKeyframeId = haveAcceptedKeyframe_ ? acceptedKeyframe_.id : feedback_->state.id;
   lastTrackedTime_ = frame->timestamp();
   haveTrackedFrame_ = true;
@@ -355,7 +403,7 @@ TrackingFrontend::Result TrackingFrontend::track(
       || feedback_->cameras.numCameras() != frame->numFrames()) return result;
 
   const auto observations = findMatches(*frame, *feedback_, result.state,
-      params_.frontend.matching_threshold);
+      params_.frontend, trackLandmarks_);
   result.matches = observations.size();
   if (observations.size() < kMinimumInliers) return result;
 
@@ -433,11 +481,16 @@ TrackingFrontend::Result TrackingFrontend::track(
       ? TrackingQuality::Good : TrackingQuality::Marginal;
   result.requestKeyframe = wantsKeyframe(result.state, result.keyframeOverlap);
   for (size_t i = 0; i < observations.size(); ++i) {
-    if (!inliers[i]) continue;
     const auto& observation = observations[i];
+    const auto track = frame->featureTrack(observation.camera, observation.keypoint);
+    if (!inliers[i]) {
+      if (track.id) trackLandmarks_.erase(track.id);
+      continue;
+    }
     const auto& point = feedback_->points[observation.point];
-    frame->setLandmarkId(observation.camera, observation.keypoint, point.id.value());
+    frame->setLandmarkId(observation.camera, observation.keypoint, point.id.value(), observation.association);
     frame->setLandmark(observation.camera, observation.keypoint, point.point, true);
+    if (track.id) trackLandmarks_[track.id] = point.id;
   }
   return result;
 }

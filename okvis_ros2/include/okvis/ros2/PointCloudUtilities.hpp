@@ -82,9 +82,13 @@ inline void requireField(const sensor_msgs::msg::PointCloud2& msg,
 /// reference is explicit for converted bags whose header denotes the scan end.
 inline size_t lidar2batch(const sensor_msgs::msg::PointCloud2& msg,
     LidarMeasurementBatch& output,
-    OusterTimeReference ousterReference = OusterTimeReference::ScanStart) {
+    OusterTimeReference ousterReference = OusterTimeReference::ScanStart,
+    double maximumRange = 50.0, size_t* rangeFilteredPoints = nullptr) {
   using Field = sensor_msgs::msg::PointField;
   output.clear();
+  if (rangeFilteredPoints) *rangeFilteredPoints = 0;
+  if (!std::isfinite(maximumRange) || maximumRange <= 0.0)
+    throw std::invalid_argument("LiDAR maximum range must be finite and positive");
   if (!msg.width || !msg.height) return 0;
   if (!msg.point_step || uint64_t(msg.width) * msg.point_step > msg.row_step
       || uint64_t(msg.height) * msg.row_step > msg.data.size()
@@ -102,15 +106,21 @@ inline size_t lidar2batch(const sensor_msgs::msg::PointCloud2& msg,
   const auto* high = detail::field(msg, "stamp_high");
   const auto* low = detail::field(msg, "stamp_low");
   const auto* offset = detail::field(msg, "t");
+  const auto* relativeTime = detail::field(msg, "time");
   const bool hesai = absolute != nullptr;
   const bool blk = !hesai && high && low;
   const bool ouster = !hesai && !blk && offset && detail::field(msg, "ring");
+  const bool velodyne = !hesai && !blk && !ouster && relativeTime;
   if (hesai) detail::requireField(msg, absolute, Field::FLOAT64, 8);
   if (blk) {
     detail::requireField(msg, high, Field::UINT32, 4);
     detail::requireField(msg, low, Field::UINT32, 4);
   }
   if (ouster) detail::requireField(msg, offset, Field::UINT32, 4);
+  // Velodyne PointCloud2 messages store a signed FLOAT32 offset in seconds
+  // from the cloud header stamp; some drivers stamp the end of the scan, so
+  // offsets can be negative.
+  if (velodyne) detail::requireField(msg, relativeTime, Field::FLOAT32, 4);
   const uint16_t endianProbe = 1;
   const bool hostBigEndian = *reinterpret_cast<const uint8_t*>(&endianProbe) == 0;
   const bool swapEndian = msg.is_bigendian != hostBigEndian;
@@ -141,6 +151,10 @@ inline size_t lidar2batch(const sensor_msgs::msg::PointCloud2& msg,
           : detail::scalar<double>(p + f->offset, swapEndian);
     }
     if (!ray.allFinite()) { ++invalid; return; }
+    if (ray.norm() > maximumRange) {
+      if (rangeFilteredPoints) ++*rangeFilteredPoints;
+      return;
+    }
     LidarMeasurement measurement;
     measurement.measurement.rayMeasurement = ray;
     measurement.measurement.intensity = 0;
@@ -160,6 +174,16 @@ inline size_t lidar2batch(const sensor_msgs::msg::PointCloud2& msg,
       uint64_t ns = headerNs;
       if (blk) ns = (uint64_t(detail::scalar<uint32_t>(p + high->offset, swapEndian)) << 32)
           | detail::scalar<uint32_t>(p + low->offset, swapEndian);
+      else if (velodyne) {
+        const double seconds = detail::scalar<float>(p + relativeTime->offset, swapEndian);
+        const long double absoluteNs = static_cast<long double>(headerNs)
+            + static_cast<long double>(seconds) * 1000000000.0L;
+        if (!std::isfinite(seconds) || absoluteNs < 0.0L
+            || absoluteNs > static_cast<long double>(maxTimeNs)) {
+          ++invalid; return;
+        }
+        ns = static_cast<uint64_t>(std::llround(absoluteNs));
+      }
       else if (ouster && ousterReference != OusterTimeReference::Header)
         ns += detail::scalar<uint32_t>(p + offset->offset, swapEndian);
       if (ns > maxTimeNs) { ++invalid; return; }

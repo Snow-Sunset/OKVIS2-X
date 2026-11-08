@@ -117,6 +117,11 @@ struct FrontendParameters {
   bool use_cnn; ///< Use the CNN (if available) to filter out dynamic content / sky.
   bool parallelise_detection; ///< Run parallel detect & describe.
   int num_matching_threads; ///< Parallelise matching with this number of threads.
+  bool use_temporal_tracking = true; ///< LK tracks, reserved young tracks and BRISK map recovery.
+  int track_min_length = 3; ///< Consecutive image observations before temporal landmark creation.
+  double track_min_distance = 20.0; ///< Circular exclusion radius for tracked features. [pixels]
+  double track_max_fb_error = 1.0; ///< Maximum forward/backward LK round-trip error. [pixels]
+  double track_max_gap = 0.5; ///< Reset image tracks after a larger image interval. [s]
   bool independent_tracking = true; ///< Separate online tracking from the sliding-window backend.
   int tracking_max_landmarks = 2000; ///< Maximum landmarks in an immutable tracking map snapshot.
   double tracking_map_radius = 50.0; ///< Tracking map radius around the feedback pose. [m]
@@ -180,6 +185,7 @@ struct LidarParameters {
     okvis::kinematics::Transformation T_SL;   ///< Transformation from LiDAR to sensor (IMU) frame.
     float elevation_resolution_angle; ///< Resolution angle for the elevation of the LiDAR sensor
     float azimuth_resolution_angle; ///< Resolution angle for the azimuth of the LiDAR sensor
+    double maximum_range = 50.0; ///< Maximum accepted LiDAR point range [m].
 };
 
 

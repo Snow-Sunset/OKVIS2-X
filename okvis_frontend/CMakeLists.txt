@@ -3,6 +3,7 @@ cmake_minimum_required(VERSION 3.8...3.30)
 find_package(Eigen3 REQUIRED)
 find_package(Glog REQUIRED)
 find_package(Threads REQUIRED)
+find_package(OpenCV REQUIRED COMPONENTS core imgproc highgui features2d calib3d video)
 if(USE_SYSTEM_BRISK)
   find_package(brisk REQUIRED)
 endif()
@@ -32,6 +33,8 @@ add_library(${LIB_NAME}
   src/Frontend.cpp
   src/FrontendPlaceRecognition.cpp
   src/TrackingFrontend.cpp
+  src/TemporalFeatureTracker.cpp
+  src/TemporalMatching.cpp
   src/LoopclosureNoncentralAbsoluteAdapter.cpp
   src/stereo_triangulation.cpp
 )
@@ -98,6 +101,11 @@ install(TARGETS ${LIB_NAME} EXPORT okvisTargets
 install(DIRECTORY include/okvis DESTINATION ${CMAKE_INSTALL_INCLUDEDIR} FILES_MATCHING PATTERN "*.hpp")
 
 if(BUILD_TESTS OR BUILD_POINT_TO_PLANE_TESTS)
+  add_executable(okvis_temporal_frontend_test test/TestTemporalFrontend.cpp)
+  target_link_libraries(okvis_temporal_frontend_test PRIVATE okvis::Frontend ${OpenCV_LIBS})
+  add_test(NAME okvis_temporal_frontend COMMAND okvis_temporal_frontend_test
+    "${CMAKE_CURRENT_SOURCE_DIR}/../resources")
+  set_tests_properties(okvis_temporal_frontend PROPERTIES TIMEOUT 60)
   add_executable(okvis_tracking_frontend_test test/TestTrackingFrontend.cpp)
   target_link_libraries(okvis_tracking_frontend_test PRIVATE okvis::Frontend Threads::Threads)
   add_test(NAME okvis_tracking_frontend COMMAND okvis_tracking_frontend_test)

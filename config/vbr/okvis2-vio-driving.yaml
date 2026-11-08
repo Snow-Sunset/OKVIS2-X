@@ -1,0 +1,95 @@
+%YAML:1.0
+# campus_train0: stereo + IMU only; LK track diagnostics, no LiDAR or submapping.
+cameras:
+  - T_SC: [0.0119141292438965, -0.000945065440359438, 0.99992857763726, 0.0879708589133336,
+      -0.999869806417975, -0.0108942944723105, 0.0119031324293728, 0.239589670676148,
+      0.0108822671369679, -0.999940208812139, -0.00107473843126882, -0.0776205608408237,
+      0.0, 0.0, 0.0, 1.0]
+    image_dimension: [1388, 700]
+    distortion_coefficients: [-0.10572495, 0.2426826, -0.00141098, -0.00577569]
+    distortion_type: radialtangential
+    focal_length: [1282.79698152, 1283.56137502]
+    principal_point: [683.48271639, 345.04730772]
+    cam_model: pinhole
+    camera_type: gray
+    mapping: false
+    mapping_rectification: false
+    slam_use: okvis
+  - T_SC: [0.0522904883845883, 0.00752371052953171, 0.998603574299817, 0.092607244896494,
+      -0.998617430028675, -0.00499222960927059, 0.0523288265342721, -0.251414693982497,
+      0.00537896527473669, -0.999959234880801, 0.00725226234888354, -0.0825889295500195,
+      0.0, 0.0, 0.0, 1.0]
+    image_dimension: [1388, 700]
+    distortion_coefficients: [-0.11189064, 0.27022719, -0.0011909, -0.00119663]
+    distortion_type: radialtangential
+    focal_length: [1286.97877645, 1287.17303603]
+    principal_point: [687.96374444, 345.34980449]
+    cam_model: pinhole
+    camera_type: gray
+    mapping: false
+    mapping_rectification: false
+    slam_use: okvis
+camera_parameters:
+  timestamp_tolerance: 0.005
+  sync_cameras: [0, 1]
+  image_delay: 0.0
+  online_calibration: {do_extrinsics: false, do_extrinsics_final_ba: false, sigma_r: 0.01, sigma_alpha: 0.1, sigma_r_final_ba: 0.02, sigma_alpha_final_ba: 0.2}
+  deep_stereo_indices: [0, 1]
+  fov_scale: 1.0
+imu_parameters:
+  use: true
+  a_max: 176.0
+  g_max: 7.8
+  sigma_g_c: 0.008
+  sigma_a_c: 0.02
+  sigma_bg: 0.01
+  sigma_ba: 0.01
+  sigma_gw_c: 0.0002
+  sigma_aw_c: 0.0006
+  g: 9.81007
+  g0: [0.0, 0.0, 0.0]
+  a0: [0.07, 0.03, -0.11]
+  s_a: [1.0, 1.0, 1.0]
+  T_BS: [0.9994652045891429, 0.03194161690749185, -0.00698788259543323, -0.045630250613467524,
+    -0.03200263570684775, 0.9994490166874298, -0.008798074077210848, -0.00784852988506693,
+    0.006703021917434096, 0.009017052443448963, 0.9999368527795895, -0.6084150115067585,
+    0.0, 0.0, 0.0, 1.0]
+frontend_parameters:
+  use_temporal_tracking: true
+  detection_threshold: 50.0
+  absolute_threshold: 5.0
+  matching_threshold: 60.0
+  octaves: 0
+  max_num_keypoints: 1000
+  keyframe_overlap: 0.6
+  use_cnn: false
+  parallelise_detection: true
+  num_matching_threads: 4
+  independent_tracking: true # online Tracking / sliding-window backend separation
+  tracking_max_landmarks: 2000 # immutable local-map snapshot point cap
+  tracking_map_radius: 50.0 # m; radius around the feedback pose
+  tracking_max_keyframe_interval: 0.25 # sensor seconds; request backend candidate
+  tracking_keyframe_translation: 0.5 # m; request backend candidate
+  tracking_keyframe_rotation: 0.15 # rad; request backend candidate
+estimator_parameters:
+  # Cold images are released; loop-closure features stay in RAM. No history disk archive.
+  memory_bounded: true
+  # Preserve scan-time coverage while the independent backend is behind.
+  # Complete live scans use packed storage, bounded by count AND payload bytes.
+  realtime_lidar_buffer_scans: 16
+  realtime_lidar_buffer_bytes: 67108864
+  num_keyframes: 5
+  num_loop_closure_frames: 3
+  num_imu_frames: 3
+  do_loop_closures: true
+  do_final_ba: true
+  enforce_realtime: false
+  realtime_min_iterations: 3
+  realtime_max_iterations: 10
+  realtime_time_limit: 0.035
+  realtime_num_threads: 3
+  full_graph_iterations: 15
+  full_graph_num_threads: 3
+  p_dbow: 0.55
+  drift_percentage_heuristic: 10.0
+output_parameters: {display_topview: true, display_matches: true, display_overhead: false, enable_submapping: false}

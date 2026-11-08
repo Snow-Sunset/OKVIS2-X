@@ -6,6 +6,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <map>
 #include <vector>
 
 #include <okvis/Measurements.hpp>
@@ -33,9 +34,10 @@ struct TrackingSnapshot {
   bool initialized = false;
   cameras::NCameraSystem cameras;
   AlignedVector<TrackingMapPoint> points;
+  std::map<uint64_t, LandmarkId> trackLandmarks; ///< Live track bindings, copied after graph updates.
 };
 
-/// Single-consumer BRISK tracker. Only this frame's six-DoF pose is optimized.
+/// Single-consumer temporal tracker with BRISK recovery. Only this frame's pose is optimized.
 /// Features must have been detected/described before track() is called.
 class TrackingFrontend {
  public:
@@ -83,6 +85,7 @@ class TrackingFrontend {
   Time lastTrackedTime_;
   bool haveAcceptedKeyframe_ = false;
   bool haveTrackedFrame_ = false;
+  std::map<uint64_t, LandmarkId> trackLandmarks_; ///< Bounded by current image tracks.
 };
 
 }  // namespace okvis

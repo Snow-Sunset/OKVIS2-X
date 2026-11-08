@@ -39,6 +39,7 @@
 #pragma GCC diagnostic pop
 
 #include <okvis/Time.hpp>
+#include <okvis/FeatureTrack.hpp>
 #include <okvis/assert_macros.hpp>
 #include "okvis/cameras/CameraBase.hpp"
 
@@ -90,6 +91,7 @@ class Frame
     descriptors_ = other.descriptors_; classifications_ = other.classifications_;
     landmarkIds_ = other.landmarkIds_; landmarks_ = other.landmarks_;
     landmarkInitialisations_ = other.landmarkInitialisations_;
+    featureTracks_ = other.featureTracks_;
   }
 
   /// \brief Default destructor
@@ -199,7 +201,8 @@ class Frame
   /// @param[in] keypointIdx The requested keypoint's index.
   /// @param[in] landmarkId The landmark Id.
   /// \return whether or not the operation was successful.
-  inline bool setLandmarkId(size_t keypointIdx, uint64_t landmarkId);
+  inline bool setLandmarkId(size_t keypointIdx, uint64_t landmarkId,
+                           FeatureAssociation association = FeatureAssociation::Unknown);
 
   /// \brief Set the landmark.
   /// @param[in] keypointIdx The requested keypoint's index.
@@ -212,6 +215,16 @@ class Frame
   /// @param[in] keypointIdx The requested keypoint's index.
   /// \return The landmark Id.
   inline uint64_t landmarkId(size_t keypointIdx) const;
+
+  inline FeatureTrack featureTrack(size_t keypointIdx) const {
+    ensurePayload();
+    return featureTracks_.at(keypointIdx);
+  }
+  inline void setFeatureTrack(size_t keypointIdx, FeatureTrack track) {
+    ensurePayload();
+    payloadDirty_ = true;
+    featureTracks_.at(keypointIdx) = track;
+  }
 
   /// \brief Get the landmark.
   /// @param[in] keypointIdx The requested keypoint's index.
@@ -265,6 +278,7 @@ class Frame
   mutable cv::Mat descriptors_;  ///< we store the descriptors using OpenCV's matrices
   mutable cv::Mat classifications_; ///< per keypoint classification.
   mutable std::vector<uint64_t> landmarkIds_;  ///< landmark Id, if associated -- 0 otherwise
+  mutable std::vector<FeatureTrack> featureTracks_;
   mutable std::vector<Eigen::Vector4d, Eigen::aligned_allocator<Eigen::Vector4d>> landmarks_; ///< pos in C.
   mutable std::vector<bool> landmarkInitialisations_; ///< Store landmark initialisation stati.
   std::function<void()> payloadLoadedCallback_;

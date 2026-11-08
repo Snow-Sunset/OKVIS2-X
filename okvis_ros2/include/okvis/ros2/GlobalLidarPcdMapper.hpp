@@ -140,7 +140,7 @@ class GlobalLidarPcdMapper {
   std::optional<uint64_t> latestStateTimeNs_;
   std::set<StateId> selectedKeyframes_;
   std::optional<StateId> activeKeyframe_;
-  uint64_t sequence_ = 0, integratedScans_ = 0, invalidPoints_ = 0;
+  uint64_t sequence_ = 0, integratedScans_ = 0, invalidPoints_ = 0, rangeFilteredPoints_ = 0;
   uint64_t skippedNonKeyframeScans_ = 0, skippedDuplicateKeyframeScans_ = 0;
   std::optional<Time> lastConsumedTime_;
   Time latestTimestamp_;

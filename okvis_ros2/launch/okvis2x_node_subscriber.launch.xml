@@ -4,7 +4,14 @@
     <arg name="config_filename" default="" />
     <arg name="se_config_filename" default="" />
     <arg name="lidar" default="false"/>
+    <arg name="vio" default="false"/>
     <arg name="lidar_ouster_time_reference" default="scan_start"/>
+    <arg name="cam0_topic" default="/camera_left/image_raw"/>
+    <arg name="cam1_topic" default="/camera_right/image_raw"/>
+    <arg name="imu_topic" default="/imu/data"/>
+    <arg name="lidar_topic" default="/ouster/points"/>
+    <!-- Use compressed_cuda for nvJPEG GPU decode of CompressedImage topics. -->
+    <arg name="image_transport" default="raw"/>
     <arg name="depth_image" default="false"/>
     <arg name="stereo_network" default="false"/>
     <arg name="depth_fusion" default="false"/>
@@ -45,6 +52,21 @@
         <remap from="/okvis/imu0" to="/rmf_owl/okvis_imu0"/>
     </node>
 
+    <node pkg="okvis" exec="okvis2x_node_subscriber" name="okvis" namespace="okvis" if="$(var vio)">
+        <param name="config_filename" value="$(var config_filename)"/>
+        <param name="se_config_filename" value="$(var se_config_filename)"/>
+        <param name="image_transport" value="$(var image_transport)"/>
+        <param name="csv_path" value="$(var csv_path)"/>
+        <param name="mesh_cutoff_z" type="float" value="$(var mesh_cutoff_z)"/>
+        <param name="save_submap_meshes" value="false"/>
+        <param name="mesh_file" value="file://$(find-pkg-share okvis)/resources/meshes/$(var mesh)"/>
+        <remap from="/okvis/cam0/image_raw" to="$(var cam0_topic)"/>
+        <remap from="/okvis/cam1/image_raw" to="$(var cam1_topic)"/>
+        <remap from="/okvis/cam0/image_raw/compressed" to="$(var cam0_topic)/compressed"/>
+        <remap from="/okvis/cam1/image_raw/compressed" to="$(var cam1_topic)/compressed"/>
+        <remap from="/okvis/imu0" to="$(var imu_topic)"/>
+    </node>
+
     <node pkg="okvis" exec="okvis2x_node_subscriber" name="okvis" namespace="okvis" if="$(var lidar)">
         <param name="global_lidar_pcd.enabled" type="bool" value="$(var global_lidar_pcd)"/>
         <param name="global_lidar_pcd.output_file" type="str" value="$(var global_lidar_pcd_file)"/>
@@ -58,19 +80,22 @@
         <!--param name="imu_propagated_state_publishing_rate" type="float" value="40.0"/-->
         <param name="config_filename" value="$(var config_filename)"/>
         <param name="se_config_filename" value="$(var se_config_filename)"/>
+        <param name="image_transport" value="$(var image_transport)"/>
         <param name="csv_path" value="$(var csv_path)"/>
         <param name="mesh_cutoff_z" type="float" value="$(var mesh_cutoff_z)"/>
         <param name="save_submap_meshes" value="$(var save_submap_meshes)"/>
         <param name="mesh_file" value="file://$(find-pkg-share okvis)/resources/meshes/$(var mesh)"/>
         <!-- Change the topic whatever you want in to="topic" -->
-        <!-- Hilti22 -->
-        <remap from="/okvis/cam0/image_raw" to="/camera_left/image_raw"/>
-        <remap from="/okvis/cam1/image_raw" to="/camera_right/image_raw"/>
+        <!-- Default topics can be overridden for dataset-specific bags. -->
+        <remap from="/okvis/cam0/image_raw" to="$(var cam0_topic)"/>
+        <remap from="/okvis/cam1/image_raw" to="$(var cam1_topic)"/>
+        <remap from="/okvis/cam0/image_raw/compressed" to="$(var cam0_topic)/compressed"/>
+        <remap from="/okvis/cam1/image_raw/compressed" to="$(var cam1_topic)/compressed"/>
         <remap from="/okvis/cam2/image_raw" to="/alphasense/cam2/image_raw"/>
         <remap from="/okvis/cam3/image_raw" to="/alphasense/cam3/image_raw"/>
         <remap from="/okvis/cam4/image_raw" to="/alphasense/cam4/image_raw"/>
-        <remap from="/okvis/lidar" to="/ouster/points"/>
-        <remap from="/okvis/imu0" to="/imu/data"/>
+        <remap from="/okvis/lidar" to="$(var lidar_topic)"/>
+        <remap from="/okvis/imu0" to="$(var imu_topic)"/>
     </node>
 
     <node pkg="okvis" exec="okvis2x_stereo_network_node_subscriber" name="okvis" namespace="okvis" if="$(var stereo_network)">

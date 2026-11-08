@@ -255,10 +255,10 @@ const unsigned char * MultiFrame::keypointDescriptor(size_t cameraIdx,
 
 // Set the landmark ID
 bool MultiFrame::setLandmarkId(size_t cameraIdx, size_t keypointIdx,
-                               uint64_t landmarkId)
+                               uint64_t landmarkId, FeatureAssociation association)
 {
   OKVIS_ASSERT_TRUE_DBG(Exception, cameraIdx < frames_.size(), "Out of range")
-  return frames_[cameraIdx].setLandmarkId(keypointIdx, landmarkId);
+  return frames_[cameraIdx].setLandmarkId(keypointIdx, landmarkId, association);
 }
 
 bool MultiFrame::setLandmark(size_t cameraIdx, size_t keypointIdx,

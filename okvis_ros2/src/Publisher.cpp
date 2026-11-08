@@ -457,6 +457,8 @@ void Publisher::setupImageTopics(const okvis::cameras::NCameraSystem & nCameraSy
       name = "cam"+std::to_string(i);
     }
     pubImages_[name] = threadedImagePublisher_->registerPublisher<sensor_msgs::msg::Image>(name+"_matches");
+    pubImages_["tracks_" + name] = threadedImagePublisher_->registerPublisher<sensor_msgs::msg::Image>(
+        name + "_tracks");
   }
   std::string name = "Top Debug View";
   pubImages_[name] = threadedImagePublisher_->registerPublisher<sensor_msgs::msg::Image>("top_debug_view");

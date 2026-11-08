@@ -19,6 +19,7 @@
 
 #ifndef INCLUDE_OKVIS_FRAMETYPEDEFS_HPP_
 #define INCLUDE_OKVIS_FRAMETYPEDEFS_HPP_
+#include <okvis/FeatureTrack.hpp>
 
 #include <map>
 #include <unordered_map>
@@ -306,6 +307,8 @@ struct Observation
   uint64_t landmarkId;  ///< unique landmark ID
   bool isInitialized;  ///< Initialisation status of landmark
   int classification;  ///< Class ID of classification (if enabled).
+  FeatureTrack track; ///< Frozen track length and actual association source for visualisation.
+  float keypointAngle = -1.f;
 };
 
 /// \brief Vector of observations.

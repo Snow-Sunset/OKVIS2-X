@@ -323,7 +323,7 @@ private:
                                   ImuMeasurementDeque frameImuMeasurements);
 
   /// \brief Performs visualisation in the background.
-  void visualisationLoop();
+  void visualisationLoop(bool frontendTracking);
 
   /// \brief Performs publishing in the background.
   void publishingLoop();
@@ -385,12 +385,14 @@ private:
 
   /// The queue containing the matching data
   threadsafe::Queue<ViVisualizer::VisualizationData::Ptr> visualisationData_;
+  threadsafe::Queue<ViVisualizer::VisualizationData::Ptr> trackingVisualisationData_;
 
   /// The queue containing the actual overhead display images
   threadsafe::Queue<cv::Mat> overheadImages_;
 
   /// The queue containing the actual matching display images
   threadsafe::Queue<std::vector<cv::Mat>> visualisationImages_;
+  threadsafe::Queue<std::vector<cv::Mat>> trackingVisualisationImages_;
 
   ViVisualizer visualizer_; ///< The matching visualiser.
 
@@ -400,6 +402,7 @@ private:
   /// @{
 
   std::thread visualisationThread_; ///< Thread running visualisation.
+  std::thread trackingVisualisationThread_; ///< Renders current image tracks without blocking tracking.
   std::thread publishingThread_; ///< Thread running publishing.
 
   /// @}

@@ -340,6 +340,48 @@ void inactiveCameraCoverageChecks(const cameras::NCameraSystem& source) {
         "Disabled or image-less cameras incorrectly requested a new keyframe");
 }
 
+void temporalAssociationChecks(const cameras::NCameraSystem& cameras) {
+  auto params = parameters(cameras);
+  params.imu.use = false;
+  TrackingFrontend tracker(params);
+  auto feedback = snapshot(cameras, 1, stateAt(10.0));
+  const auto identity = kinematics::Transformation::Identity();
+  const auto trackedFrame = [&](double timestamp, uint64_t id, uint32_t length, bool corrupt) {
+    auto output = frame(*feedback, timestamp, id, identity);
+    for (size_t im = 0; im < output->numFrames(); ++im)
+      for (size_t k = 0; k < output->numKeypoints(im); ++k)
+        output->setFeatureTrack(im, k, FeatureTrack{1000 + im * 100 + k, length});
+    if (corrupt)
+      output->resetDescriptors(0, cv::Mat::zeros(int(feedback->points.size()), 48, CV_8UC1));
+    return output;
+  };
+  // New image tracks can recover through BRISK before they have any map binding.
+  auto seed = trackedFrame(10.1, 2, 1, false);
+  check(tracker.track(seed, feedback, {}).valid,
+        "New image tracks could not recover map bindings through BRISK");
+  check(seed->featureTrack(0, 0).association == FeatureAssociation::BriskMap,
+        "BRISK map recovery was mislabeled as temporal association");
+  const auto young = tracker.track(trackedFrame(10.12, 3, 2, false), feedback, {});
+  check(!young.valid && young.matches == 0, "Reserved young tracks entered map matching");
+  auto mature = trackedFrame(10.14, 4, 3, true);
+  const auto associated = tracker.track(mature, feedback, {});
+  check(associated.valid && associated.inliers == feedback->points.size(),
+        "Mature tracks needed BRISK descriptors despite continuous track bindings");
+  check(mature->featureTrack(0, 0).association == FeatureAssociation::TemporalTrack,
+        "Mature track association did not preserve its actual source");
+
+  // A graph merge arrives after several image frames; its binding must replace the local one.
+  auto merged = std::make_shared<TrackingSnapshot>(*feedback);
+  merged->version = 2;
+  for (size_t k = 0; k < merged->points.size(); ++k) {
+    merged->points[k].id = LandmarkId(500 + k);
+    merged->trackLandmarks.emplace(1000 + k, merged->points[k].id);
+  }
+  auto next = trackedFrame(10.16, 5, 4, true);
+  check(tracker.track(next, merged, {}).valid && next->landmarkId(0, 0) == 500,
+        "Delayed authoritative graph binding did not replace the old landmark ID");
+}
+
 void run() {
   using RadTan = cameras::PinholeCamera<cameras::RadialTangentialDistortion>;
   using Equidistant = cameras::PinholeCamera<cameras::EquidistantDistortion>;
@@ -350,6 +392,10 @@ void run() {
   coverageKeyframeChecks(cameras);
   inactiveCameraCoverageChecks(cameras);
   geometricChecks(cameras);
+  temporalAssociationChecks(cameras);
+  temporalAssociationChecks(cameraSystem(Equidistant::createTestObject(), cameras::NCameraSystem::Equidistant));
+  temporalAssociationChecks(cameraSystem(RadTan8::createTestObject(), cameras::NCameraSystem::RadialTangential8));
+  temporalAssociationChecks(cameraSystem(cameras::EucmCamera::createTestObject(), cameras::NCameraSystem::NoDistortion));
   geometricChecks(cameraSystem(Equidistant::createTestObject(), cameras::NCameraSystem::Equidistant));
   geometricChecks(cameraSystem(RadTan8::createTestObject(), cameras::NCameraSystem::RadialTangential8));
   geometricChecks(cameraSystem(cameras::EucmCamera::createTestObject(), cameras::NCameraSystem::NoDistortion));

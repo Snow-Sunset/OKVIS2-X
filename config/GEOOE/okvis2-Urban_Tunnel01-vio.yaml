@@ -1,0 +1,104 @@
+%YAML:1.0
+# GEOOE Urban_Tunnel01 VIO-only: stereo cameras + IMU, no LiDAR input.
+# T_SC is copied from T_IMU_CamL/R (camera frame into IMU frame).
+cameras:
+  - T_SC: [0.00458595, -0.00877931, 0.99995095, 0.13519371,
+      -0.99997425, 0.00548025, 0.00463417, 0.15905829,
+      -0.00552066, -0.99994644, -0.00875395, 0.00537348,
+      0.0, 0.0, 0.0, 1.0]
+    image_dimension: [1224, 1024]
+    distortion_coefficients: [-0.054564387916302, 0.118401668712345,
+      -0.00005660201404086453, 0.0001663858521146268, -0.0347627411856, 0.0, 0.0, 0.0]
+    distortion_type: radialtangential8
+    focal_length: [1178.885033542471, 1179.140805904268]
+    principal_point: [606.6447526169975, 520.465787177123]
+    cam_model: pinhole
+    camera_type: gray
+    mapping: false
+    mapping_rectification: false
+    slam_use: okvis
+  - T_SC: [0.00166323, -0.01109482, 0.99993707, 0.13552398,
+      -0.99999725, 0.00163484, 0.00168147, -0.19660059,
+      -0.00165339, -0.99993711, -0.01109208, 0.01715528,
+      0.0, 0.0, 0.0, 1.0]
+    image_dimension: [1224, 1024]
+    distortion_coefficients: [-0.054720755161749, 0.121867423561453,
+      0.0002761411734940336, 0.0002831601051633437, -0.044701434206636, 0.0, 0.0, 0.0]
+    distortion_type: radialtangential8
+    focal_length: [1176.065196992534, 1176.141807045666]
+    principal_point: [622.8164261295069, 510.4913682341769]
+    cam_model: pinhole
+    camera_type: gray
+    mapping: false
+    mapping_rectification: false
+    slam_use: okvis
+
+camera_parameters:
+  timestamp_tolerance: 0.005
+  sync_cameras: [0, 1]
+  image_delay: 0.0
+  online_calibration: {do_extrinsics: false, do_extrinsics_final_ba: false,
+    sigma_r: 0.01, sigma_alpha: 0.1, sigma_r_final_ba: 0.02, sigma_alpha_final_ba: 0.2}
+  deep_stereo_indices: [0, 1]
+  fov_scale: 1.0
+
+imu_parameters:
+  use: true
+  a_max: 176.0
+  g_max: 7.8
+  sigma_g_c: 0.009669083592885673
+  sigma_a_c: 0.010481546278947311
+  sigma_bg: 0.01
+  sigma_ba: 0.1
+  sigma_gw_c: 0.00008288787586563574
+  sigma_aw_c: 0.00018451561389195461
+  g: 9.81007
+  g0: [0.0, 0.0, 0.0]
+  a0: [0.0, 0.0, 0.0]
+  s_a: [1.0, 1.0, 1.0]
+  # Use the IMU as the body reference frame.
+  T_BS: [1.0, 0.0, 0.0, 0.0,
+    0.0, 1.0, 0.0, 0.0,
+    0.0, 0.0, 1.0, 0.0,
+    0.0, 0.0, 0.0, 1.0]
+
+frontend_parameters:
+  use_temporal_tracking: true
+  detection_threshold: 50.0
+  absolute_threshold: 5.0
+  matching_threshold: 60.0
+  octaves: 0
+  max_num_keypoints: 1000
+  keyframe_overlap: 0.6
+  use_cnn: false
+  parallelise_detection: true
+  num_matching_threads: 4
+  independent_tracking: true
+  tracking_max_landmarks: 2000
+  tracking_map_radius: 50.0
+  tracking_max_keyframe_interval: 0.25
+  tracking_keyframe_translation: 0.5
+  tracking_keyframe_rotation: 0.15
+
+estimator_parameters:
+  memory_bounded: true
+  num_keyframes: 5
+  num_loop_closure_frames: 3
+  num_imu_frames: 3
+  do_loop_closures: true
+  do_final_ba: true
+  enforce_realtime: false
+  realtime_min_iterations: 3
+  realtime_max_iterations: 10
+  realtime_time_limit: 0.035
+  realtime_num_threads: 3
+  full_graph_iterations: 15
+  full_graph_num_threads: 3
+  p_dbow: 0.55
+  drift_percentage_heuristic: 10.0
+
+output_parameters:
+  display_topview: true
+  display_matches: true
+  display_overhead: false
+  enable_submapping: false

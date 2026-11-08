@@ -25,6 +25,7 @@
 #include <memory>
 #include <mutex>
 #include <thread>
+#include <vector>
 
 #include <boost/shared_ptr.hpp>
 #include <chrono>
@@ -37,6 +38,7 @@
   #include <cv_bridge/cv_bridge.h> // ros2 changed to .hpp some point...
 #endif
 #include <sensor_msgs/msg/image.hpp>
+#include <sensor_msgs/msg/compressed_image.hpp>
 #include <sensor_msgs/msg/imu.hpp>
 #include <sensor_msgs/msg/point_cloud2.hpp>
 #include <std_msgs/msg/bool.hpp>
@@ -58,6 +60,8 @@
 
 /// \brief okvis Main namespace of this package.
 namespace okvis {
+
+class NvJpegDecoder;
 
 /**
  * @brief This class handles all the buffering of incoming data.
@@ -104,6 +108,10 @@ class Subscriber
   void imageCallback(const sensor_msgs::msg::Image::ConstSharedPtr& msg,
                      unsigned int cameraIndex, bool isColour = false);
 
+  /// @brief Decode a JPEG image on the GPU and buffer it for stereo synchronization.
+  void compressedImageCallback(const sensor_msgs::msg::CompressedImage::ConstSharedPtr& msg,
+                               unsigned int cameraIndex, bool isColour = false);
+
   /// @brief The IMU callback.
   void imuCallback(const sensor_msgs::msg::Imu& msg);
 
@@ -128,6 +136,9 @@ class Subscriber
   std::shared_ptr<rclcpp::Node> node_; ///< The node handle.
   std::shared_ptr<image_transport::ImageTransport> imgTransport_; ///< The image transport.
   std::vector<image_transport::Subscriber> imageSubscribers_; ///< The image message subscriber.
+  std::vector<rclcpp::Subscription<sensor_msgs::msg::CompressedImage>::SharedPtr>
+      compressedImageSubscribers_; ///< Direct JPEG subscribers for GPU decode.
+  std::vector<std::unique_ptr<NvJpegDecoder>> cudaJpegDecoders_; ///< Per-camera nvJPEG decoders.
   std::vector<image_transport::Subscriber> depthImageSubscribers_; ///< The depth image message subscriber
   rclcpp::Subscription<sensor_msgs::msg::Imu>::SharedPtr subImu_;  ///< The IMU message subscriber.
   rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr subLiDAR_;  ///< The LiDAR message subscriber.
@@ -161,6 +172,7 @@ class Subscriber
   std::atomic<uint64_t> lidarScansDropped_{0};
   std::atomic<uint64_t> lidarPointsReceived_{0};
   std::atomic<uint64_t> lidarInvalidPoints_{0};
+  std::atomic<uint64_t> lidarRangeFilteredPoints_{0};
   std::atomic<uint64_t> lidarRegressingPoints_{0};
   std::atomic<uint64_t> lidarEstimatorRejectedBatches_{0};
   std::atomic<uint64_t> lidarSubmappingRejectedBatches_{0};

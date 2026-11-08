@@ -82,6 +82,7 @@
 #include <opengv/sac_problems/relative_pose/FrameRotationOnlySacProblem.hpp>
 
 #include <okvis/internal/Network.hpp>
+#include <okvis/TemporalMatching.hpp>
 
 /// \brief okvis Main namespace of this package.
 namespace okvis {
@@ -109,6 +110,7 @@ Frontend::Frontend(size_t numCameras, std::string dBowVocDir)
   }
   trackingLost_ = false;
   initialiseBriskFeatureDetectors();
+  configureTemporalTracking(temporalParameters_);
 
 #ifdef OKVIS_USE_NN
   // Deserialize the ScriptModule from a file using torch::jit::load().
@@ -134,6 +136,18 @@ Frontend::Frontend(size_t numCameras, std::string dBowVocDir)
 Frontend::~Frontend() {
   stopPlaceRecognition(false);
   endCnnThreads();
+}
+
+void Frontend::configureTemporalTracking(const FrontendParameters& parameters) {
+  OKVIS_ASSERT_TRUE(Exception, parameters.track_min_length >= 2
+      && std::isfinite(parameters.track_min_distance) && parameters.track_min_distance > 0
+      && std::isfinite(parameters.track_max_fb_error) && parameters.track_max_fb_error > 0
+      && std::isfinite(parameters.track_max_gap) && parameters.track_max_gap > 0,
+      "Invalid temporal tracking parameters")
+  temporalParameters_ = parameters;
+  temporalTrackers_.clear();
+  for (size_t i = 0; i < numCameras_; ++i)
+    temporalTrackers_.emplace_back(new TemporalFeatureTracker(parameters, i));
 }
 
 bool Frontend::loadComponent(std::string filename,
@@ -222,11 +236,46 @@ bool Frontend::detectAndDescribe(size_t cameraIndex, std::shared_ptr<okvis::Mult
   frameOut->setNetwork(cameraIndex, networks_[cameraIndex]);
 #endif
 
-  // detect
-  frameOut->detect(cameraIndex);
+  // Preserve long image tracks first, then replenish outside their circular masks.
+  if (temporalParameters_.use_temporal_tracking && !temporalTrackers_.empty()) {
+    const auto& image = frameOut->image(cameraIndex);
+    auto tracked = temporalTrackers_[cameraIndex]->propose(image, frameOut->timestamp());
+    cv::Mat mask(image.size(), CV_8UC1, cv::Scalar(255));
+    std::vector<cv::KeyPoint> keys;
+    const int radius = int(std::ceil(temporalParameters_.track_min_distance));
+    const auto append = [&](const cv::KeyPoint& key) {
+      const int x = cvRound(key.pt.x), y = cvRound(key.pt.y);
+      if (x < 0 || y < 0 || x >= mask.cols || y >= mask.rows || !mask.at<uchar>(y, x)
+          || keys.size() >= briskDetectionMaximumKeypoints_) return;
+      keys.push_back(key);
+      cv::circle(mask, key.pt, radius, cv::Scalar(0), cv::FILLED);
+    };
+    for (const auto& key : tracked) append(key);
+    std::vector<cv::KeyPoint> detected;
+    featureDetectors_[cameraIndex]->detect(image, detected);
+    for (auto key : detected) {
+      key.class_id = -1;
+      append(key);
+    }
+    frameOut->resetKeypoints(cameraIndex, keys);
+  } else {
+    frameOut->detect(cameraIndex);
+  }
 
   // extract
   frameOut->describe(cameraIndex);
+
+  if (temporalParameters_.use_temporal_tracking && !temporalTrackers_.empty()) {
+    std::vector<cv::KeyPoint> keys;
+    for (size_t k = 0; k < frameOut->numKeypoints(cameraIndex); ++k) {
+      cv::KeyPoint key;
+      frameOut->getCvKeypoint(cameraIndex, k, key);
+      keys.push_back(key);
+    }
+    const auto tracks = temporalTrackers_[cameraIndex]->commit(
+        frameOut->image(cameraIndex), frameOut->timestamp(), keys);
+    for (size_t k = 0; k < tracks.size(); ++k) frameOut->setFeatureTrack(cameraIndex, k, tracks[k]);
+  }
 
   // precompute backprojections
   frameOut->computeBackProjections(cameraIndex);
@@ -1057,6 +1106,15 @@ bool Frontend::dataAssociationAndInitialization(
       && (params.estimator.do_loop_closures || !componentDBows_.empty()))
     submitPlaceRecognitionKeyframe(estimator, params, framesInOut);
 
+  // Monocular tracks need several images and parallax before they can enter the map.
+  // Keep the bootstrap alive while image tracking is healthy, including pure rotation.
+  if (params.frontend.use_temporal_tracking && !isInitialized_) {
+    size_t continuing = 0;
+    for (size_t im = 0; im < framesInOut->numFrames(); ++im)
+      for (size_t k = 0; k < framesInOut->numKeypoints(im); ++k)
+        if (framesInOut->featureTrack(im, k).length > 1) ++continuing;
+    if (continuing >= 15) return true;
+  }
   return trackingQuality >= 0.01;
 }
 
@@ -1101,6 +1159,10 @@ void Frontend::clear()
   dBow_->database.clear();
   dBow_->poseIds.clear(); // Store the multiframe IDs corresponsind to the dBow ones
   trackingLost_ = false; // Is the tracking currently lost?
+  for (size_t im = 0; im < temporalTrackers_.size(); ++im) {
+    std::lock_guard<std::mutex> lock(*featureDetectorMutexes_[im]);
+    temporalTrackers_[im]->reset();
+  }
 }
 
 // Decision whether a new frame should be keyframe or not.
@@ -1231,6 +1293,8 @@ int Frontend::matchToMap(Estimator &estimator, const okvis::ViParameters& params
   MapPoints pointMap;
   estimator.getLandmarks(pointMap);
   mapCopyTimer.stop();
+  if (pointMap.empty() && params.frontend.use_temporal_tracking
+      && !loopClosureLandmarksToUseExclusively) return 0;
 
   // these may be needed for loop-closure map fusion
   std::vector<LandmarkId> oldIds, newIds;
@@ -1241,6 +1305,53 @@ int Frontend::matchToMap(Estimator &estimator, const okvis::ViParameters& params
 
   // match
   int ctr = 0;
+  // Resolve identities from live backend observations on every admitted frame.
+  // Graph merges/outlier removal are authoritative; image tracks never retain graph pointers.
+  const auto current = estimator.multiFrame(StateId(currentFrameId));
+  if (params.frontend.use_temporal_tracking && !loopClosureLandmarksToUseExclusively) {
+    std::set<StateId> live(estimator.keyFrames().begin(), estimator.keyFrames().end());
+    live.insert(estimator.imuFrames().begin(), estimator.imuFrames().end());
+    for (size_t im = 0; im < current->numFrames(); ++im) {
+      std::map<uint64_t, LandmarkId> bindings;
+      std::set<uint64_t> ambiguous;
+      for (const auto& id : live) {
+        if (id == StateId(currentFrameId)) continue;
+        const auto older = estimator.multiFrame(id);
+        for (size_t k = 0; k < older->numKeypoints(im); ++k) {
+          const auto track = older->featureTrack(im, k);
+          const LandmarkId landmark(older->landmarkId(im, k));
+          if (!track.id || !pointMap.count(landmark) || !pointMap.at(landmark).isInitialised
+              || !estimator.isObserved(KeypointIdentifier{id.value(), im, k})) continue;
+          const auto inserted = bindings.emplace(track.id, landmark);
+          if (!inserted.second && inserted.first->second != landmark) ambiguous.insert(track.id);
+        }
+      }
+      std::set<LandmarkId> used;
+      const auto camera = current->geometryAs<CAMERA_GEOMETRY>(im);
+      const auto T_CW = (estimator.pose(StateId(currentFrameId))
+          * estimator.extrinsics(StateId(currentFrameId), im)).inverse();
+      const double f = .5 * (camera->focalLengthU() + camera->focalLengthV());
+      const double threshold = 3.0 + f * (params.imu.use ? .06 : .34);
+      for (size_t k = 0; k < current->numKeypoints(im); ++k) {
+        const auto track = current->featureTrack(im, k);
+        if (!track.mature(params.frontend.track_min_length) || ambiguous.count(track.id)
+            || current->landmarkId(im, k)) continue;
+        const auto bound = bindings.find(track.id);
+        if (bound == bindings.end() || used.count(bound->second)) continue;
+        const auto& point = pointMap.at(bound->second);
+        if (point.classification == 10 || point.classification == 11) continue;
+        Eigen::Vector2d measured, projected;
+        current->getKeypoint(im, k, measured);
+        if (camera->projectHomogeneous(T_CW * Eigen::Vector4d(point.point), &projected)
+                != cameras::ProjectionStatus::Successful
+            || !projected.allFinite() || (measured - projected).norm() > threshold) continue;
+        current->setLandmarkId(im, k, bound->second.value(), FeatureAssociation::TemporalTrack);
+        estimator.addObservation<CAMERA_GEOMETRY>(bound->second, StateId(currentFrameId), im, k);
+        used.insert(bound->second);
+        ++ctr;
+      }
+    }
+  }
   std::vector<cv::Mat> descriptorPool(params.nCameraSystem.numCameras());
   kinematics::Transformation T_WS1 = estimator.pose(StateId(currentFrameId));
   double reprErr = 0.0;
@@ -1280,12 +1391,18 @@ int Frontend::matchToMap(Estimator &estimator, const okvis::ViParameters& params
         multiFrame->geometryAs<CAMERA_GEOMETRY>(im)->focalLengthU()
         + multiFrame->geometryAs<CAMERA_GEOMETRY>(im)->focalLengthV();
 
+    std::set<LandmarkId> linkedLandmarks;
+    if (params.frontend.use_temporal_tracking && !loopClosureLandmarksToUseExclusively)
+      for (size_t k = 0; k < numKeypoints; ++k)
+        if (multiFrame->landmarkId(im, k)) linkedLandmarks.insert(LandmarkId(multiFrame->landmarkId(im, k)));
+
     // go through all landmarks
     const size_t numDescriptorsToKeep = 3; // use only best 3
     descriptorPool[im] = cv::Mat(
         int(numDescriptorsToKeep)*pointMap.size(), 48, CV_8UC1);
     uchar* dataPtr = descriptorPool[im].data;
     for(MapPoints::const_iterator it = pointMap.begin(); it != pointMap.end(); ++it) {
+      if (linkedLandmarks.count(it->first)) continue;
       if(loopClosureLandmarksToUseExclusively) {
         if(!loopClosureLandmarksToUseExclusively->count(it->first)) {
           continue; // skip non-loop-closure points in this case
@@ -1469,7 +1586,8 @@ int Frontend::matchToMap(Estimator &estimator, const okvis::ViParameters& params
           newIds.push_back(lmIds[k]);
         }
 
-        multiFrame->setLandmarkId(im, k, lmIds[k].value());
+        multiFrame->setLandmarkId(im, k, lmIds[k].value(), loopClosureLandmarksToUseExclusively
+            ? FeatureAssociation::LoopClosure : FeatureAssociation::BriskMap);
         estimator.addObservation<CAMERA_GEOMETRY>(
               lmIds[k], StateId(currentFrameId), im, k);
         if (landmarksToMatch[lmIds[k]].ignore) {
@@ -1633,7 +1751,8 @@ int Frontend::matchToMap(Estimator &estimator, const okvis::ViParameters& params
         }
 
         // accept and set observation
-        multiFrame->setLandmarkId(im, k, lmIds[k].value());
+        multiFrame->setLandmarkId(im, k, lmIds[k].value(), loopClosureLandmarksToUseExclusively
+            ? FeatureAssociation::LoopClosure : FeatureAssociation::BriskMap);
         estimator.addObservation<CAMERA_GEOMETRY>(
             lmIds[k], StateId(currentFrameId), im, k);
         if (landmarksToMatch[lmIds[k]].ignore) {
@@ -1709,6 +1828,11 @@ void Frontend::matchToMapByThread(
     multiFrame->getKeypoint(im, k, keypoint);
     keypoints.col(k) = keypoint;
     const uint64_t previousId = multiFrame->landmarkId(im,k);
+    if (!loopClosureLandmarksToUseExclusively && params.frontend.use_temporal_tracking
+        && multiFrame->featureTrack(im, k).reserved(params.frontend.track_min_length)) {
+      use[k] = false;
+      continue;
+    }
     if(previousId&&!loopClosureLandmarksToUseExclusively) {
       use[k] = false; // I don't remember why this could happen -- just being paranoid.
       continue; // already matched
@@ -1795,6 +1919,8 @@ void Frontend::matchToMapByThreadUnitialised(
       e_Ws.col(k) = e1_W;
       const uint64_t previousId = multiFrame->landmarkId(im,k);
       previousIds[k] = previousId;
+      if (!loopClosureLandmarksToUseExclusively && params.frontend.use_temporal_tracking
+          && multiFrame->featureTrack(im, k).reserved(params.frontend.track_min_length)) continue;
       if(previousId&&!loopClosureLandmarksToUseExclusively) {
         continue; // already matched
       }
@@ -1896,9 +2022,13 @@ struct MatchInfo {
   double quality = 0.0; ///< 3D quality.
 };
 
+#include "FrontendTemporal.hpp"
+
 template <class CAMERA_GEOMETRY>
 int Frontend::matchMotionStereo(Estimator& estimator, const ViParameters &params,
                                  const uint64_t currentFrameId, bool& rotationOnly) {
+  if (params.frontend.use_temporal_tracking)
+    return matchTemporalTracks<CAMERA_GEOMETRY>(estimator, params, currentFrameId, rotationOnly);
   int retCtr = 0;
   rotationOnly = true;
 
@@ -2110,13 +2240,13 @@ int Frontend::matchMotionStereo(Estimator& estimator, const ViParameters &params
           }
         } else {
           id0 = estimator.addLandmark(mInfo.hp_W, mInfo.initialisable).value();
-          multiFrame0->setLandmarkId(im, k0, id0);
+          multiFrame0->setLandmarkId(im, k0, id0, FeatureAssociation::MotionStereo);
           OKVIS_ASSERT_TRUE_DBG(Exception, estimator.isLandmarkAdded(LandmarkId(id0)),
                               id0<<" not added, bug")
           estimator.addObservation<CAMERA_GEOMETRY>(LandmarkId(id0), StateId(olderFrameId), im, k0);
         }
 
-        multiFrame1->setLandmarkId(im, mInfo.k1, id0);
+        multiFrame1->setLandmarkId(im, mInfo.k1, id0, FeatureAssociation::MotionStereo);
         estimator.addObservation<CAMERA_GEOMETRY>(
               LandmarkId(id0), StateId(currentFrameId), im, mInfo.k1);
         retCtr++;
@@ -2179,6 +2309,8 @@ void Frontend::matchStereo(Estimator &estimator, std::shared_ptr<okvis::MultiFra
         const double f0 = 0.5* (camera0->focalLengthU() + camera0->focalLengthV());
         const double f1 = 0.5* (camera1->focalLengthU() + camera1->focalLengthV());
         for(size_t k0 = 0; k0 < k0Size; ++k0) {
+          if (params.frontend.use_temporal_tracking
+              && multiFrame->featureTrack(im0, k0).reserved(params.frontend.track_min_length)) continue;
 
           double distances = briskMatchingThreshold_;
           bool initialisable=  false;
@@ -2186,6 +2318,8 @@ void Frontend::matchStereo(Estimator &estimator, std::shared_ptr<okvis::MultiFra
           size_t k1_match = 0;
 
           for(size_t k1 = 0; k1 < k1Size; ++k1) {
+            if (params.frontend.use_temporal_tracking
+                && multiFrame->featureTrack(im1, k1).reserved(params.frontend.track_min_length)) continue;
             const auto dist = brisk::Hamming::PopcntofXORed(
                 multiFrame->keypointDescriptor(im0, k0),
                   multiFrame->keypointDescriptor(im1, k1), 3);
@@ -2289,7 +2423,7 @@ void Frontend::matchStereo(Estimator &estimator, std::shared_ptr<okvis::MultiFra
               auto s0 = camera0->projectHomogeneous(T_WC0.inverse()*hp_eff_W, &pt0p);
               if(s0 == cameras::ProjectionStatus::Successful && (pt0-pt0p).norm()<4.0) {
                 // safe to add.
-                multiFrame->setLandmarkId(im0, k0, lmId);
+                multiFrame->setLandmarkId(im0, k0, lmId, FeatureAssociation::Stereo);
                 estimator.addObservation<CAMERA_GEOMETRY>(LandmarkId(lmId), StateId(mfId), im0, k0);
               }
             }
@@ -2301,7 +2435,7 @@ void Frontend::matchStereo(Estimator &estimator, std::shared_ptr<okvis::MultiFra
               Eigen::Vector4d hp_eff_W = mapPoint.point;
               auto s1 = camera1->projectHomogeneous(T_WC1.inverse()*hp_eff_W, &pt1p);
               if(s1 == cameras::ProjectionStatus::Successful && (pt1-pt1p).norm()<4.0) {
-                multiFrame->setLandmarkId(im1, k1_match, lmId);
+                multiFrame->setLandmarkId(im1, k1_match, lmId, FeatureAssociation::Stereo);
                 estimator.addObservation<CAMERA_GEOMETRY>(
                   LandmarkId(lmId), StateId(mfId), im1, k1_match);
               }
